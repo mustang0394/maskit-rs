@@ -14,7 +14,7 @@
 # ---------------------------------------------------------------------------
 
 # ---------- 阶段 1：依赖层（仅依赖，利用 Docker 缓存） ----------
-FROM rust:1.83-slim-bookworm AS deps
+FROM rust:1.90-slim-bookworm AS deps   # 依赖要求 ≥1.85（sha2/indexmap/uuid 等），勿降版本
 WORKDIR /build
 # openssl 不需要（无 TLS 依赖），仅装 pkg-config 供极少数构建脚本探测用
 RUN apt-get update \
@@ -37,7 +37,6 @@ COPY . .
 # 复用依赖层已编译的产物
 RUN touch src/main.rs src/lib.rs \
  && cargo build --release --locked \
- && strip target/release/maskit-rs \
  && ls -lh target/release/maskit-rs
 
 # ---------- 阶段 3：运行时（distroless，非 root） ----------
