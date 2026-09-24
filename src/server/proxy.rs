@@ -427,6 +427,18 @@ pub async fn handler(State(state): State<SharedState>, req: Request) -> Response
     }
     state.bus.emit(ev);
 
+    // 映射落盘（随机后缀 → 原文）：保证进程重启后历史占位符仍可还原。
+    // **必须无条件 drain**：否则事件库不可用时该集合永不回收，会泄漏。
+    // 落盘本身是非阻塞入队（写线程异步执行），不影响本请求延迟。
+    let pending = state.sessions.drain_pending_persist(&sid);
+    if !pending.is_empty() {
+        if let Some(es) = &state.event_store {
+            let ttl = state.config.get().mask.mapping_ttl;
+            let n = es.save_mappings(&pending, ttl);
+            tracing::debug!(count = n, "占位符映射已入队落盘");
+        }
+    }
+
     // 转发（脱敏后的 body）+ 响应侧还原
     let mut headers = parts.headers.clone();
     inject_identity_for_stream(&mut headers, &body_bytes);

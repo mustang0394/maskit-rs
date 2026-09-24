@@ -246,3 +246,105 @@ fn audit_events_roundtrip() {
     assert_eq!(audits.len(), 1);
     assert_eq!(audits[0].signal_type, "response_poison");
 }
+
+// ── 占位符映射表：异步落盘 / 兜底查询 / TTL 清理 ──────────────────
+
+#[test]
+fn mapping_save_lookup_prune_roundtrip() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = EventStore::open(dir.path()).unwrap();
+
+    // 入队（异步写线程）；轮询等待落盘可见
+    let pairs = vec![
+        (
+            "{{PHONE_kqmzbv}}".to_string(),
+            "13800138000".to_string(),
+            "PHONE".to_string(),
+        ),
+        (
+            "{{EMAIL_aaaaaa}}".to_string(),
+            "a@b.com".to_string(),
+            "EMAIL".to_string(),
+        ),
+    ];
+    assert_eq!(store.save_mappings(&pairs, 86400), 2, "应全部入队");
+
+    let mut got = None;
+    for _ in 0..100 {
+        if let Some(v) = store.lookup_mapping("13800138000") {
+            got = Some(v);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let (tok, label) = got.expect("落盘后应能查到映射");
+    assert_eq!(tok, "{{PHONE_kqmzbv}}");
+    assert_eq!(label, "PHONE");
+    assert_eq!(
+        store.lookup_mapping("a@b.com").map(|(t, _)| t),
+        Some("{{EMAIL_aaaaaa}}".to_string())
+    );
+    assert!(store.lookup_mapping("不存在@x.com").is_none());
+
+    // TTL=0 → 立即过期 → 查不到（验证 expires_at 生效）
+    let expiring = vec![(
+        "{{PHONE_bbbbbb}}".to_string(),
+        "13900139000".to_string(),
+        "PHONE".to_string(),
+    )];
+    assert_eq!(store.save_mappings(&expiring, 0), 1);
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert!(
+        store.lookup_mapping("13900139000").is_none(),
+        "TTL 到期的映射不应被查到"
+    );
+
+    // 清理：prune 后过期行消失，存活行保留
+    store.prune_mappings();
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert!(
+        store.lookup_mapping("13800138000").is_some(),
+        "未过期映射应保留"
+    );
+    let back = store.load_mappings(10);
+    assert_eq!(back.len(), 2, "load_mappings 只应返回未过期项");
+}
+
+#[test]
+fn mapping_save_is_idempotent_upsert() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = EventStore::open(dir.path()).unwrap();
+    let tok = "{{APIKEY_zzzzzz}}".to_string();
+    // 同一 token 重复写（幂等，不应产生重复行 / 不应报错）
+    for _ in 0..5 {
+        store.save_mappings(
+            &[(tok.clone(), "sk-secret".to_string(), "API_KEY".to_string())],
+            86400,
+        );
+    }
+    // 写线程「满批或 500ms 超时」才 flush，轮询等待可见
+    for _ in 0..100 {
+        if store.load_mappings(100).iter().any(|(t, _, _)| *t == tok) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let all = store.load_mappings(100);
+    let n = all.iter().filter(|(t, _, _)| *t == tok).count();
+    assert_eq!(n, 1, "同一 token 只应保留 1 行，实际 {n}");
+    assert_eq!(store.lookup_mapping("sk-secret").map(|(t, _)| t), Some(tok));
+}
+
+#[test]
+fn mapping_db_file_is_owner_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let _store = EventStore::open(dir.path()).unwrap();
+    let db = dir.path().join("shield-events.sqlite3");
+    assert!(db.exists());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&db).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "库内含明文凭据，权限应为 0600，实际 {mode:o}");
+    }
+}

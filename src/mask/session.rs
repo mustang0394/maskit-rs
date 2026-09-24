@@ -42,6 +42,8 @@ pub struct Session {
     pub cmd_req_snippets: Option<std::collections::HashSet<String>>,
     pub cmd_reason_snippets: std::collections::HashSet<String>,
     pub cmd_pend: HashMap<String, String>,
+    /// 本次会话新建的映射（待持久化到 SQLite；由调用方 drain 后入队落盘）
+    pub pending_persist: std::collections::HashSet<String>,
     /// 请求侧命令窗口切片
     /// 时间戳
     pub ts: f64,
@@ -95,8 +97,10 @@ pub struct RecentEntry {
     pub ts: f64,
 }
 
-pub const RECENT_MAX: usize = 2000;
-/// 复用表 TTL：至少 24h（对齐 RECENT_TTL）
+/// 内存映射缓存容量上限（超出按最旧 LRU 淘汰；淘汰后由 DB 兜底回填）。
+pub const RECENT_MAX: usize = 10000;
+/// 映射 TTL：全局 24h。内存表与 SQLite 映射表同口径，
+/// 避免「内存还能还原、但 DB 已过期导致重启后还原不回来」的不一致窗口。
 pub const RECENT_TTL: u64 = 24 * 3600;
 
 /// 全局会话表。
@@ -114,7 +118,17 @@ pub struct SessionStore {
     pub custom_rev: DashMap<String, RecentEntry>,
     /// 复用表 TTL（可跟 session_ttl 放大）
     pub ttl_secs: std::sync::atomic::AtomicU64,
+    /// 内存未命中时的 DB 兜底查询：orig → (token, label)。
+    ///
+    /// 内存表只是 SQLite 映射表前面的一层**缓存**（LRU 10000 条 + 24h TTL）。
+    /// 被 LRU 挤掉时若不回查 DB，同一敏感值会拿到新随机后缀，
+    /// 上游请求前缀变化 → prompt cache 失效。回查命中则回填内存，占位符保持稳定。
+    lookup_hook: std::sync::RwLock<Option<MappingLookupHook>>,
 }
+
+/// DB 兜底查询钩子：orig → (token, label)
+pub type MappingLookupHook =
+    std::sync::Arc<dyn Fn(&str) -> Option<(String, String)> + Send + Sync + 'static>;
 
 #[derive(Clone, PartialEq)]
 pub enum SuffixIndexValue {
@@ -138,7 +152,43 @@ impl SessionStore {
             custom_fwd: DashMap::new(),
             custom_rev: DashMap::new(),
             ttl_secs: std::sync::atomic::AtomicU64::new(RECENT_TTL),
+            lookup_hook: std::sync::RwLock::new(None),
         }
+    }
+
+    /// 注入 DB 兜底查询钩子（AppState 构造时调用）。
+    pub fn set_lookup_hook(&self, hook: MappingLookupHook) {
+        if let Ok(mut g) = self.lookup_hook.write() {
+            *g = Some(hook);
+        }
+    }
+
+    fn db_lookup(&self, orig: &str) -> Option<(String, String)> {
+        let g = self.lookup_hook.read().ok()?;
+        let hook = g.as_ref()?;
+        hook(orig)
+    }
+
+    /// 把 DB 查回的映射回填进内存两张表 + 后缀索引。
+    fn rehydrate(&self, orig: &str, token: &str, label: &str) {
+        let now = now();
+        self.recent_fwd.insert(
+            orig.to_string(),
+            RecentEntry {
+                token: token.to_string(),
+                label: label.to_string(),
+                ts: now,
+            },
+        );
+        self.recent_rev.insert(
+            token.to_string(),
+            RecentEntry {
+                token: orig.to_string(),
+                label: label.to_string(),
+                ts: now,
+            },
+        );
+        self.suffix_index_add(token);
     }
 
     pub fn set_ttl(&self, session_ttl_secs: u64) {
@@ -318,6 +368,13 @@ impl SessionStore {
                 return (token, true);
             }
         }
+        // 内存未命中（LRU 淘汰或 TTL 过期）→ 查 SQLite 映射表兜底。
+        // 命中则回填内存并复用原占位符：**同一敏感值始终得到同一后缀**，
+        // 保证上游请求前缀稳定（prompt cache 不失效）。
+        if let Some((token, label)) = self.db_lookup(orig) {
+            self.rehydrate(orig, &token, &label);
+            return (token, true);
+        }
         let token = placeholder::new_token(label, &taken);
         // 旧映射过期：注销 REV / 后缀索引再覆盖 FWD
         if let Some(prev) = self.recent_fwd.get(orig) {
@@ -360,9 +417,30 @@ impl SessionStore {
             session.fwd.insert(orig.to_string(), token.clone());
             session.labels.insert(orig.to_string(), label.to_string());
             session.rev.insert(token, orig.to_string());
+            // 每次新建都登记（HashSet O(1) 去重；标签从 session.labels 取）
+            session.pending_persist.insert(orig.to_string());
             return reused;
         }
         false
+    }
+
+    /// 取走并清空「待持久化」集合，返回 (token, orig, label) 列表。
+    ///
+    /// 必须在**每条走完 mask 的请求**上调用（无论事件库是否可用），
+    /// 否则该集合会随会话增长而永不回收。
+    pub fn drain_pending_persist(&self, sid: &str) -> Vec<(String, String, String)> {
+        let Some(mut s) = self.sessions.get_mut(sid) else {
+            return vec![];
+        };
+        let pending = std::mem::take(&mut s.pending_persist);
+        pending
+            .into_iter()
+            .filter_map(|orig| {
+                let tok = s.fwd.get(&orig)?.clone();
+                let label = s.labels.get(&orig).cloned().unwrap_or_default();
+                Some((tok, orig, label))
+            })
+            .collect()
     }
 
     fn touch_recent(&self, token: &str, orig: &str) {
@@ -532,10 +610,58 @@ impl SessionStore {
         }
     }
 
-    /// 从事件库预热复用表（M9 接线；此接口保持稳定）。
-    pub fn warmup_from_events(&self, _records: Vec<(String, String, String)>) -> usize {
-        // records: (token, orig, label) — 按 M9 调用；凭据类已由调用方过滤
-        0
+    /// 从事件库预热复用表（对齐 Python `_warmup_recent_from_db`）。
+    ///
+    /// 为什么需要：普通敏感值的后缀是**随机**的（防上游枚举反推，安全红线），
+    /// 映射只存在于内存。进程重启后 AI 若复述历史里的 `{{PHONE_xxx}}`，
+    /// 查不到映射就会把裸占位符返回给用户。
+    /// 事件库里已经存了非凭据 PII 的 `tok`/`original`/`label`（凭据类只存摘要，
+    /// 天然无法也**不应**还原），启动时回读即可重建。
+    ///
+    /// 安全约束（与 Python 一致）：
+    /// - 凭据类同样回读（映射表已全类型落盘，行为保持一致）
+    /// - 跳过原文本身是占位符的脏数据
+    /// - 按「事件 id 倒序 → 去重 → 正序写入」，保证超容量淘汰时先删最旧
+    ///
+    /// 返回实际恢复的条数。
+    pub fn warmup_from_events(&self, records: Vec<(String, String, String)>) -> usize {
+        let now = now();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut collected: Vec<(String, String, String)> = Vec::new();
+        for (token, orig, label) in records {
+            if token.is_empty() || orig.is_empty() {
+                continue;
+            }
+            // 原文本身是占位符 → 脏数据，跳过
+            if super::placeholder::placeholder_rx().is_match(&orig) {
+                continue;
+            }
+            if seen.insert(orig.clone()) {
+                collected.push((token, orig, label));
+            }
+        }
+        // 正序写入（collected 已是「最新事件优先」的反序收集，这里翻回来）
+        for (token, orig, label) in collected.iter().rev() {
+            self.recent_fwd.insert(
+                orig.clone(),
+                RecentEntry {
+                    token: token.clone(),
+                    label: label.clone(),
+                    ts: now,
+                },
+            );
+            self.recent_rev.insert(
+                token.clone(),
+                RecentEntry {
+                    token: orig.clone(),
+                    label: label.clone(),
+                    ts: now,
+                },
+            );
+            self.suffix_index_add(token);
+        }
+        self.prune_recent();
+        collected.len()
     }
 }
 

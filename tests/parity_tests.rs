@@ -4,6 +4,7 @@
 
 use maskit_rs::config::Config;
 use maskit_rs::mask::engine::{restore_final, CustomWords, MaskCtx, RestoreStats};
+use maskit_rs::mask::session::Session;
 use maskit_rs::mask::session::SessionStore;
 
 fn full_rules() -> Config {
@@ -592,10 +593,15 @@ fn custom_word_suffix_is_deterministic_across_restart() {
 fn custom_word_mapping_survives_ttl_expiry() {
     // 自定义词映射永久有效，不受 session_ttl / LRU 淘汰影响
     let store = SessionStore::new();
-    store.set_ttl(1); // TTL 设为 1 秒
+    // 注意：set_ttl 语义是 max(24h, x)，无法把 TTL 压到 1s。
+    // 直接老化时间戳来验证「自定义词不受 TTL 影响」。
     let words = vec![("机密".to_string(), "内部".to_string())];
     store.seed_custom_words(&words);
     let tok = store.custom_fwd.get("机密").unwrap().clone();
+    // 把时间戳改到 100 天前，远超 24h TTL
+    if let Some(mut e) = store.custom_rev.get_mut(&tok) {
+        e.ts -= 100.0 * 24.0 * 3600.0;
+    }
     store.prune_recent(); // 触发清理（普通条目会被淘汰，自定义词不会）
     assert!(
         store.custom_fwd.contains_key("机密"),
@@ -666,4 +672,114 @@ fn ordinary_secret_uses_random_not_deterministic() {
         "50 次生成得到 {} 个不同后缀（应接近 50）——普通敏感值必须是随机的",
         suffixes.len()
     );
+}
+
+// ── 映射持久化 / 内存-DB 两级查找 ─────────────────────────────────
+
+#[test]
+fn memory_miss_falls_back_to_db_and_rehydrates() {
+    // 场景：同一敏感值的映射被 LRU 挤出内存，但 DB 仍有（24h TTL 内）。
+    // 期望：回查 DB 拿回**原占位符**（而非生成新的），保证 prompt cache 稳定。
+    let store = SessionStore::new();
+    let original_token = "{{PHONE_kqmzbv}}".to_string();
+
+    // 模拟 DB：orig → (token, label)
+    let db_token = original_token.clone();
+    store.set_lookup_hook(std::sync::Arc::new(move |orig: &str| {
+        if orig == "13800138000" {
+            Some((db_token.clone(), "PHONE".to_string()))
+        } else {
+            None
+        }
+    }));
+
+    let taken = |_t: &str, _s: &str| false;
+    let (tok, reused) = store.recall_token("13800138000", "PHONE", &taken);
+    assert_eq!(tok, original_token, "内存未命中必须回查 DB 并复用原占位符");
+    assert!(reused, "DB 命中应标记为复用");
+    // 已回填内存
+    assert_eq!(
+        store.recent_fwd.get("13800138000").map(|r| r.token.clone()),
+        Some(original_token.clone()),
+        "DB 命中后应回填内存正向表"
+    );
+    assert!(
+        store.recent_rev.contains_key(&original_token),
+        "应回填反向表"
+    );
+}
+
+#[test]
+fn same_orig_gets_same_token_across_cache_eviction() {
+    // 核心缓存契约：无论内存是否淘汰，同一敏感值在 DB 有效期内占位符恒定。
+    let store = SessionStore::new();
+    store.set_lookup_hook(std::sync::Arc::new(|orig: &str| {
+        if orig == "alice@example.com" {
+            Some(("{{EMAIL_aaaaaa}}".to_string(), "EMAIL".to_string()))
+        } else {
+            None
+        }
+    }));
+    let taken = |_t: &str, _s: &str| false;
+    
+    let first = store.recall_token("alice@example.com", "EMAIL", &taken).0;
+    // 手动清空内存表（模拟 LRU 淘汰 / 进程内缓存失效）
+    store.recent_fwd.clear();
+    store.recent_rev.clear();
+    
+    let second = store.recall_token("alice@example.com", "EMAIL", &taken).0;
+    assert_eq!(first, second, "内存淘汰后必须回查 DB，占位符不得改变");
+    assert_eq!(first, "{{EMAIL_aaaaaa}}");
+}
+
+#[test]
+fn db_miss_generates_fresh_random_token() {
+    // DB 也没有 → 生成全新随机后缀（不同值不得撞同一个占位符）
+    let store = SessionStore::new();
+    store.set_lookup_hook(std::sync::Arc::new(|_orig: &str| None));
+    let taken = |_t: &str, _s: &str| false;
+    let (a, reused_a) = store.recall_token("13800138000", "PHONE", &taken);
+    let (b, reused_b) = store.recall_token("13900139000", "PHONE", &taken);
+    assert!(!reused_a && !reused_b, "DB 未命中不应算复用");
+    assert_ne!(a, b, "不同敏感值必须得到不同占位符");
+    assert!(a.starts_with("{{PHONE_") && b.starts_with("{{PHONE_"));
+}
+
+#[test]
+fn pending_persist_drains_completely() {
+    // 防泄漏：无论是否落盘，pending 集合必须被取空
+    let store = SessionStore::new();
+    let taken = |_t: &str, _s: &str| false;
+    let mut session = Session::default();
+    store.remember(&mut session, "13800138000", "PHONE", &taken);
+    store.remember(&mut session, "a@b.com", "EMAIL", &taken);
+    store.new_session("sid-1");
+    // 把 session 放进 store（drain 需要按 sid 取）
+    if let Some(mut s) = store.sessions.get_mut("sid-1") {
+        s.fwd = session.fwd.clone();
+        s.labels = session.labels.clone();
+        s.pending_persist = session.pending_persist.clone();
+    }
+    let first = store.drain_pending_persist("sid-1");
+    assert_eq!(first.len(), 2, "应排出 2 条新映射");
+    let second = store.drain_pending_persist("sid-1");
+    assert!(second.is_empty(), "drain 后必须为空（否则集合无限增长）");
+    // 重复 drain 不产生重复落盘
+    assert!(store.drain_pending_persist("no-such-sid").is_empty());
+}
+
+#[test]
+fn recent_cache_evicts_oldest_beyond_10000() {
+    // 内存表容量上限 10000，超出按最旧 LRU 淘汰
+    assert_eq!(maskit_rs::mask::session::RECENT_MAX, 10000);
+    let store = SessionStore::new();
+    let taken = |_t: &str, _s: &str| false;
+    for i in 0..10_050 {
+        let mut s = Session::default();
+        store.remember(&mut s, &format!("1380013{i:04}"), "PHONE", &taken);
+    }
+    store.prune_recent();
+    let n = store.recent_fwd.len();
+    assert!(n <= 10_000, "内存表应回落到容量上限内，实际 {n}");
+    assert!(n > 9_000, "不应过度淘汰，实际 {n}");
 }

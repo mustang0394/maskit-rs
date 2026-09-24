@@ -173,6 +173,11 @@ pub struct MaskConfig {
     pub max_body_bytes: usize,
     #[serde(default = "default_session_ttl")]
     pub session_ttl: u64,
+    /// 占位符映射表保留时长（秒，默认 24h，与内存表同口径）。
+    /// 内存表是 DB 前面的一层 LRU 缓存（10000 条 + 24h TTL）；
+    /// 被淘汰时回查本表，保证同一敏感值的占位符在有效期内保持稳定。
+    #[serde(default = "default_mapping_ttl")]
+    pub mapping_ttl: u64,
     /// NER 预留位（PLAN §11：一期不实现，置 true 时告警）
     #[serde(default)]
     pub ner_enabled: bool,
@@ -191,6 +196,11 @@ fn default_secret_prefixes() -> Vec<String> {
 fn default_max_body_bytes() -> usize {
     32 * 1024 * 1024
 }
+/// 映射表默认保留 24 小时（与内存表 RECENT_TTL 同口径）。
+fn default_mapping_ttl() -> u64 {
+    24 * 3600
+}
+
 fn default_session_ttl() -> u64 {
     600
 }
@@ -208,6 +218,7 @@ impl Default for MaskConfig {
             secret_prefixes: default_secret_prefixes(),
             max_body_bytes: default_max_body_bytes(),
             session_ttl: default_session_ttl(),
+            mapping_ttl: default_mapping_ttl(),
             ner_enabled: false,
             record_plaintext_words: true,
         }
@@ -431,6 +442,9 @@ impl Config {
         }
         if c.mask.session_ttl == 0 {
             c.mask.session_ttl = 600;
+        }
+        if c.mask.mapping_ttl == 0 {
+            c.mask.mapping_ttl = 24 * 3600;
         }
         if c.panel_token.len() < 16 {
             // 交给启动逻辑生成随机令牌

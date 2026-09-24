@@ -42,6 +42,10 @@ enum StoreMsg {
     Event(Box<Event>),
     Audit(Box<AuditEvent>),
     Prune(i64),
+    /// 占位符映射批量落盘（token, orig, label, ttl_secs）
+    Mappings(Vec<(String, String, String, u64)>),
+    /// 清理过期映射
+    PruneMappings,
     Shutdown,
 }
 
@@ -51,6 +55,8 @@ impl EventStore {
         std::fs::create_dir_all(data_dir).ok();
         let path = data_dir.join("shield-events.sqlite3");
         init_schema(&path)?;
+        // 库内含明文凭据映射，仅属主可读写
+        restrict_permissions(&path);
         let (tx, rx) = sync_channel::<StoreMsg>(EVENT_QUEUE_MAX);
         let stats = Arc::new(Mutex::new(WriterStats {
             alive: true,
@@ -233,6 +239,92 @@ impl EventStore {
         (get("tokens_prompt"), get("tokens_completion"))
     }
 
+    /// 占位符映射落盘：**非阻塞入队**，由单写线程批量执行（同事件库模式）。
+    ///
+    /// 绝不阻塞代理路径：队列满则丢弃并计数（映射丢失只影响重启后的还原能力，
+    /// 不影响本次请求的正确性 —— 内存表仍然有效）。
+    pub fn save_mappings(&self, pairs: &[(String, String, String)], ttl_secs: u64) -> usize {
+        if pairs.is_empty() {
+            return 0;
+        }
+        let batch: Vec<(String, String, String, u64)> = pairs
+            .iter()
+            .filter(|(t, o, _)| !t.is_empty() && !o.is_empty())
+            .map(|(t, o, l)| (t.clone(), o.clone(), l.clone(), ttl_secs))
+            .collect();
+        if batch.is_empty() {
+            return 0;
+        }
+        let n = batch.len();
+        if self.tx.try_send(StoreMsg::Mappings(batch)).is_err() {
+            if let Ok(mut st) = self.stats.lock() {
+                st.dropped += n as u64;
+            }
+            return 0;
+        }
+        n
+    }
+
+    /// 内存未命中时的 DB 兜底查询：orig → (token, label)。
+    ///
+    /// 只读操作，走独立连接（WAL 允许「一写多读」并发），因此可以安全地在
+    /// 请求线程里同步调用。仅在内存 LRU 淘汰后触发，属低频路径。
+    pub fn lookup_mapping(&self, orig: &str) -> Option<(String, String)> {
+        let conn = open_read(&self.path).ok()?;
+        conn.query_row(
+            "SELECT token, label FROM placeholder_map WHERE orig = ?1 AND expires_at > ?2 LIMIT 1",
+            params![orig, crate::store::events::now_secs()],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+        )
+        .ok()
+    }
+
+    /// 读回未过期的映射（启动时恢复内存表）。
+    pub fn load_mappings(&self, limit: usize) -> Vec<(String, String, String)> {
+        let Ok(conn) = open_read(&self.path) else {
+            return vec![];
+        };
+        let now = crate::store::events::now_secs();
+        let mut stmt = match conn.prepare(
+            "SELECT token, orig, label FROM placeholder_map \
+             WHERE expires_at > ?1 ORDER BY created_at DESC LIMIT ?2",
+        ) {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+        let rows = stmt.query_map(params![now, limit as i64], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        });
+        match rows {
+            Ok(it) => it.filter_map(|r| r.ok()).collect(),
+            Err(_) => vec![],
+        }
+    }
+
+    /// 清理过期映射（非阻塞入队，由写线程执行 —— 避免两个连接争写锁）。
+    pub fn prune_mappings(&self) -> usize {
+        if self.tx.try_send(StoreMsg::PruneMappings).is_ok() {
+            1
+        } else {
+            0
+        }
+    }
+
+    /// 映射表当前条数（状态展示用）。
+    pub fn mappings_count(&self) -> usize {
+        let Ok(conn) = open_read(&self.path) else {
+            return 0;
+        };
+        conn.query_row("SELECT COUNT(*) FROM placeholder_map", [], |r| {
+            r.get::<_, i64>(0)
+        })
+        .unwrap_or(0) as usize
+    }
+
     /// 今日统计（从 daily_stats 读，缺失则从 events 现算）。
     pub fn today_stats(&self) -> rusqlite::Result<serde_json::Value> {
         let conn = open_read(&self.path)?;
@@ -408,6 +500,18 @@ CREATE TABLE IF NOT EXISTS daily_prefix (
     cnt INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (day, prefix)
 );
+
+-- 占位符映射表：随机后缀 → 原文。进程重启后据此还原历史占位符。
+-- 按 expires_at 定期清理，避免库无限增长（ttl 由 config.mask.mapping_ttl 控制）。
+CREATE TABLE IF NOT EXISTS placeholder_map (
+    token TEXT PRIMARY KEY,
+    orig TEXT NOT NULL,
+    label TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    expires_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_pm_expires ON placeholder_map(expires_at);
+CREATE INDEX IF NOT EXISTS idx_pm_orig ON placeholder_map(orig);
 "#,
     )?;
     Ok(())
@@ -440,6 +544,41 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 }
 
 /// 写线程主循环：批量事务 + 每日聚合 + 保留期清理 + 故障不死。
+/// 写线程内执行：幂等 upsert 映射（同 token 覆盖 orig/label/expires_at）。
+/// 0600：SQLite 及其 -wal/-shm 旁文件。
+fn restrict_permissions(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for p in [
+            path.to_path_buf(),
+            path.with_extension("sqlite3-wal"),
+            path.with_extension("sqlite3-shm"),
+        ] {
+            let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
+fn write_mappings(
+    tx: &rusqlite::Transaction<'_>,
+    batch: &[(String, String, String, u64)],
+) -> rusqlite::Result<()> {
+    let now = crate::store::events::now_secs();
+    let mut stmt = tx.prepare(
+        "INSERT INTO placeholder_map (token, orig, label, created_at, expires_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5) \
+         ON CONFLICT(token) DO UPDATE SET orig=excluded.orig, label=excluded.label, \
+         expires_at=excluded.expires_at",
+    )?;
+    for (token, orig, label, ttl) in batch {
+        stmt.execute(params![token, orig, label, now, now + *ttl as f64])?;
+    }
+    Ok(())
+}
+
 fn writer_loop(path: &Path, rx: Receiver<StoreMsg>, stats: Arc<Mutex<WriterStats>>) {
     let mut batch: Vec<StoreMsg> = Vec::new();
     let mut last_write = std::time::Instant::now();
@@ -519,6 +658,21 @@ fn flush_batch(
                         } else {
                             failed += 1;
                         }
+                    }
+                    StoreMsg::Mappings(batch) => {
+                        if write_mappings(&tx, batch).is_ok() {
+                            written += batch.len() as u64;
+                        } else {
+                            failed += batch.len() as u64;
+                        }
+                    }
+                    StoreMsg::PruneMappings => {
+                        let now = crate::store::events::now_secs();
+                        let _ = tx.execute(
+                            "DELETE FROM placeholder_map WHERE expires_at <= ?1",
+                            params![now],
+                        );
+                        written += 1;
                     }
                     StoreMsg::Audit(av) => {
                         if write_audit(&tx, av).is_ok() {

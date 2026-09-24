@@ -303,3 +303,39 @@ Rust 版现状：配置字段存在但 **HTTP 客户端未使用，填了不生�
 2. 由上一条暴露：**会话释放守卫被我建在了 `stream_response()` 的局部作用域**，函数 return 即 drop → 会话在客户端读 body 前就消失 → **流式还原全部失效**（占位符原样下发）。已把守卫移入 `async_stream` 生成器内部（覆盖「消费完/断连/被丢弃」三种结束），并新增从完整代理路径验证的回归测试。
 
 这正是「先修 mock、再验证」的价值：两个问题互相遮蔽，只靠单测全绿会漏掉。
+
+
+## M13：占位符映射持久化（两级缓存）
+
+**背景**：随机后缀（防上游枚举反推，安全红线）意味着映射是**有状态**的。
+原先映射只在内存，进程重启后 AI 复述历史 `{{PHONE_xxx}}` 还原不回来。
+
+**设计**（经多轮讨论定稿）：
+
+```
+mask 替换 ──► 内存 recent_fwd/rev（热缓存，LRU 10000 条 + TTL 24h）
+                    │ 命中 → 返回（µs，零磁盘 I/O）
+                    │ 未命中（LRU 淘汰 / TTL 过期）
+                    ▼
+             SQLite placeholder_map（真相，TTL 24h）
+                    │ 命中 → 回填内存 → 返回原占位符
+                    │ 未命中 → 生成新随机后缀 → 异步入队落盘
+```
+
+关键点：
+- **同一敏感值占位符恒定**（24h 内），保证上游请求前缀稳定 → prompt cache 不失效
+- 落盘走 `EventStore` 已有**单写线程队列**（`try_send` 非阻塞，队列满则丢并计数）
+- 凭据类**同样落盘**（用户决策：行为一致优先），DB 文件权限 0600
+
+**改动**：
+- `StoreMsg::Mappings` / `PruneMappings` 变体 + 写线程处理
+- `EventStore::save_mappings`（入队）/ `lookup_mapping`（同步只读）/ `prune_mappings`（入队）
+- `SessionStore::set_lookup_hook` + `recall_token` 内存未命中时回查 DB 并回填
+- `pending_persist`: `Vec<(String,String)>` → `HashSet<String>`（O(1) 去重 + 杜绝泄漏）
+- `RECENT_MAX` 2000 → 10000；内存 TTL 全局 24h（`set_ttl` 恢复 `max(24h, x)` 语义）
+- `config.mask.mapping_ttl` 默认 86400s
+- 回放 `warmup_from_events` 移除凭据类过滤
+- SQLite 文件 0600
+
+**测试**（+13）：内存未命中回查 DB、回填、淘汰后占位符恒定、DB 未命中生成新值、
+pending drain 不泄漏、10050 条 LRU 淘汰、落盘往返/幂等 upsert/TTL 清理/文件权限。
