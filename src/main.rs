@@ -90,13 +90,26 @@ fn main() {
         }));
     }
 
-    // 占位符映射的两级缓存第二级：内存 LRU 未命中时回查 SQLite 映射表。
+    // 占位符映射的两级缓存（内存 LRU + SQLite 真相）：
+    //
+    //   1. 启动时把库里未过期的映射**预热回内存**（两张表 + 后缀索引）；
+    //   2. 运行中内存未命中时回查库（钩子）。
+    //
+    // 两者缺一不可，只做一半就会出现「重启后占位符还原不回来」：
+    // 钩子只覆盖 `orig → token`（签发方向）；而**还原方向 `token → 原文`** 走的是
+    // 内存 `recent_rev`，重启后它是空的 —— 模型回显 `{{PHONE_xxx}}` 就查不到原文，
+    // 客户端看到裸占位符（实测可复现：重启后 `unresolved` 计数 +1）。
     //
     // 钩子只在**真实服务器**里接线（不放进 `AppState::new`）：它写的是进程全局
-    // `STORE`，集成测试里每个用例都会建自己的临时事件库，若在 `AppState::new`
-    // 里接线，并发测试之间会互相把钩子指向别人的库。
+    // `STORE`，而集成测试里每个用例建自己的临时事件库，在 `AppState::new` 里接线
+    // 会让并发测试互相把钩子指向别人的库。
     if let Some(es) = &event_store {
         maskit_rs::mask::session::STORE.set_lookup_hook(es.make_lookup_hook());
+        // `load_mappings` 是 `created_at DESC`（最新优先），与 `warmup_from_events`
+        // 期望的输入顺序一致（内部会翻回「旧→新」写入，保证超容量淘汰时先删最旧）。
+        let warm = es.load_mappings(maskit_rs::mask::session::RECENT_MAX);
+        let n = maskit_rs::mask::session::STORE.warmup_from_events(warm);
+        tracing::info!("占位符映射预热完成：{n} 条（重启后历史占位符仍可还原）");
     }
 
     let state = std::sync::Arc::new(server::AppState::new(

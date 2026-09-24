@@ -194,6 +194,31 @@ pub fn restore_sse_event(
                         }
                     }
                 }
+                // ── 槽位之外的同事件文本也必须还原 ──
+                //
+                // 回归（真机报告）：思考内容里的占位符原样下发给客户端。根因有两个：
+                //   ① 已知增量字段写错了频道名（见 `slots::set_slot`）；
+                //   ② **事件里只要有任一可识别槽位，其余字段就完全不还原** ——
+                //      而各家实现的字段名远比三大协议文档多：Ollama 的
+                //      `message.thinking`、OpenRouter 的 `delta.reasoning_details[]`、
+                //      中转塞在事件顶层的 `system_fingerprint`/`text`/`item_id` 等。
+                //      逐个字段名去列举就是打地鼠，所以这里补一道**整树兜底**。
+                //
+                // 为什么安全：槽位值此时已被换成还原后的文本（无可还原占位符），
+                // 且被扣住的半截尾巴存在 `pending` 里而不在树上，所以这遍历对槽位
+                // 是无害的空转。已知小瑕疵：若槽位里是一个**查不到映射**的幻占位符，
+                // 它会同时被槽位与本次遍历各计一次 `unresolved`（计数偏高一点，
+                // 不影响下发内容）。
+                let mut st = RestoreStats::default();
+                restored = crate::mask::tree::restore_tree(&restored, sid, store, &mut st, 0);
+                stats.restored += st.restored;
+                stats.degraded += st.degraded;
+                stats.unresolved += st.unresolved;
+                for s in st.samples {
+                    if stats.samples.len() < 5 && !stats.samples.contains(&s) {
+                        stats.samples.push(s);
+                    }
+                }
             } else {
                 // 非增量事件：整树还原
                 let mut st = RestoreStats::default();
@@ -237,6 +262,18 @@ pub fn restore_ndjson_line(
         for (channel, text, escape) in &slot_list {
             let r = restore_channel(text, sid, store, stats, channel, *escape, final_frame);
             slots::set_slot(&mut restored, channel, &r);
+        }
+        // 槽位之外的同事件文本也要还原（见 `restore_sse_event` 里的同段说明）：
+        // 一条 NDJSON 里可能同时带 content + thinking + 结构化 tool_calls。
+        let mut st = RestoreStats::default();
+        restored = crate::mask::tree::restore_tree(&restored, sid, store, &mut st, 0);
+        stats.restored += st.restored;
+        stats.degraded += st.degraded;
+        stats.unresolved += st.unresolved;
+        for s in st.samples {
+            if stats.samples.len() < 5 && !stats.samples.contains(&s) {
+                stats.samples.push(s);
+            }
         }
         if let Some(mut s) = store.get_mut(sid) {
             for (channel, _, _) in &slot_list {

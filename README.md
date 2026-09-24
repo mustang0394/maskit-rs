@@ -78,6 +78,9 @@ MASKIT_RS_DATA_DIR=/var/lib/maskit-rs ./target/release/maskit-rs
 - **多轮一致性**：同一原文在 TTL 内复用同一占位符（`session_ttl`，默认 600s）
 - **路径感知脱敏**：协议位置字段（`role`/`model`/`id` 等）不动，业务区（工具参数）强制扫描
 - **流式还原**：SSE / NDJSON 逐事件还原，跨 chunk 的半截占位符扣留后拼合
+  - 覆盖范围：Chat Completions（`delta.content` / `reasoning_content` / `reasoning` / `reasoning_details[]` / `tool_calls.arguments`）、Anthropic（`text` / `thinking` / `partial_json`）、Responses API（`output_text` / `reasoning_summary_text` / `function_call_arguments`）、Ollama NDJSON（`message.content` / `message.thinking` / 结构化 `tool_calls`）
+  - 每个事件里**未被槽位接管的其余文本**也会走一次整树兜底还原 —— 各家中转的字段名远比协议文档多，逐个列举等于打地鼠
+  - 响应为文本类（`json` / `text/*` / `xml` / **未声明 content-type**）都会尝试还原；二进制（图片/音频/octet-stream）与**压缩体**不动
 - **命令拦截**：observe（只记录，默认）/ rewrite（改写为 no-op 说明）/ block（停止下发）
 - **8 类被动审计信号**：错误泄露 / 换芯 / 工具重写 / 流异常 / 响应投毒 / 跨请求污染 / 凭据回流 / 危险动作
 - **token 用量统计**：按模型统计输入/输出 token（`/api/stats/today`、`/api/stats/models`）。**只统计数量，不做价格/费用计算**
@@ -256,7 +259,7 @@ maskit-rs --health-check   # 健康检查（容器 HEALTHCHECK 用，退出码 0
 ```bash
 export CARGO_INCREMENTAL=0   # 磁盘紧张时强烈建议
 cargo build --release         # 产物：target/release/maskit-rs（约 9.4MB）
-cargo test                    # 345 个测试
+cargo test                    # 351 个测试
 cargo test --release --test perf_tests -- --test-threads=1   # 性能基准
 ```
 

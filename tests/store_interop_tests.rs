@@ -379,3 +379,99 @@ fn lookup_hook_rehydrates_token_from_sqlite() {
         Some("13800138000".to_string())
     );
 }
+
+/// 回归：**进程重启后**，客户端历史 / 模型回显里的占位符必须仍能还原。
+///
+/// 这是「思考内容里的占位符原样返回给客户端」的真正根因。签名方向（orig→token）
+/// 有 DB 兜底钩子，但**还原方向（token→原文）**走的是内存 `recent_rev`：
+/// 重启后它是空的，若不预热，`lookup` 就查不到原文 → 客户端看到裸占位符
+/// （实测 `RESTORE` 事件的 reason 会变成 `unresolved`）。
+/// 库里的 `placeholder_map` 就是为这件事存的，但 `load_mappings` /
+/// `warmup_from_events` 此前**没有任何生产调用点**。
+#[test]
+fn restart_warmup_makes_old_placeholders_restorable() {
+    use maskit_rs::mask::session::SessionStore;
+
+    let dir = tempfile::tempdir().unwrap();
+    let es = EventStore::open(dir.path()).unwrap();
+
+    // ── 「上一个进程」：签发并落盘两套映射 ──
+    // 顺序模拟真实情形：先创建的记录 created_at 更早
+    let pairs = vec![
+        (
+            "{{PHONE_old111}}".to_string(),
+            "13800138000".to_string(),
+            "PHONE".to_string(),
+        ),
+        (
+            "{{EMAIL_old222}}".to_string(),
+            "old@example.com".to_string(),
+            "EMAIL".to_string(),
+        ),
+    ];
+    assert_eq!(es.save_mappings(&pairs, 86400), 2);
+    es.sync();
+
+    // ── 「新进程」：全新空内存表 ──
+    let store = SessionStore::new();
+    store.new_session("s");
+    // 预热前：token → 原文 查不到（这就是泄漏时的状态）
+    assert_eq!(
+        store.lookup("{{PHONE_old111}}", "s"),
+        None,
+        "预热前查不到是预期（用于证明预热确实起了作用）"
+    );
+
+    // 模拟 main 启动做的事：load_mappings（最新优先）+ warmup_from_events
+    let warm = es.load_mappings(maskit_rs::mask::session::RECENT_MAX);
+    assert_eq!(warm.len(), 2, "库里应有两条未过期映射");
+    let n = store.warmup_from_events(warm);
+    assert_eq!(n, 2, "两条都应预热进内存");
+
+    // 预热后：还原方向打通
+    assert_eq!(
+        store.lookup("{{PHONE_old111}}", "s"),
+        Some("13800138000".to_string()),
+        "重启后必须能按占位符还原出原文"
+    );
+    assert_eq!(
+        store.lookup("{{EMAIL_old222}}", "s"),
+        Some("old@example.com".to_string())
+    );
+    // 且签发方向也复用同一占位符（否则上游前缀变化、prompt cache 失效）
+    for (tok, orig) in [
+        ("{{PHONE_old111}}", "13800138000"),
+        ("{{EMAIL_old222}}", "old@example.com"),
+    ] {
+        let taken = |_t: &str, _s: &str| false;
+        let mut sess = maskit_rs::mask::session::Session::default();
+        store.remember(&mut sess, orig, "TERM", &taken);
+        assert_eq!(
+            sess.fwd.get(orig).map(String::as_str),
+            Some(tok),
+            "{orig} 必须复用预热回来的占位符"
+        );
+    }
+}
+
+/// 预热不加载已过期映射（避免把过期原文重新拉进内存）。
+#[test]
+fn warmup_skips_expired_mappings() {
+    use maskit_rs::mask::session::SessionStore;
+    let dir = tempfile::tempdir().unwrap();
+    let es = EventStore::open(dir.path()).unwrap();
+    es.save_mappings(
+        &[(
+            "{{PHONE_dead00}}".to_string(),
+            "13900139000".to_string(),
+            "PHONE".to_string(),
+        )],
+        0, // TTL=0 → 立即过期
+    );
+    es.sync();
+    let store = SessionStore::new();
+    store.new_session("s");
+    let n = store.warmup_from_events(es.load_mappings(100));
+    assert_eq!(n, 0, "过期映射不得预热");
+    assert_eq!(store.lookup("{{PHONE_dead00}}", "s"), None);
+}

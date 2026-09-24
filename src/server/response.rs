@@ -29,13 +29,33 @@ pub struct ResponseOutcome {
 }
 
 /// 判断响应是否可还原（content-type + 是否声明的可流式）。
+///
+/// ⚠️ 这里的语义是「**能不能碰这段字节**」，而不是「用什么方式还原」：
+/// 只要响应是文本类，就该试着还原（没有占位符时还原是空转），
+/// 因为占位符是**我们自己签发**的 —— 放行等于把 `{{PHONE_xxx}}` 送到客户端。
+///
+/// 回归：早期只认 `json` / `event-stream`，于是
+/// `content-type: text/plain`（不少中转会这么发 JSON）与**完全不发 content-type**
+/// 的响应直接跳过了还原，占位符原样下发（真机报告的那类「思考内容里还是占位符」
+/// 完全可能是这个原因）。
+///
+/// 仍然拒绝的两类：
+///   * **压缩体**（`content-encoding: gzip/br`）—— 解码前不能按字节处理；
+///   * **二进制体**（image/audio/octet-stream/pdf…）—— `from_utf8_lossy`
+///     会不可逆地弄坏它们，宁可不动。
 pub fn restorable(ct: &str, content_encoding: &str) -> bool {
-    // 压缩体在解码前不能按事件切分；本实现要求上游返回 identity（请求侧已声明）
     if !content_encoding.is_empty() && content_encoding != "identity" {
         return false;
     }
     let c = ct.to_ascii_lowercase();
-    c.contains("json") || c.contains("event-stream")
+    if c.contains("json") || c.contains("event-stream") {
+        return true;
+    }
+    // 未声明 content-type：上游漏发或有中转吞了头。宁可试一次还原。
+    if c.trim().is_empty() {
+        return true;
+    }
+    c.starts_with("text/") || c.contains("xml")
 }
 
 /// 响应侧是否应按流式逐事件处理。
@@ -108,6 +128,16 @@ pub fn process_whole(
             joined = format!("{}\n\n{}", joined.trim_end_matches('\n'), tail);
         }
         joined
+    } else if c.starts_with("text/") || c.contains("xml") || c.trim().is_empty() {
+        // 纯文本 / XML / 未声明类型的响应：既不是 JSON 也不是 SSE。
+        // 直接对整段做一次还原（先试 JSON 树，能解析就按树还原以免弄坏转义）。
+        match serde_json::from_str::<serde_json::Value>(&text) {
+            Ok(v) => serde_json::to_string(&crate::mask::tree::restore_tree(
+                &v, sid, store, &mut stats, 0,
+            ))
+            .unwrap_or_else(|_| text.clone()),
+            Err(_) => crate::mask::engine::restore_final(&text, sid, false, store, &mut stats),
+        }
     } else {
         text.clone()
     };
@@ -639,9 +669,50 @@ mod tests {
             !restorable("text/event-stream", "gzip"),
             "压缩体在解码前不可按事件切分"
         );
-        assert!(!restorable("text/plain", ""));
+        // 回归：文本类响应必须试着还原 —— 占位符是我们自己签发的，
+        // 「content-type 不是 json」不等于「可以放着占位符不管」。
+        assert!(restorable("text/plain", ""), "text/plain 也必须还原");
+        assert!(restorable("", ""), "未声明 content-type 也要试一次");
+        assert!(restorable("text/html; charset=utf-8", ""));
+        assert!(restorable("application/xml", ""));
+        // 二进制仍然不碰（from_utf8_lossy 会把它弄坏）
+        assert!(!restorable("image/png", ""));
+        assert!(!restorable("audio/mpeg", ""));
+        assert!(!restorable("application/octet-stream", ""));
+        assert!(!restorable("application/pdf", ""));
         assert!(is_streaming_response("text/event-stream"));
         assert!(is_streaming_response("application/x-ndjson"));
         assert!(!is_streaming_response("application/json"));
+    }
+
+    /// 回归：非 JSON 的文本响应也必须还原占位符（真机报告的一类遗漏）。
+    #[test]
+    fn plain_text_body_restores() {
+        let parts = setup();
+        let masked = mask_and_register(&parts, "电话13800138000");
+        let cmd = crate::cmdblock::CmdBlockEngine::new(&parts.0);
+        // text/plain 却装着 JSON
+        let body = format!(r#"{{"choices":[{{"message":{{"content":"{masked}"}}}}]}}"#);
+        let out = process_whole(body.as_bytes(), "text/plain", "r", &parts.1, &cmd);
+        let s = String::from_utf8_lossy(&out.body);
+        assert!(s.contains("13800138000"), "text/plain 也要还原：{s}");
+        assert!(!s.contains("{{PHONE_"), "不得残留占位符：{s}");
+        // 完全没声明 content-type
+        let out2 = process_whole(body.as_bytes(), "", "r", &parts.1, &cmd);
+        let s2 = String::from_utf8_lossy(&out2.body);
+        assert!(s2.contains("13800138000"), "未声明类型也要还原：{s2}");
+        // 纯文本（非 JSON）
+        let out3 = process_whole(
+            format!("前缀 {masked} 后缀").as_bytes(),
+            "text/plain",
+            "r",
+            &parts.1,
+            &cmd,
+        );
+        let s3 = String::from_utf8_lossy(&out3.body);
+        assert!(
+            s3.contains("13800138000") && !s3.contains("{{PHONE_"),
+            "纯文本：{s3}"
+        );
     }
 }

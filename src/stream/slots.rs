@@ -54,6 +54,16 @@ pub fn text_slots(data: &Value) -> Vec<Slot> {
                 if let Some(s) = d.get("reasoning").and_then(Value::as_str) {
                     slots.push((format!("c{idx}.reason2"), s.to_string(), false));
                 }
+                // `reasoning_details: [{type:"reasoning.text", text:"..."}]`
+                // （OpenRouter 等中转的推理明细，**是增量字段**，必须走槽位才能跨
+                //  chunk 扣住半截占位符）。
+                if let Some(rd) = d.get("reasoning_details").and_then(Value::as_array) {
+                    for (n, item) in rd.iter().enumerate() {
+                        if let Some(s) = item.get("text").and_then(Value::as_str) {
+                            slots.push((format!("c{idx}.rd{n}"), s.to_string(), false));
+                        }
+                    }
+                }
                 if let Some(tcs) = d.get("tool_calls").and_then(Value::as_array) {
                     for (tidx, tc) in tcs.iter().enumerate() {
                         let slot_no = tc
@@ -125,9 +135,18 @@ pub fn text_slots(data: &Value) -> Vec<Slot> {
             if let Some(s) = msg.get("content").and_then(Value::as_str) {
                 slots.push(("o.message.content".into(), s.to_string(), false));
             }
+            // 思考内容也是**增量**字段（deepseek-r1 这类模型逐块吐 thinking），
+            // 必须走槽位，否则跨 chunk 的半截占位符会原样下发。
+            if let Some(s) = msg.get("thinking").and_then(Value::as_str) {
+                slots.push(("o.message.thinking".into(), s.to_string(), false));
+            }
         }
         if let Some(s) = obj.get("response").and_then(Value::as_str) {
             slots.push(("o.response".into(), s.to_string(), false));
+        }
+        // `/api/generate` 的思考字段（部分实现用 thinking 而非 response）
+        if let Some(s) = obj.get("thinking").and_then(Value::as_str) {
+            slots.push(("o.thinking".into(), s.to_string(), false));
         }
     }
     slots
@@ -194,14 +213,37 @@ pub fn set_slot(data: &mut Value, channel: &str, text: &str) {
                     continue;
                 }
                 match field {
-                    "content" | "reasoning_content" | "reasoning" => {
+                    // ⚠️ 这里必须写**槽位名**（`content`/`reason`/`reason2`），
+                    // 不是 JSON 字段名。早期写的是 `reasoning_content`/`reasoning`
+                    // —— 与 `text_slots` 产生的频道名对不上，于是思考内容走进 `_`
+                    // 分支被静默丢弃：**还原后的文本写不回去，占位符原样下发给客户端**。
+                    "content" => {
                         if let Some(d) = c.get_mut("delta").and_then(Value::as_object_mut) {
-                            let key = match field {
-                                "reason" => "reasoning_content",
-                                "reason2" => "reasoning",
-                                other => other,
-                            };
-                            d.insert(key.into(), Value::String(text.into()));
+                            d.insert("content".into(), Value::String(text.into()));
+                        }
+                    }
+                    "reason" => {
+                        if let Some(d) = c.get_mut("delta").and_then(Value::as_object_mut) {
+                            d.insert("reasoning_content".into(), Value::String(text.into()));
+                        }
+                    }
+                    "reason2" => {
+                        if let Some(d) = c.get_mut("delta").and_then(Value::as_object_mut) {
+                            d.insert("reasoning".into(), Value::String(text.into()));
+                        }
+                    }
+                    f if f.starts_with("rd") => {
+                        let Ok(n) = f[2..].parse::<usize>() else {
+                            return;
+                        };
+                        if let Some(rd) = c
+                            .get_mut("delta")
+                            .and_then(|d| d.get_mut("reasoning_details"))
+                            .and_then(Value::as_array_mut)
+                        {
+                            if let Some(item) = rd.get_mut(n).and_then(Value::as_object_mut) {
+                                item.insert("text".into(), Value::String(text.into()));
+                            }
                         }
                     }
                     "text" => {
@@ -273,14 +315,22 @@ pub fn set_slot(data: &mut Value, channel: &str, text: &str) {
         }
         return;
     }
-    // o.message.content / o.response
+    // o.message.content / o.message.thinking / o.response / o.thinking
     if channel == "o.message.content" {
         if let Some(msg) = data.get_mut("message").and_then(Value::as_object_mut) {
             msg.insert("content".into(), Value::String(text.into()));
         }
+    } else if channel == "o.message.thinking" {
+        if let Some(msg) = data.get_mut("message").and_then(Value::as_object_mut) {
+            msg.insert("thinking".into(), Value::String(text.into()));
+        }
     } else if channel == "o.response" {
         if let Some(o) = data.as_object_mut() {
             o.insert("response".into(), Value::String(text.into()));
+        }
+    } else if channel == "o.thinking" {
+        if let Some(o) = data.as_object_mut() {
+            o.insert("thinking".into(), Value::String(text.into()));
         }
     }
 }
