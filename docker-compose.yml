@@ -1,0 +1,60 @@
+# Maskit-RS Docker Compose 示例
+#
+# 用法：
+#   docker compose up -d
+#   然后打开 http://127.0.0.1:18701/console
+#
+# 首次启动令牌见容器日志（docker compose logs maskit | grep token）
+# 或在 data/config.json 的 panel_token 字段查看/修改。
+
+services:
+  maskit:
+    # 本地构建（默认）
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: maskit-rs:local
+    container_name: maskit-rs
+    restart: unless-stopped
+
+    ports:
+      # 单端口：Web 控制台(/console) + 管理 API + LLM 反代 共用
+      - "127.0.0.1:18701:18701"
+
+    volumes:
+      # 配置与事件库持久化（SQLite），容器重建不丢历史
+      - ./data:/data
+
+    environment:
+      MASKIT_RS_DATA_DIR: /data
+      RUST_LOG: info
+      # TZ: Asia/Shanghai
+
+    # distroless 镜像没有 shell，无法 exec 排障；需要时用 docker logs
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    # 资源上限（按需调整；脱敏是 CPU 密集型，给足 CPU 配额更稳）
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 512M
+
+# ---------------------------------------------------------------------------
+# 改用 GHCR 镜像（发布版）时，把上面的 build/image 换成：
+#
+#   image: ghcr.io/<你的账号或组织>/maskit-rs:v0.1.0
+#
+# 例：
+#   services:
+#     maskit:
+#       image: ghcr.io/owner/maskit-rs:latest
+#       ports: ["127.0.0.1:18701:18701"]
+#       volumes: ["./data:/data"]
+#       environment:
+#         MASKIT_RS_DATA_DIR: /data
+# ---------------------------------------------------------------------------

@@ -1,0 +1,121 @@
+{
+  "server": {
+    "port": 18701,
+    "bind": "127.0.0.1"
+  },
+  "upstream": {
+    "target": "",
+    "extra_headers": {},
+    "connect_timeout_secs": 15,
+    "read_timeout_secs": 0
+  },
+  "mask": {
+    "enabled": true,
+    "builtin_rules": {
+      "ACCESS_KEY": false,
+      "API_KEY": true,
+      "CARD": true,
+      "CONNSTR": true,
+      "EMAIL": true,
+      "HKID": false,
+      "IBAN": false,
+      "IDCARD": true,
+      "IPV6_PRIVATE": false,
+      "IP_INTERNAL": false,
+      "IP_PRIVATE": false,
+      "IP_PUBLIC": false,
+      "JWT": false,
+      "LANDLINE": true,
+      "MAC": false,
+      "PHONE": true,
+      "PLATE": false,
+      "PRIVATE_KEY": false,
+      "SECRET": false,
+      "TOKEN": false,
+      "USCC": false
+    },
+    "custom_words": {},
+    "custom_regexes": [],
+    "secret_prefixes": [
+      "sk-",
+      "ah-"
+    ],
+    "max_body_bytes": 33554432,
+    "session_ttl": 600,
+    "ner_enabled": false,
+    "record_plaintext_words": true,
+    "sensitive_disabled": [],
+    "sensitive_word_disabled": {},
+    "sensitive_word_whole": []
+  },
+  "command_block": {
+    "mode": "observe",
+    "channels": [
+      "tool"
+    ],
+    "allow_patterns": [],
+    "patterns": [
+      {
+        "id": "builtin-rm-root",
+        "label": "递归删除根目录",
+        "regex": "(?i)\\brm\\s+(?:-[a-z]*[rf][a-z]*\\s+)+(?:/|/\\*)(?:\\s|$|;|&|\\|)",
+        "enabled": true,
+        "builtin": true
+      },
+      {
+        "id": "builtin-rm-home",
+        "label": "递归删除家目录",
+        "regex": "(?i)\\brm\\s+(?:-[a-z]*[rf][a-z]*\\s+)+~(?:/\\*?)?(?=\\s|$|;|&|\\|)",
+        "enabled": true,
+        "builtin": true
+      },
+      {
+        "id": "builtin-del-win",
+        "label": "Windows 全盘删除",
+        "regex": "(?i)(?:^|[\\s;&|])(?:del|erase)\\s+/[sq]\\b[^\\n]{0,40}[A-Za-z]:[\\\\/]?(?:\\s|$)|\\bRemove-Item\\b[^\\n]{0,60}-Recurse\\b[^\\n]{0,40}-Force\\b[^\\n]{0,20}[A-Za-z]:\\\\(?:\\s|$|\")",
+        "enabled": true,
+        "builtin": true
+      },
+      {
+        "id": "builtin-format",
+        "label": "格式化磁盘/块设备",
+        "regex": "(?i)(?:\\bformat\\s+[A-Za-z]:|\\bmkfs(?:\\.\\w+)?\\s+/dev/)",
+        "enabled": true,
+        "builtin": true
+      },
+      {
+        "id": "builtin-drop-db",
+        "label": "删除数据库/表",
+        "regex": "(?i)(?:\\bdrop\\s+(?:database|schema)\\b|\\bdrop\\s+table\\b|\\btruncate\\s+table\\b)",
+        "enabled": true,
+        "builtin": true
+      },
+      {
+        "id": "builtin-dd",
+        "label": "dd 直写块设备",
+        "regex": "(?i)\\bdd\\s+[^\\n]{0,60}\\bof=/dev/(?:sd[a-z]|nvme\\d|disk\\d)",
+        "enabled": true,
+        "builtin": true
+      },
+      {
+        "id": "builtin-forkbomb",
+        "label": "fork 炸弹",
+        "regex": ":\\(\\)\\s*\\{\\s*:\\|\\s*:&\\s*\\}\\s*;\\s*:",
+        "enabled": true,
+        "builtin": true
+      }
+    ]
+  },
+  "audit": {
+    "enabled": true,
+    "passive": true,
+    "severity_floor": "MEDIUM",
+    "signals": {}
+  },
+  "fail_closed": true,
+  "response_scan": true,
+  "stream_response": true,
+  "log_retention_days": 7,
+  "panel_token": "",
+  "paused": false
+}

@@ -1,0 +1,17 @@
+# 构建上下文排除项：显著减小上下文、避免把本地产物带进镜像
+target/
+data/
+.git/
+.github/
+tests/
+examples/
+*.md
+!README.md
+Dockerfile
+docker-compose.yml
+.dockerignore
+config.json
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+core.*

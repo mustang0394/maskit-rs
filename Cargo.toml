@@ -1,0 +1,60 @@
+[package]
+name = "maskit-rs"
+version = "0.1.0"
+edition = "2021"
+description = "Maskit Rust rewrite: local LLM privacy masking gateway (single-port, single-upstream)"
+license = "AGPL-3.0"
+
+[dependencies]
+# async runtime + http
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.8", features = ["http1", "json", "tokio", "query"] }
+hyper = { version = "1", features = ["client", "http1", "http2"] }
+http-body-util = "0.1"
+hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "http2", "tokio"] }
+# serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+# regex engines (fancy-regex ONLY for user custom regexes, see PLAN D7)
+regex = "1"
+aho-corasick = "1"
+fancy-regex = "0.14"
+# storage
+rusqlite = { version = "0.32", features = ["bundled"] }
+crossbeam-channel = "0.5"
+dashmap = "6"
+# embedded ui
+rust-embed = { version = "8", features = ["mime-guess"] }
+mime_guess = "2"
+# util
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+uuid = { version = "1", features = ["v4"] }
+sha2 = "0.10"
+base64 = "0.22"
+once_cell = "1"
+rand = "0.8"
+percent-encoding = "2"
+futures-util = "0.3"
+async-stream = "0.3"
+bytes = "1"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+# integration test helpers
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true
+
+# 磁盘友好：容器根分区仅 31G，完整调试信息会把 target/ 推到 3GB+。
+# line-tables-only 保留可回溯的栈帧（panic 仍能定位到文件:行），体积降 ~70%。
+[profile.dev]
+debug = "line-tables-only"
+incremental = false
+
+[profile.test]
+debug = 0
+incremental = false

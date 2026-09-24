@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Maskit-RS 控制台</title>
+<link rel="stylesheet" href="/console/style.css" />
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">Maskit<span>-RS</span></div>
+  <nav class="tabs">
+    <button class="tab active" data-page="dashboard">概览</button>
+    <button class="tab" data-page="rules">规则</button>
+    <button class="tab" data-page="logs">日志</button>
+    <button class="tab" data-page="audit">审计</button>
+    <button class="tab" data-page="settings">设置</button>
+  </nav>
+  <div class="status" id="topStatus">连接中…</div>
+</header>
+
+<main>
+  <!-- 概览 -->
+  <section class="page active" id="page-dashboard">
+    <div class="cards" id="statCards"></div>
+    <div class="panel">
+      <h2>上游与运行状态</h2>
+      <table class="kv" id="statusTable"></table>
+      <div class="row">
+        <button id="btnPause" class="warn">暂停脱敏（纯透传）</button>
+        <button id="btnResume" class="ok">恢复脱敏</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- 规则 -->
+  <section class="page" id="page-rules">
+    <div class="panel">
+      <h2>内置规则（21 类）</h2>
+      <div class="rules" id="ruleToggles"></div>
+    </div>
+    <div class="panel">
+      <h2>自定义敏感词</h2>
+      <div class="row">
+        <input id="newWord" placeholder="敏感词" />
+        <input id="newLabel" placeholder="分类（如 人名）" />
+        <button id="btnAddWord">添加</button>
+      </div>
+      <table class="list" id="wordList"></table>
+    </div>
+    <div class="panel">
+      <h2>密钥前缀规则</h2>
+      <div class="row">
+        <input id="newPrefix" placeholder="如 sk-" />
+        <button id="btnAddPrefix">添加</button>
+      </div>
+      <div id="prefixList" class="chips"></div>
+    </div>
+  </section>
+
+  <!-- 日志 -->
+  <section class="page" id="page-logs">
+    <div class="panel">
+      <div class="row">
+        <select id="logFilter">
+          <option value="">全部事件</option>
+          <option value="MASK">MASK</option>
+          <option value="RESTORE">RESTORE</option>
+          <option value="PASS">PASS</option>
+          <option value="BYPASS">BYPASS</option>
+          <option value="BLOCK">BLOCK</option>
+          <option value="ERR">ERR</option>
+        </select>
+        <button id="btnRefreshLogs">刷新</button>
+        <button id="btnClearLogs" class="warn">清空日志</button>
+        <span class="hint">凭据类命中只显示打码预览与摘要，绝不显示原文</span>
+      </div>
+      <table class="list" id="logList"></table>
+    </div>
+  </section>
+
+  <!-- 审计 -->
+  <section class="page" id="page-audit">
+    <div class="panel">
+      <div class="row">
+        <button id="btnRefreshAudit">刷新</button>
+        <button id="btnClearAudit" class="warn">清空</button>
+        <span class="hint">被动信号：错误泄露 / 换芯 / 投毒 / 注入 / 危险命令（只记录，不改写）</span>
+      </div>
+      <table class="list" id="auditList"></table>
+    </div>
+  </section>
+
+  <!-- 设置 -->
+  <section class="page" id="page-settings">
+    <div class="panel">
+      <h2>上游（单一上游，单端口）</h2>
+      <div class="row">
+        <label>目标地址</label>
+        <input id="upstreamTarget" placeholder="https://api.your-relay.com" />
+      </div>
+      <div class="row">
+        <label>监听端口</label>
+        <input id="serverPort" type="number" />
+        <label>绑定地址</label>
+        <input id="serverBind" />
+      </div>
+      <div class="row">
+        <label>敏感内容上限（MiB）</label>
+        <input id="maxBodyMib" type="number" />
+        <label>会话 TTL（秒）</label>
+        <input id="sessionTtl" type="number" />
+      </div>
+    </div>
+    <div class="panel">
+      <h2>安全与行为</h2>
+      <div class="row"><label><input type="checkbox" id="failClosed" /> fail-closed（已识别协议脱敏异常时阻断）</label></div>
+      <div class="row"><label><input type="checkbox" id="responseScan" /> 响应侧 PII 扫描（模型幻觉泄漏告警）</label></div>
+      <div class="row"><label><input type="checkbox" id="streamResponse" /> SSE / NDJSON 流式还原</label></div>
+      <div class="row">
+        <label>命令拦截模式</label>
+        <select id="cmdMode">
+          <option value="observe">observe（只记录）</option>
+          <option value="rewrite">rewrite（改写为占位说明）</option>
+          <option value="block">block（停止下发）</option>
+        </select>
+      </div>
+      <div class="row">
+        <label>日志保留（天）</label>
+        <input id="retentionDays" type="number" />
+      </div>
+    </div>
+    <div class="panel">
+      <h2>访问令牌</h2>
+      <div class="row">
+        <input id="panelToken" />
+        <button id="btnRotateToken">重新生成</button>
+      </div>
+      <p class="hint">令牌保存在 config.json；控制台通过 Authorization: Bearer 调用 API。</p>
+    </div>
+    <div class="row">
+      <button id="btnSave" class="ok">保存配置</button>
+      <span id="saveMsg" class="hint"></span>
+    </div>
+  </section>
+</main>
+
+<script src="/console/app.js"></script>
+</body>
+</html>

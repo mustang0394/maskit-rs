@@ -1,0 +1,25 @@
+# Rust 构建产物
+/target
+
+# 运行时数据（配置含 panel_token、SQLite 事件库，绝不入库）
+/data
+/config.json
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+
+# 崩溃转储
+core.*
+core
+
+# 备份与临时文件
+*.bak
+*.tmp
+*.orig
+*.rej
+
+# 编辑器
+.idea/
+.vscode/
+*.swp
+.DS_Store
