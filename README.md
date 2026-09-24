@@ -134,6 +134,7 @@ maskit-rs/
 | `command_block.mode` | `observe` / `rewrite` / `block` |
 | `audit.*` | 审计开关、严重度门槛（**无主动探针**，只做被动检测） |
 | `panel_token` | 控制台令牌（不限制长度，原样生效；留空自动生成 24 位随机值） |
+| `mask.log_credential_plaintext` | 事件日志是否保留凭据类**明文原文**（默认 `true`）。⚠️ 为 `true` 时 API Key / 私钥 / 连接串等明文会写入 SQLite，**备份必须加密**；多人可读的主机建议设为 `false` |
 
 ---
 
