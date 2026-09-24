@@ -171,7 +171,7 @@ fn python_can_read_rust_written_events() {
         ..Default::default()
     };
     store.enqueue(ev);
-    std::thread::sleep(std::time::Duration::from_millis(800));
+    store.sync(); // 屏障：确保已落盘（下面用裸 SQL 模拟 Python 侧读取）
 
     // 模拟 Python 读取：按 Python 的 SQL 与字段访问方式
     let conn = Connection::open(store.path()).unwrap();
@@ -228,8 +228,8 @@ fn audit_events_roundtrip() {
         method: "POST".into(),
         path: "/v1/chat".into(),
     });
-    std::thread::sleep(std::time::Duration::from_millis(800));
-    // Python 侧读法：signal_type/severity/evidence 列 + payload
+    store.sync(); // 屏障：确保已落盘（下面用裸 SQL 模拟 Python 侧读取）
+                  // Python 侧读法：signal_type/severity/evidence 列 + payload
     let conn = Connection::open(store.path()).unwrap();
     let (sig, sev, evi): (String, String, String) = conn
         .query_row(
@@ -269,15 +269,10 @@ fn mapping_save_lookup_prune_roundtrip() {
     ];
     assert_eq!(store.save_mappings(&pairs, 86400), 2, "应全部入队");
 
-    let mut got = None;
-    for _ in 0..100 {
-        if let Some(v) = store.lookup_mapping("13800138000") {
-            got = Some(v);
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-    let (tok, label) = got.expect("落盘后应能查到映射");
+    store.sync(); // 屏障：确保已入队 == 已落盘
+    let (tok, label) = store
+        .lookup_mapping("13800138000")
+        .expect("落盘后应能查到映射");
     assert_eq!(tok, "{{PHONE_kqmzbv}}");
     assert_eq!(label, "PHONE");
     assert_eq!(
@@ -293,7 +288,7 @@ fn mapping_save_lookup_prune_roundtrip() {
         "PHONE".to_string(),
     )];
     assert_eq!(store.save_mappings(&expiring, 0), 1);
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    store.sync();
     assert!(
         store.lookup_mapping("13900139000").is_none(),
         "TTL 到期的映射不应被查到"
@@ -301,7 +296,7 @@ fn mapping_save_lookup_prune_roundtrip() {
 
     // 清理：prune 后过期行消失，存活行保留
     store.prune_mappings();
-    std::thread::sleep(std::time::Duration::from_millis(300));
+    store.sync();
     assert!(
         store.lookup_mapping("13800138000").is_some(),
         "未过期映射应保留"
@@ -322,13 +317,7 @@ fn mapping_save_is_idempotent_upsert() {
             86400,
         );
     }
-    // 写线程「满批或 500ms 超时」才 flush，轮询等待可见
-    for _ in 0..100 {
-        if store.load_mappings(100).iter().any(|(t, _, _)| *t == tok) {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
+    store.sync();
     let all = store.load_mappings(100);
     let n = all.iter().filter(|(t, _, _)| *t == tok).count();
     assert_eq!(n, 1, "同一 token 只应保留 1 行，实际 {n}");

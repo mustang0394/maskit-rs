@@ -46,6 +46,9 @@ enum StoreMsg {
     Mappings(Vec<(String, String, String, u64)>),
     /// 清理过期映射
     PruneMappings,
+    /// 同步屏障：写线程处理到此消息时，先把之前累积的批次落盘再回复。
+    /// 供测试 / 关停前确保「已入队 == 已落盘」。
+    Flush(std::sync::mpsc::Sender<()>),
     Shutdown,
 }
 
@@ -78,6 +81,21 @@ impl EventStore {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// 同步屏障：阻塞直到**此前入队的所有消息**都已提交到 SQLite。
+    ///
+    /// 消息与写线程共用一个有序队列，因此屏障被处理时，它之前的消息必然已经
+    /// 落盘（同一批次内 commit）。写线程卡死时最多等 5s，不会永久挂起。
+    ///
+    /// 代理热路径**不应**调用（那是阻塞的）；它的用途是测试与关停前排空。
+    pub fn sync(&self) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        // 用阻塞 send 而非 try_send：屏障必须保证顺序，队列满则等写线程排空
+        if self.tx.send(StoreMsg::Flush(tx)).is_err() {
+            return;
+        }
+        let _ = rx.recv_timeout(std::time::Duration::from_secs(5));
     }
 
     /// 入队事件（非阻塞；队列满则丢弃并计数 —— 绝不让日志拖慢代理）。
@@ -599,6 +617,12 @@ fn writer_loop(path: &Path, rx: Receiver<StoreMsg>, stats: Arc<Mutex<WriterStats
                 flush_batch(&mut conn, &mut batch, &stats, path);
                 break;
             }
+            // 屏障：立即落盘，不等「满批或 500ms」阈值（否则 sync() 要白等一拍）
+            Ok(m @ StoreMsg::Flush(_)) => {
+                batch.push(m);
+                flush_batch(&mut conn, &mut batch, &stats, path);
+                last_write = std::time::Instant::now();
+            }
             Ok(m) => batch.push(m),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
@@ -648,6 +672,8 @@ fn flush_batch(
     let mut written = 0u64;
     let mut failed = 0u64;
     let mut reconnect = false;
+    // 屏障回执必须等 commit 之后再发：先发会让调用方在事务尚未落盘时就去读库
+    let mut flush_replies: Vec<std::sync::mpsc::Sender<()>> = Vec::new();
     match c.unchecked_transaction() {
         Ok(tx) => {
             for msg in msgs.iter() {
@@ -685,6 +711,7 @@ fn flush_batch(
                         let _ = prune_events(&tx, *days);
                     }
                     StoreMsg::Shutdown => {}
+                    StoreMsg::Flush(reply) => flush_replies.push(reply.clone()),
                 }
             }
             if tx.commit().is_err() {
@@ -708,6 +735,10 @@ fn flush_batch(
             s.batches += 1;
         }
         *conn = Some(c);
+    }
+    // 无论 commit 成功与否都要回执：否则写线程故障时 sync() 会白等满 5s
+    for reply in flush_replies {
+        let _ = reply.send(());
     }
 }
 
@@ -918,7 +949,7 @@ mod tests {
             false,
         ));
         // 触发 flush
-        std::thread::sleep(std::time::Duration::from_millis(700));
+        store.sync();
         let evs = store.fetch_events(10, 0);
         assert!(evs.len() >= 2, "事件必须落库（实际 {}）", evs.len());
         assert_eq!(evs[0].event_type, EventType::Restore, "新→旧");
@@ -930,7 +961,7 @@ mod tests {
         let store = EventStore::open(dir.path()).unwrap();
         let secret = "sk-abcdefghijklmnopqrstuvwxyz012345";
         store.enqueue(sample_event(EventType::Mask, "API_KEY", secret, true));
-        std::thread::sleep(std::time::Duration::from_millis(700));
+        store.sync();
         // 直接读原始 payload 检查
         let conn = Connection::open(store.path()).unwrap();
         let payload: String = conn
@@ -948,7 +979,7 @@ mod tests {
             store.enqueue(sample_event(EventType::Mask, "PHONE", "13800138000", false));
         }
         store.enqueue(sample_event(EventType::Block, "PHONE", "x", false));
-        std::thread::sleep(std::time::Duration::from_millis(700));
+        store.sync();
         let st = store.today_stats().unwrap();
         assert_eq!(st["requests"], 4);
         assert_eq!(st["mask_events"], 3);
@@ -992,7 +1023,7 @@ mod tests {
             method: "POST".into(),
             path: "/v1/chat".into(),
         });
-        std::thread::sleep(std::time::Duration::from_millis(700));
+        store.sync();
         let audits = store.fetch_audits(10);
         assert_eq!(audits.len(), 2);
         let st = store.today_stats().unwrap();
@@ -1007,10 +1038,10 @@ mod tests {
         old.ts = crate::store::events::now_secs() - 30.0 * 86400.0; // 30 天前
         store.enqueue(old);
         store.enqueue(sample_event(EventType::Mask, "PHONE", "13900139000", false));
-        std::thread::sleep(std::time::Duration::from_millis(700));
+        store.sync();
         assert_eq!(store.fetch_events(10, 0).len(), 2);
         store.prune(7); // 保留 7 天
-        std::thread::sleep(std::time::Duration::from_millis(700));
+        store.sync();
         let left = store.fetch_events(10, 0);
         assert_eq!(left.len(), 1, "过期事件必须被清理");
     }
@@ -1020,7 +1051,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = EventStore::open(dir.path()).unwrap();
         store.enqueue(sample_event(EventType::Mask, "PHONE", "13800138000", false));
-        std::thread::sleep(std::time::Duration::from_millis(700));
+        store.sync();
         let before = store.today_stats().unwrap();
         assert_eq!(before["mask_events"], 1);
         store.clear_events().unwrap();
@@ -1051,7 +1082,7 @@ mod tests {
         let _ = bad;
         // 正常写入仍可用
         store.enqueue(sample_event(EventType::Mask, "PHONE", "13800138000", false));
-        std::thread::sleep(std::time::Duration::from_millis(700));
+        store.sync();
         assert_eq!(store.fetch_events(10, 0).len(), 1);
     }
 
@@ -1068,7 +1099,7 @@ mod tests {
                 false,
             ));
         }
-        std::thread::sleep(std::time::Duration::from_millis(900));
+        store.sync();
         let s = store.stats.lock().unwrap().clone();
         assert!(s.written > 0, "正常事件必须写入");
     }
