@@ -101,7 +101,9 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
 
       - name: 单元 + 集成测试
-        run: cargo test
+        # 用 verify.sh 而非裸 `cargo test`：它会解析 failed/ignored 并据此退出，
+        # 避免「看着 passed 数字像过了、实际有失败」（曾因此漏交、CI 才报）。
+        run: ./scripts/verify.sh
 
       - name: 性能基准（release + 串行，计时才有意义）
         run: cargo test --release --test perf_tests -- --test-threads=1

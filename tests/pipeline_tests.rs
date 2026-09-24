@@ -452,9 +452,12 @@ async fn e2e_mask_and_restore_nonstream() {
     assert!(restore.is_some(), "响应侧必须发 RESTORE 事件");
 }
 
-/// 行 16：凭据类命中不落原文（红线）。
+/// 行 16：**凭据类原文明文入日志**（用户决定：不分类别，全部可看）。
+///
+/// 原断言为「凭据原文永不落库」，已被 M18 的用户决策推翻；同时下方补了
+/// `log_credential_plaintext=false` 时的红线回归。
 #[tokio::test]
-async fn credential_items_never_store_plaintext() {
+async fn credential_items_keep_plaintext_by_default() {
     let h = Harness::new(true, false, true).await;
     let secret = "sk-1234567890abcdefghijklmnopqrst";
     let body =
@@ -464,14 +467,57 @@ async fn credential_items_never_store_plaintext() {
         .await;
     assert_eq!(status, StatusCode::OK);
     let up = String::from_utf8_lossy(&h.mock.last_body().unwrap()).to_string();
-    assert!(!up.contains(secret));
+    assert!(!up.contains(secret), "发给上游的内容不得含明文密钥");
     let ev = find_event(h.bus(), maskit_rs::store::events::EventType::Mask).expect("MASK 事件");
-    for item in &ev.items {
-        assert_ne!(item.original, secret, "凭据原文永不落库");
-        if item.label == "API_KEY" {
-            assert!(item.cred);
-            assert_eq!(item.digest.len(), 16, "凭据必须带 sha256 摘要");
-            assert!(!item.preview.contains(&secret[10..30]));
+    let api_key = ev
+        .items
+        .iter()
+        .find(|i| i.label == "API_KEY")
+        .expect("应有 API_KEY 项");
+    assert_eq!(
+        api_key.original, secret,
+        "默认应保留凭据原文（用户要求：全类型都可看）"
+    );
+    assert!(api_key.cred, "cred 标记仍应为 true（供 UI 区分类型）");
+    assert_eq!(api_key.digest.len(), 16, "凭据必须带 sha256 摘要");
+    assert!(
+        !api_key.preview.contains(&secret[10..30]),
+        "打码预览不应泄露中段"
+    );
+    assert!(!api_key.token.is_empty(), "仍应产出占位符");
+}
+
+/// 把 \`mask.log_credential_plaintext\` 设为 false 时，凭据原文必须重新被清空
+/// （事件、DB 两层都不留）。这是保留红线的退路。
+#[tokio::test]
+async fn credential_plaintext_respects_config_off() {
+    let h = Harness::new(true, false, true).await;
+    {
+        let mut cfg = h.state.config.get();
+        cfg.mask.log_credential_plaintext = false;
+        h.state.config.update(cfg);
+    }
+    let secret = "sk-1234567890abcdefghijklmnopqrst";
+    let body =
+        format!(r#"{{"model":"gpt-4o","messages":[{{"role":"user","content":"key {secret}"}}]}}"#);
+    let (status, _) = h
+        .send("POST", "/v1/chat/completions", "application/json", &body)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let ev = find_event(h.bus(), maskit_rs::store::events::EventType::Mask).expect("MASK 事件");
+    let api_key = ev
+        .items
+        .iter()
+        .find(|i| i.label == "API_KEY")
+        .expect("应有 API_KEY 项");
+    assert_eq!(api_key.original, "", "关闭开关后凭据原文必须清空（红线）");
+    assert_eq!(api_key.digest.len(), 16, "摘要仍保留");
+    assert!(!api_key.preview.is_empty(), "打码预览仍保留");
+    // 非凭据类不受影响
+    let phone_ev = find_event(h.bus(), maskit_rs::store::events::EventType::Mask).unwrap();
+    for it in &phone_ev.items {
+        if !it.cred {
+            assert!(!it.original.is_empty(), "非凭据类始终保留原文");
         }
     }
 }

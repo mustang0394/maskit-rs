@@ -530,3 +530,34 @@ pending drain 不泄漏、10050 条 LRU 淘汰、落盘往返/幂等 upsert/TTL 
 **测试** +6：全局 store 零增长（连跑 20 次防假阴性）、DB 零写入、
 纯文本往返一致、三协议输出均为合法 JSON 且保留 model、空输入 400、页面存在
 且声明隔离。312 全绿，clippy 零告警。
+
+
+## M20：修测试门禁盲区（流程缺陷，非代码缺陷）
+
+**事故**：M18 改了凭据明文的默认行为，`src/store/db.rs` 里的
+`credential_plaintext_never_persisted` 已同步重写，但
+`tests/pipeline_tests.rs:credential_items_never_store_plaintext` **漏改**。
+本地跑测试时却「看起来是绿的」。
+
+**根因不是忘了，是验证命令有缺陷。** 当时用的是：
+
+```bash
+cargo test 2>&1 | grep -E "test result" | awk '{s+=}'   # 只累加 passed
+```
+
+输出 `21 passed; 1 failed` 时，这行照样打印「测试通过: 21」——
+**失败数被完全丢弃**。最后几次全量跑我只看了这个数字就收工，
+于是漏交、CI 才报出来。
+
+**修法**：
+
+1. `scripts/verify.sh` —— 解析每个测试二进制的 passed/**failed**/ignored，
+   任一非零即退出码 1，并打印失败详情。已做过**自检**：注入一个必失败测试，
+   确认脚本确实返回 1 并列出 panic。
+2. CI 的 `cargo test` 换成 `./scripts/verify.sh`，与本地同一套判定。
+3. 重写 `credential_items_keep_plaintext_by_default`（默认保留明文），
+   并补 `credential_plaintext_respects_config_off`（开关关掉后红线必须恢复），
+   把「开关两边都有测试」变成硬约束。
+
+**教训**：验证脚本本身就是代码，也要测试。看到「通过数」不等于「没有失败」，
+必须看**失败数**。已改用 verify.sh，不再手写 awk 汇总。
