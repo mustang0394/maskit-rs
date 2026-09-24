@@ -125,10 +125,16 @@ pub fn placeholder_rx() -> &'static Regex {
 }
 
 /// 容错双花括号占位符（允许内部空白/大小写改写，`_BRACED_PLACEHOLDER_RX`）。
+///
+/// ⚠️ label 与 suffix 之间有**必需的 `_`**（与 Python 逐字一致）。
+/// 曾漏掉这个下划线：`([A-Za-z0-9_]{1,12})` 贪婪吃满 12 字符后接不上 6 位后缀，
+/// 于是 12 字符标签（`safe_label` 的上限，如 `CUSTOMERID20`）永远匹配不上；
+/// 而宽松遍又会把「看起来完整的 `{{…}}`」当已处理跳过 → **该占位符永久还原不回来**。
+/// 反向副作用是会把缺下划线的畸形形态 `{{TERMxxxxxx}}` 误认成占位符。
 pub fn braced_placeholder_rx() -> &'static Regex {
     static RX: Lazy<Regex> = Lazy::new(|| {
         Regex::new(&format!(
-            r"\{{\{{\s*([A-Za-z0-9_]{{1,12}})({SUFFIX_PAT})\s*\}}\}}"
+            r"\{{\{{\s*([A-Za-z0-9_]{{1,12}})_({SUFFIX_PAT})\s*\}}\}}"
         ))
         .unwrap()
     });
@@ -139,7 +145,7 @@ pub fn braced_placeholder_rx() -> &'static Regex {
 pub fn any_braced_suffix_rx() -> &'static Regex {
     static RX: Lazy<Regex> = Lazy::new(|| {
         Regex::new(&format!(
-            r"(?i)^\{{\{{\s*([A-Za-z0-9_]{{1,12}})({SUFFIX_PAT})\s*\}}\}}$"
+            r"(?i)^\{{\{{\s*([A-Za-z0-9_]{{1,12}})_({SUFFIX_PAT})\s*\}}\}}$"
         ))
         .unwrap()
     });
@@ -147,10 +153,14 @@ pub fn any_braced_suffix_rx() -> &'static Regex {
 }
 
 /// 转义形态（`\{\{X\}\}` / `\\{\\{X\\}\\}`，`_ESCAPED_PLACEHOLDER_RX`）。
+///
+/// ⚠️ 必须 `(?i)`（与 Python 的 `re.IGNORECASE` 一致）：模型「转义 + 顺手大写」
+/// 会产出 `\{\{TERM_BKRHVH\}\}`，后缀字符类只写了小写辅音/hex，
+/// 缺 IGNORECASE 就整条匹配不上（`canonicalize` 本来会把后缀转小写）。
 pub fn escaped_placeholder_rx() -> &'static Regex {
     static RX: Lazy<Regex> = Lazy::new(|| {
         Regex::new(&format!(
-            r"(?:\\{{0,3}}\{{){{1,3}}(?:\\{{0,3}})\s*([A-Za-z0-9_]{{1,12}})_({SUFFIX_PAT})\s*(?:\\{{0,3}}\}}){{1,3}}"
+            r"(?i)(?:\\{{0,3}}\{{){{1,3}}(?:\\{{0,3}})\s*([A-Za-z0-9_]{{1,12}})_({SUFFIX_PAT})\s*(?:\\{{0,3}}\}}){{1,3}}"
         ))
         .unwrap()
     });
@@ -252,11 +262,36 @@ mod tests {
         assert!(braced_placeholder_rx().is_match("{{EMAIL_abcdef}}"));
         assert!(escaped_placeholder_rx().is_match(r"\{\{EMAIL_abcdef\}\}"));
         assert!(escaped_placeholder_rx().is_match(r"\\{\\{EMAIL_abcdef\\}\\}"));
+        // 大写后缀（模型转义+大写改写）必须认（Python 侧是 re.IGNORECASE）
+        assert!(escaped_placeholder_rx().is_match(r"\{\{TERM_BKRHVH\}\}"));
         assert!(loose_placeholder_rx().is_match("SECRET_b5a53c"));
         assert!(loose_placeholder_rx().is_match("{{SECRET_b5a53c"));
         assert!(partial_rx().is_match("结尾{{NAME_ab"));
         assert!(partial_rx().is_match("文本\\"));
         assert!(!partial_rx().is_match("普通文本结尾"));
+    }
+
+    /// 回归：label 与 suffix 之间**必须**有下划线。
+    ///
+    /// 12 字符标签（`safe_label` 上限）曾因缺 `_` 而整条匹配不上，
+    /// 导致该占位符永久还原不回来；反过来 `{{TERMxxxxxx}}`（无下划线）被误认。
+    #[test]
+    fn braced_requires_underscore_separator() {
+        // 12 字符标签：必须匹配，且切成 (label, suffix)
+        let c = braced_placeholder_rx()
+            .captures("{{CUSTOMERID20_nsvdqs}}")
+            .expect("12 字符标签必须能解析");
+        assert_eq!(&c[1], "CUSTOMERID20");
+        assert_eq!(&c[2], "nsvdqs");
+        // any_braced_suffix_rx 同理（后缀反查靠它）
+        let c2 = any_braced_suffix_rx()
+            .captures("{{CUSTOMERID20_nsvdqs}}")
+            .expect("12 字符标签必须能按后缀反查");
+        assert_eq!(&c2[1], "CUSTOMERID20");
+        // 缺下划线的畸形形态不得被当成占位符（Python 同样不认）
+        assert!(!braced_placeholder_rx().is_match("{{TERMfwggbs}}"));
+        assert!(!any_braced_suffix_rx().is_match("{{TERMfwggbs}}"));
+        assert!(!placeholder_rx().is_match("{{TERMfwggbs}}"));
     }
 
     #[test]

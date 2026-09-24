@@ -11,6 +11,25 @@ cd "$(dirname "$0")/.."
 export PATH="$HOME/.cargo/bin:$PATH"
 export CARGO_INCREMENTAL=0
 
+# 前端门禁（先跑，失败即快速退出，不白等整套 cargo test）：
+#  1) `node --check`：语法层错误；
+#  2) `ui-smoke.js`：用最小 DOM 桩**真的执行** app.js 并逐页驱动。
+# console_tests 只能做「文本里包含某字符串」的断言，拦不住
+# 「语法合法但 IIFE 提前闭合 → 加载期 ReferenceError」这类 bug —— 实测
+# `node --check` 也拦不住（语法是合法的），只有真执行才拦得住。
+# node 不存在时跳过（不把 node 做成构建依赖）。
+if command -v node >/dev/null 2>&1; then
+  if node --check assets/app.js; then
+    echo "✅ app.js 语法检查通过"
+  else
+    echo "❌ app.js 语法检查失败"
+    exit 1
+  fi
+  node scripts/ui-smoke.js || exit 1
+else
+  echo "（跳过前端语法 / UI 冒烟：未安装 node）"
+fi
+
 out=$(cargo test 2>&1)
 echo "$out" | grep -E "^(error|warning: unused)" -A5 || true
 

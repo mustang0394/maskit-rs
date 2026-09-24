@@ -1,13 +1,14 @@
-/* Maskit-RS 控制台（原生 JS，无构建步骤） */
+/* Maskit-RS 控制台（原生 JS，无构建步骤，整文件一个 IIFE） */
 (function () {
   'use strict';
 
   const API = '/console/api';
   const LS_TOKEN = 'maskit_token';
   const LS_THEME = 'maskit_theme';
+  const API_TIMEOUT_MS = 30000;
   let TOKEN = localStorage.getItem(LS_TOKEN) || '';
 
-  /* ---------------- 主题 ---------------- */
+  /* ==================== 主题 ==================== */
   function applyTheme(theme) {
     document.documentElement.setAttribute('data-theme', theme);
     localStorage.setItem(LS_THEME, theme);
@@ -18,7 +19,7 @@
   }
   applyTheme(localStorage.getItem(LS_THEME) || 'dark');
 
-  /* ---------------- 工具 ---------------- */
+  /* ==================== 基础工具 ==================== */
   function $(id) { return document.getElementById(id); }
   function esc(v) {
     return String(v == null ? '' : v).replace(/[&<>"']/g, c => ({
@@ -26,11 +27,25 @@
     }[c]));
   }
   function fmtTs(ts) {
-    if (!ts) return '';
+    if (!ts) return '—';
     const d = new Date(ts * 1000);
     const p = n => String(n).padStart(2, '0');
     return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
   }
+  function fmtTime(ts) {
+    if (!ts) return '';
+    const d = new Date(ts * 1000);
+    const p = n => String(n).padStart(2, '0');
+    return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+  }
+  function fmtBytes(n) {
+    if (!n) return '';
+    if (n < 1024) return n + 'B';
+    if (n < 1024 * 1024) return (n / 1024).toFixed(1) + 'KB';
+    return (n / 1024 / 1024).toFixed(1) + 'MB';
+  }
+  function fmtMs(v) { return v == null ? '' : Number(v).toFixed(1) + 'ms'; }
+
   let toastTimer = null;
   function toast(msg, isErr) {
     const el = $('toast');
@@ -41,25 +56,115 @@
     toastTimer = setTimeout(() => { el.hidden = true; }, 3200);
   }
 
-  /* ---------------- API ---------------- */
-  async function api(path, opts) {
-    const res = await fetch(API + path, Object.assign({
-      headers: Object.assign({ 'Content-Type': 'application/json' },
-        TOKEN ? { Authorization: 'Bearer ' + TOKEN } : {}),
-    }, opts || {}));
-    if (res.status === 401) {
-      showLogin('令牌无效或已过期，请重新输入');
-      throw new Error('unauthorized');
+  /* ==================== 文本高亮 ==================== */
+  // 占位符形态（与引擎一致）：标签 1-12 位 [A-Za-z0-9_]，后缀 6 位辅音或留存 hex6。
+  // 另兼容模型把花括号「整理」掉的裸形态（`PHONE_bcdfgh`）—— 还原的宽松遍
+  // 就是冲着这种形态去的，日志里也常能看到，标出来才知道哪里是占位符。
+  const PH_BRACED = /\{\{[A-Za-z0-9_]{1,12}_[0-9a-zA-Z]{6}\}\}/g;
+  const PH_BARE = /(?<![A-Za-z0-9_])[A-Z][A-Z0-9]{1,11}_[0-9a-z]{6}(?![A-Za-z0-9_])/g;
+
+  /**
+   * 在**已转义**的文本上标出占位符与指定原文，返回安全 HTML。
+   * 先算好所有区间再一次性拼接，避免「替换出的标签又被后续替换命中」。
+   */
+  function highlight(text, needles) {
+    const src = esc(text == null ? '' : text);
+    if (!src) return '';
+    const marks = [];
+    const collect = re => {
+      const rx = new RegExp(re.source, 'g');
+      let m;
+      while ((m = rx.exec(src)) !== null) {
+        marks.push({ s: m.index, e: m.index + m[0].length, kind: 'tok' });
+        if (m[0].length === 0) rx.lastIndex++;
+      }
+    };
+    collect(PH_BRACED);
+    collect(PH_BARE);
+    const uniq = [...new Set((needles || []).filter(Boolean))].sort((a, b) => b.length - a.length);
+    for (const raw of uniq) {
+      const n = esc(raw);
+      if (!n) continue;
+      let i = 0;
+      while ((i = src.indexOf(n, i)) !== -1) {
+        const s = i, e = i + n.length;
+        if (!marks.some(r => s < r.e && e > r.s)) marks.push({ s, e, kind: 'hit' });
+        i = e;
+      }
     }
-    if (!res.ok) {
-      let msg = res.status + ' ' + res.statusText;
-      try { const j = await res.json(); msg = j.error || msg; } catch (e) {}
-      throw new Error(msg);
+    marks.sort((a, b) => a.s - b.s || b.e - a.e);
+    let out = '', pos = 0;
+    for (const r of marks) {
+      if (r.s < pos) continue;
+      out += src.slice(pos, r.s);
+      const seg = src.slice(r.s, r.e);
+      out += r.kind === 'tok' ? `<span class="tok">${seg}</span>` : `<mark class="hit">${seg}</mark>`;
+      pos = r.e;
     }
-    return res.json();
+    return out + src.slice(pos);
   }
 
-  /* ---------------- 登录 ---------------- */
+  /** 用命中明细把原文还原成「发给上游」的形态（老事件没有 masked_dialog 时兜底）。 */
+  function deriveMasked(text, items) {
+    let out = String(text || '');
+    const pairs = (items || [])
+      .filter(it => it.original && (it.tok || it.token))
+      .map(it => [it.original, it.tok || it.token])
+      .sort((a, b) => b[0].length - a[0].length);
+    for (const [orig, tok] of pairs) out = out.split(orig).join(tok);
+    return out;
+  }
+
+  async function copyFrom(el, btn) {
+    try {
+      await navigator.clipboard.writeText(el.textContent);
+      const old = btn.textContent;
+      btn.textContent = '已复制';
+      setTimeout(() => { btn.textContent = old; }, 1200);
+    } catch { toast('剪贴板不可用', true); }
+  }
+
+  /** 空状态 HTML。 */
+  function emptyBox(text) { return `<div class="d-empty">${esc(text)}</div>`; }
+
+  /* ==================== API ==================== */
+  async function api(path, opts) {
+    // 必须带超时：上游卡住时，展开日志详情等操作会永久停在「加载中…」
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), API_TIMEOUT_MS);
+    try {
+      const res = await fetch(API + path, Object.assign({
+        headers: Object.assign({ 'Content-Type': 'application/json' },
+          TOKEN ? { Authorization: 'Bearer ' + TOKEN } : {}),
+        signal: ctrl.signal,
+      }, opts || {}));
+      if (res.status === 401) {
+        showLogin('令牌无效或已过期，请重新输入');
+        throw new Error('unauthorized');
+      }
+      if (!res.ok) {
+        let msg = res.status + ' ' + res.statusText;
+        try { const j = await res.json(); msg = j.error || msg; } catch (e) {}
+        throw new Error(msg);
+      }
+      return res.json();
+    } catch (e) {
+      if (e && e.name === 'AbortError') throw new Error('请求超时（' + (API_TIMEOUT_MS / 1000) + 's）');
+      throw e;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /** 配置补丁：segs 优先（键含 '.' 时点分 path 会被切错）。返回新配置。 */
+  async function patch(segs, value) {
+    const r = await api('/config/patch', {
+      method: 'POST', body: JSON.stringify({ segs, value }),
+    });
+    return r.config;
+  }
+
+  /* ==================== 登录 ==================== */
   function showLogin(errMsg) {
     $('loginScreen').hidden = false;
     $('app').hidden = true;
@@ -82,7 +187,7 @@
     btn.disabled = true;
     btn.textContent = '验证中…';
     try {
-      await api('/status');                    // 验证令牌
+      await api('/status');
       localStorage.setItem(LS_TOKEN, TOKEN);
       $('loginError').hidden = true;
       enterApp();
@@ -100,6 +205,7 @@
   $('logoutBtn').addEventListener('click', () => {
     TOKEN = ''; localStorage.removeItem(LS_TOKEN);
     $('tokenInput').value = '';
+    stopLogAuto();
     showLogin();
   });
 
@@ -108,21 +214,47 @@
     applyTheme(cur === 'dark' ? 'light' : 'dark');
   });
 
-  /* ---------------- 页面切换 ---------------- */
+  /* ==================== 页面切换 ==================== */
+  const PAGES = ['dashboard', 'rules', 'logs', 'audit', 'test', 'settings'];
   const loaders = {};
+  let currentPage = 'dashboard';
+
+  /** 从 URL hash 取页面名（支持刷新保持当前页 / 直接书签某个页）。 */
+  function hashPage() {
+    try {
+      const h = String((window.location && window.location.hash) || '').replace(/^#\/?/, '');
+      return PAGES.includes(h) ? h : '';
+    } catch (e) { return ''; }
+  }
+
   function switchPage(name) {
-    document.querySelectorAll('.tab').forEach(t =>
-      t.classList.toggle('active', t.dataset.page === name));
-    document.querySelectorAll('.page').forEach(p =>
-      p.classList.toggle('active', p.id === 'page-' + name));
+    if (!PAGES.includes(name)) name = 'dashboard';
+    currentPage = name;
+    document.querySelectorAll('.tab').forEach(t => {
+      const on = t.dataset.page === name;
+      t.classList.toggle('active', on);
+      t.setAttribute('aria-selected', on ? 'true' : 'false');
+    });
+    document.querySelectorAll('.page').forEach(p => p.classList.toggle('active', p.id === 'page-' + name));
+    // 刷新/回退后仍停在当前页（用 replaceState，不往历史里堆垃圾条目）
+    try {
+      if (window.history && window.history.replaceState) {
+        window.history.replaceState(null, '', '#' + name);
+      }
+    } catch (e) { /* file:// 等场景忽略 */ }
+    if (name !== 'logs') stopLogAuto();
     if (loaders[name]) loaders[name]().catch(e => toast(e.message, true));
   }
   $('tabs').addEventListener('click', ev => {
     const t = ev.target.closest('.tab');
     if (t) switchPage(t.dataset.page);
   });
+  window.addEventListener('hashchange', () => {
+    const p = hashPage();
+    if (p && p !== currentPage) switchPage(p);
+  });
 
-  /* ---------------- 概览 ---------------- */
+  /* ==================== 概览 ==================== */
   async function loadDashboard() {
     const [status, today] = await Promise.all([api('/status'), api('/stats/today')]);
     const c = status.counters || {};
@@ -131,7 +263,7 @@
       ['已阻断', c.blocked], ['透传', c.bypassed], ['错误', c.errors],
       ['今日 token', today.tokens_total],
     ].map(([k, v]) =>
-      `<div class="card"><div class="v">${v == null ? 0 : v}</div><div class="k">${k}</div></div>`).join('');
+      `<div class="card"><div class="v">${v == null ? 0 : esc(v)}</div><div class="k">${esc(k)}</div></div>`).join('');
 
     $('statusTable').innerHTML = [
       ['监听', status.bind + ':' + status.port],
@@ -149,14 +281,16 @@
       (status.upstream_target ? '上游已配置' : '未配置上游');
     el.className = 'status ' + (status.upstream_target ? 'ok' : 'bad');
   }
+  loaders.dashboard = loadDashboard;
+
   $('btnPause').addEventListener('click', () =>
-    api('/proxy/pause', { method: 'POST' }).then(() => { toast('已暂停脱敏（纯透传）'); loadDashboard(); })
+    api('/proxy/pause', { method: 'POST' }).then(() => { toast('已暂停脱敏（纯透传）'); return loadDashboard(); })
        .catch(e => toast(e.message, true)));
   $('btnResume').addEventListener('click', () =>
-    api('/proxy/resume', { method: 'POST' }).then(() => { toast('已恢复脱敏'); loadDashboard(); })
+    api('/proxy/resume', { method: 'POST' }).then(() => { toast('已恢复脱敏'); return loadDashboard(); })
        .catch(e => toast(e.message, true)));
 
-  /* ---------------- 规则 ---------------- */
+  /* ==================== 规则：内置规则 ==================== */
   const RULE_LABELS = {
     API_KEY: 'API Key / 密钥前缀', ACCESS_KEY: '云厂商 AccessKey', CARD: '银行卡（Luhn 校验）',
     CONNSTR: '连接串密码', EMAIL: '邮箱地址', HKID: '港澳通行证', IBAN: 'IBAN 银行账号',
@@ -168,6 +302,31 @@
   };
   const RULE_DEFAULT_ON = ['API_KEY', 'CARD', 'CONNSTR', 'EMAIL', 'IDCARD', 'LANDLINE', 'PHONE'];
 
+  // 事件委托只注册一次（放在 IIFE 顶层）—— 早期写在 loadRules() 里，
+  // 而 loadRules 会被反复调用，每次都新建箭头函数、无法被去重，
+  // 于是监听器不断累积：切一个开关打 N 次 PATCH、弹 N 个 toast。
+  $('ruleToggles').addEventListener('change', async ev => {
+    const cb = ev.target.closest('input[data-rule]');
+    if (!cb) return;
+    const item = cb.closest('.rule-item');
+    item.classList.toggle('on', cb.checked);
+    try {
+      const cfg = await patch(['mask', 'builtin_rules', cb.dataset.rule], cb.checked);
+      renderRuleSummary(cfg.mask.builtin_rules || {});
+      toast(`${cb.dataset.rule} 已${cb.checked ? '开启' : '关闭'}`);
+    } catch (e) {
+      cb.checked = !cb.checked;
+      item.classList.toggle('on', cb.checked);
+      toast('保存失败：' + e.message, true);
+    }
+  });
+
+  function renderRuleSummary(rules) {
+    const keys = Object.keys(rules);
+    const n = keys.filter(k => rules[k]).length;
+    $('ruleSummary').textContent = `已开启 ${n} / ${keys.length}`;
+  }
+
   async function loadRules() {
     const cfg = await api('/config');
     const rules = cfg.mask.builtin_rules || {};
@@ -175,8 +334,7 @@
 
     $('ruleToggles').innerHTML = keys.map(k => {
       const name = RULE_LABELS[k] || k;
-      const full = `${name}（${k}）`;
-      return `<label class="rule-item ${rules[k] ? 'on' : ''}" title="${esc(full)}">
+      return `<label class="rule-item ${rules[k] ? 'on' : ''}" title="${esc(name)}（${esc(k)}）">
         <input type="checkbox" data-rule="${esc(k)}" ${rules[k] ? 'checked' : ''}/>
         <span class="rule-text">
           <span class="rule-name">${esc(name)}</span>
@@ -184,127 +342,11 @@
         </span>
       </label>`;
     }).join('');
-
-    const onCount = keys.filter(k => rules[k]).length;
-    $('ruleSummary').textContent = `已开启 ${onCount} / ${keys.length}`;
-
-    // 事件委托：单个开关变更立即保存
-    $('ruleToggles').addEventListener('change', async ev => {
-      const cb = ev.target.closest('input[data-rule]');
-      if (!cb) return;
-      const item = cb.closest('.rule-item');
-      item.classList.toggle('on', cb.checked);
-      try {
-        await api('/config/patch', {
-          method: 'POST',
-          body: JSON.stringify({ path: 'mask.builtin_rules.' + cb.dataset.rule, value: cb.checked }),
-        });
-        const cfg2 = await api('/config');
-        const r2 = cfg2.mask.builtin_rules || {};
-        const n = Object.values(r2).filter(Boolean).length;
-        $('ruleSummary').textContent = `已开启 ${n} / ${Object.keys(r2).length}`;
-        toast(`${cb.dataset.rule} 已${cb.checked ? '开启' : '关闭'}`);
-      } catch (e) {
-        cb.checked = !cb.checked;
-        item.classList.toggle('on', cb.checked);
-        toast('保存失败：' + e.message, true);
-      }
-    });
-
-    // 自定义词：按分类分组展示
-    const words = cfg.mask.custom_words || {};
-    const groups = new Map();
-    for (const [w, l] of Object.entries(words)) {
-      const key = l || 'TERM';
-      if (!groups.has(key)) groups.set(key, []);
-      groups.get(key).push(w);
-    }
-    // 分类补全：已用过的分类直接选
-    $('labelOptions').innerHTML = [...groups.keys()]
-      .sort()
-      .map(l => `<option value="${esc(l)}"></option>`).join('');
-    // 占位符标签只留 ASCII：中文分类会退化成 TERM，提前告知避免误解
-    const pendingLabel = $('newLabel').value.trim();
-    const tokLabel = safeLabel(pendingLabel);
-    $('labelHint').textContent = pendingLabel && tokLabel !== pendingLabel
-      ? `占位符前缀将使用 ${tokLabel}（${pendingLabel} 含非 ASCII 字符，会被剔除）`
-      : '';
-    $('wordList').innerHTML = groups.size
-      ? [...groups.entries()].sort((a, b) => a[0].localeCompare(b[0])).map(([label, ws]) => `
-          <div class="word-group">
-            <span class="word-group-name">${esc(label)}
-              <span class="tok">{{${esc(safeLabel(label))}_xxxxxx}}</span>
-            </span>
-            ${ws.sort().map(w => `<span class="chip" title="${esc(w)}">
-              <span class="chip-text">${esc(w)}</span>
-              <button data-del-word="${esc(w)}" aria-label="删除">×</button>
-            </span>`).join('')}
-          </div>`).join('')
-      : '<span class="hint">暂无自定义敏感词</span>';
-
-    // 前缀
-    const prefixes = cfg.mask.secret_prefixes || [];
-    $('prefixList').innerHTML = prefixes.length
-      ? prefixes.map(p => `<span class="chip"><span class="chip-text mono">${esc(p)}</span>
-            <button data-del-prefix="${esc(p)}" aria-label="删除">×</button></span>`).join('')
-      : '<span class="hint">未配置前缀规则</span>';
+    renderRuleSummary(rules);
+    await loadWords(cfg);
+    renderPrefixes(cfg);
   }
   loaders.rules = loadRules;
-
-  // 占位符标签 ASCII 化（与服务端 safe_label 一致）
-  function safeLabel(label) {
-    const s = String(label || '').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 12);
-    return s || 'TERM';
-  }
-  // 多词切分：换行 / 逗号 / 顿号 / 分号 / 空白
-  function splitWords(text) {
-    return [...new Set(
-      String(text || '').split(/[\n\r,，、;；\s]+/)
-        .map(s => s.trim()).filter(Boolean)
-    )];
-  }
-
-  $('btnAddWord').addEventListener('click', async () => {
-    const list = splitWords($('newWords').value);
-    const label = $('newLabel').value.trim() || 'TERM';
-    if (!list.length) return toast('请输入至少一个敏感词', true);
-    if (list.some(w => w.length > 200)) return toast('单个敏感词不能超过 200 字符', true);
-    try {
-      const cfg = await api('/config');
-      const next = Object.assign({}, cfg.mask.custom_words);
-      // 整个词表一次 patch：避免 N 次往返，也避开读-改-写竞态
-      const added = [];
-      for (const w of list) {
-        if (!Object.prototype.hasOwnProperty.call(next, w)) added.push(w);
-        next[w] = label;
-      }
-      await api('/config/patch', {
-        method: 'POST', body: JSON.stringify({ segs: ['mask', 'custom_words'], value: next })
-      });
-      $('newWords').value = '';
-      toast(added.length
-        ? `已添加 ${added.length} 个词到「${label}」${list.length > added.length ? `（${list.length - added.length} 个已存在，已改分类）` : ''}`
-        : `已更新 ${list.length} 个词的分类为「${label}」`);
-      loadRules();
-    } catch (e) { toast('保存失败：' + e.message, true); }
-  });
-
-  $('btnAddPrefix').addEventListener('click', async () => {
-    const p = $('newPrefix').value.trim();
-    if (!p) return toast('请输入前缀', true);
-    try {
-      const cfg = await api('/config');
-      const list = (cfg.mask.secret_prefixes || []).slice();
-      if (list.includes(p)) { toast('该前缀已存在', true); return; }
-      list.push(p);
-      await api('/config/patch', {
-        method: 'POST', body: JSON.stringify({ path: 'mask.secret_prefixes', value: list }),
-      });
-      $('newPrefix').value = '';
-      toast('已添加前缀 ' + p);
-      loadRules();
-    } catch (e) { toast(e.message, true); }
-  });
 
   $('btnRulesDefault').addEventListener('click', async () => {
     if (!confirm('把所有内置规则恢复为默认开关状态？')) return;
@@ -313,7 +355,7 @@
       const cur = cfg.mask.builtin_rules || {};
       const next = {};
       Object.keys(cur).forEach(k => { next[k] = RULE_DEFAULT_ON.includes(k); });
-      await api('/config/patch', { method: 'POST', body: JSON.stringify({ path: 'mask.builtin_rules', value: next }) });
+      await patch(['mask', 'builtin_rules'], next);
       toast('已恢复默认');
       loadRules();
     } catch (e) { toast(e.message, true); }
@@ -326,257 +368,707 @@
       const cur = cfg.mask.builtin_rules || {};
       const next = {};
       Object.keys(cur).forEach(k => { next[k] = true; });
-      await api('/config/patch', { method: 'POST', body: JSON.stringify({ path: 'mask.builtin_rules', value: next }) });
+      await patch(['mask', 'builtin_rules'], next);
       toast('已开启全部规则');
       loadRules();
     } catch (e) { toast(e.message, true); }
   });
 
-  $('wordList').addEventListener('click', async ev => {
-    const b = ev.target.closest('button[data-del-word]');
-    if (!b) return;
-    const w = b.dataset.delWord;
+  /* ==================== 规则：密钥前缀 ==================== */
+  function renderPrefixes(cfg) {
+    const prefixes = cfg.mask.secret_prefixes || [];
+    $('prefixList').innerHTML = prefixes.length
+      ? prefixes.map(p => `<span class="chip"><span class="chip-text mono">${esc(p)}</span>
+            <button data-del-prefix="${esc(p)}" aria-label="删除">×</button></span>`).join('')
+      : '<span class="hint">未配置前缀规则</span>';
+  }
+
+  $('btnAddPrefix').addEventListener('click', async () => {
+    const p = $('newPrefix').value.trim();
+    if (!p) return toast('请输入前缀', true);
     try {
-      // 用 segs 而非点分 path：词含 '.' 时点分会被切成多段而写错位置
-      await api('/config/patch', {
-        method: 'POST',
-        body: JSON.stringify({ segs: ['mask', 'custom_words', w], value: null })
-      });
-      toast('已删除「' + w + '」');
+      const cfg = await api('/config');
+      const list = (cfg.mask.secret_prefixes || []).slice();
+      if (list.includes(p)) { toast('该前缀已存在', true); return; }
+      list.push(p);
+      await patch(['mask', 'secret_prefixes'], list);
+      $('newPrefix').value = '';
+      toast('已添加前缀 ' + p);
       loadRules();
-    } catch (e) { toast('删除失败：' + e.message, true); }
+    } catch (e) { toast(e.message, true); }
   });
 
   $('prefixList').addEventListener('click', async ev => {
     const b = ev.target.closest('button[data-del-prefix]');
     if (!b) return;
-    const p = b.dataset.delPrefix;
     try {
       const cfg = await api('/config');
-      const list = (cfg.mask.secret_prefixes || []).filter(x => x !== p);
-      await api('/config/patch', { method: 'POST', body: JSON.stringify({ path: 'mask.secret_prefixes', value: list }) });
-      toast('已删除前缀 ' + p);
+      const list = (cfg.mask.secret_prefixes || []).filter(x => x !== b.dataset.delPrefix);
+      await patch(['mask', 'secret_prefixes'], list);
+      toast('已删除前缀 ' + b.dataset.delPrefix);
       loadRules();
     } catch (e) { toast(e.message, true); }
   });
 
-  /* ---------------- 日志 ---------------- */
-  let logRows = [];        // 列表数据缓存，供详情展开复用
-  let openLogId = null;    // 当前展开的事件 id
+  /* ==================== 规则：自定义敏感词（主从双栏） ==================== */
+  const cw = { cfg: null, label: null, search: '', onlyDisabled: false };
 
-  async function loadLogs() {
-    const f = $('logFilter').value;
-    const data = await api('/logs?limit=200' + (f ? '&event_type=' + f : ''));
-    logRows = data.events || [];
-    $('logList').innerHTML = logRows.length
-      ? logRows.map(renderLogRow).join('')
-      : '<tr><td colspan="7" class="empty">暂无事件</td></tr>';
+  /** 占位符标签 ASCII 化（与服务端 safe_label 一致：非 [A-Z0-9] 剔除，≤12，空则 TERM）。 */
+  function safeLabel(label) {
+    const s = String(label || '').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 12);
+    return s || 'TERM';
   }
-  loaders.logs = loadLogs;
-
-  /** 凭据类：original 恒空（红线），退而显示打码预览 + 摘要 */
-  function itemSource(it) {
-    if (it.original) return esc(it.original);
-    if (it.preview) return `<span class="item-redacted" title="凭据类不存明文">${esc(it.preview)}</span>`;
-    return '<span class="hint">—</span>';
+  /** 多词切分：换行 / 逗号 / 顿号 / 分号 / 空白。 */
+  function splitWords(text) {
+    return [...new Set(
+      String(text || '').split(/[\n\r,，、;；\s]+/).map(s => s.trim()).filter(Boolean)
+    )];
   }
+  const isAsciiWord = w => /^[\x20-\x7e]+$/.test(w);
 
-  /** 单条命中：原文 → 占位符（这就是「加密后的字符串」） */
-  function renderItem(it) {
-    // 后端序列化名是 `tok`（serde rename），不是 `token`
-    const tok = it.tok || it.token || '';
-    const tail = [
-      it.length ? `<span class="hint">${it.length} 位</span>` : '',
-      it.digest ? `<span class="hint mono" title="sha256 摘要">#${esc(String(it.digest).slice(0, 8))}</span>` : '',
-    ].filter(Boolean).join(' ');
-    return `<div class="item">
-      <span class="item-label">${it.cred ? '<span class="lock" title="凭据类">🔒</span>' : ''}${esc(it.label)}</span>
-      <span class="item-src mono">${itemSource(it)}</span>
-      <span class="item-arrow">→</span>
-      <span class="item-tok mono">${tok ? esc(tok) : '<span class="hint">—</span>'}</span>
-      ${tail ? `<span class="item-meta">${tail}</span>` : ''}
-    </div>`;
+  /** 从配置抽出词表模型（分组 / 组开关 / 词开关 / 整词）。 */
+  function wmodel(cfg) {
+    const words = cfg.mask.custom_words || {};
+    const groups = new Map();
+    for (const [w, l] of Object.entries(words)) {
+      const key = (l || 'TERM');
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(w);
+    }
+    // 组开关里可能残留「词已删光」的分类 —— 也列出来，方便用户清掉
+    for (const l of (cfg.mask.sensitive_disabled || [])) if (!groups.has(l)) groups.set(l, []);
+    for (const l of Object.keys(cfg.mask.sensitive_word_disabled || {})) if (!groups.has(l)) groups.set(l, []);
+    return {
+      groups,
+      off: new Set(cfg.mask.sensitive_disabled || []),
+      wordOff: cfg.mask.sensitive_word_disabled || {},
+      whole: new Set(cfg.mask.sensitive_word_whole || []),
+    };
   }
 
-  function renderLogRow(e) {
-    const t = String(e.type || '');
-    const items = e.items || [];
-    // 统计：count=命中数 restored=还原数，其余为异常计数
-    const stat = [];
-    if (e.count) stat.push(`<span class="st st-mask">脱敏 ${e.count}</span>`);
-    if (e.restored) stat.push(`<span class="st st-restore">还原 ${e.restored}</span>`);
-    if (e.unresolved) stat.push(`<span class="st st-warn">未还原 ${e.unresolved}</span>`);
-    if (e.degraded) stat.push(`<span class="st st-deg">容错 ${e.degraded}</span>`);
-    const flags = [];
-    if (e.stream_mode) {
-      const actual = e.stream_actual || 'whole';
-      const bad = actual !== e.stream_mode;
-      flags.push(`<span class="hint${bad ? ' st-warn' : ''}" title="声明流式 ${esc(e.stream_mode)} / 实际 ${esc(actual)}">${bad ? '流式不符 ' : ''}${esc(e.stream_mode)}</span>`);
-    }
-    if (e.unknown_shape) flags.push('<span class="st-warn">未知形态</span>');
-    if (e.status >= 400) flags.push(`<span class="st-warn">${e.status}</span>`);
-    if (e.req_bytes) flags.push(`<span class="hint">↑${e.req_bytes}</span>`);
-
-    return `<tr class="log-row${openLogId === e.id ? ' open' : ''}" data-log-id="${e.id}">
-      <td class="col-time mono">${esc(fmtTs(e.ts))}</td>
-      <td class="col-type"><span class="badge ${esc(t)}">${esc(t)}</span></td>
-      <td class="col-req"><span class="path mono">${esc(e.method)} ${esc(e.path)}</span>
-        ${flags.length ? `<div class="row-flags">${flags.join(' ')}</div>` : ''}</td>
-      <td class="col-model mono">${esc(e.model || '—')}</td>
-      <td class="col-stat">${stat.join(' ') || '<span class="hint">—</span>'}</td>
-      <td class="col-items">${items.length
-          ? `<div class="item-list">${items.map(renderItem).join('')}</div>`
-          : `<span class="hint">${esc(e.reason || e.message || '无命中')}</span>`}</td>
-      <td class="col-ms mono">${e.mask_ms != null ? esc(Number(e.mask_ms).toFixed(1)) + 'ms' : '—'}</td>
-    </tr>
-    <tr class="log-detail" data-detail-for="${e.id}" hidden><td colspan="7"><div class="detail-box">加载中…</div></td></tr>`;
+  function wordEnabled(m, label, word) {
+    if (m.off.has(label)) return false;
+    return !((m.wordOff[label] || []).includes(word));
   }
 
-  // 点行展开详情（回源 /logs/detail，与 Python 的详情弹窗同源）
-  $('logList').addEventListener('click', async ev => {
-    const tr = ev.target.closest('tr.log-row');
-    if (!tr) return;
-    const id = Number(tr.dataset.logId);
-    const box = document.querySelector(`tr.log-detail[data-detail-for="${id}"] td`);
-    if (openLogId === id) {           // 再次点击收起
-      box.parentElement.hidden = true;
-      tr.classList.remove('open');
-      openLogId = null;
-      return;
-    }
-    // 先把之前展开的收起来
-    if (openLogId !== null) {
-      const prev = document.querySelector(`tr.log-detail[data-detail-for="${openLogId}"]`);
-      if (prev) prev.hidden = true;
-      const prevRow = document.querySelector(`tr.log-row[data-log-id="${openLogId}"]`);
-      if (prevRow) prevRow.classList.remove('open');
-    }
-    openLogId = id;
-    tr.classList.add('open');
-    box.parentElement.hidden = false;
-    box.innerHTML = '<div class="detail-box hint">加载中…</div>';
-    try {
-      const d = await api('/logs/detail?id=' + id);
-      box.innerHTML = renderLogDetail(d);
-    } catch (e) {
-      box.innerHTML = `<div class="detail-box hint">详情加载失败：${esc(e.message)}</div>`;
-    }
-  });
+  /** 更新敏感词区域的整块视图（导航 + 当前分类词表）。 */
+  function renderWords() {
+    const cfg = cw.cfg;
+    if (!cfg) return;
+    const m = wmodel(cfg);
+    const labels = [...m.groups.keys()].sort((a, b) => a.localeCompare(b));
 
-  function renderLogDetail(d) {
-    const e = d.event || d;
+    if (!labels.length) cw.label = null;
+    else if (!labels.includes(cw.label)) cw.label = labels[0];
+
+    // 分类补全
+    $('cwLabels').innerHTML = labels.map(l => `<option value="${esc(l)}"></option>`).join('');
+
+    // 目录
+    $('cwNav').innerHTML = labels.length ? labels.map(l => {
+      const ws = m.groups.get(l) || [];
+      const off = m.off.has(l);
+      const disabledN = ws.filter(w => !wordEnabled(m, l, w)).length;
+      return `<button class="nav-item ${l === cw.label ? 'active' : ''} ${off ? 'off' : ''}"
+                data-cw-label="${esc(l)}" title="${esc(l)}">
+          <span class="nav-dot"></span>
+          <span class="nav-name">${esc(l)}</span>
+          <span class="nav-count">${ws.length}</span>
+          ${disabledN ? `<span class="hint mono">${disabledN}关</span>` : ''}
+        </button>`;
+    }).join('') + `<button class="nav-item nav-add" data-cw-new="1">＋ 新建分类</button>`
+      : `<div class="cw-empty">暂无自定义敏感词<br><span class="hint">在上方输入分类与词，点「添加」</span></div>`;
+
+    // 当前分类
+    const label = cw.label;
+    if (!label) { $('cwMain').innerHTML = emptyBox('左侧还没有分类'); return; }
+    const all = (m.groups.get(label) || []).slice().sort((a, b) => a.localeCompare(b));
+    const q = cw.search.trim().toLowerCase();
+    const rows = all.filter(w => {
+      if (q && !w.toLowerCase().includes(q)) return false;
+      if (cw.onlyDisabled && wordEnabled(m, label, w)) return false;
+      return true;
+    });
+
+    const groupOff = m.off.has(label);
+    $('cwMain').innerHTML = `
+      <div class="cw-head">
+        <div class="cw-title">
+          <b>${esc(label)}</b>
+          <span class="hint mono">{{${esc(safeLabel(label))}_xxxxxx}}</span>
+          <span class="hint">${all.length} 词${all.length !== rows.length ? `（显示 ${rows.length}）` : ''}</span>
+          ${safeLabel(label) !== label
+            ? `<span class="cw-note" title="占位符标签只保留 A-Z0-9（最多 12 位），中文等字符会被剔除">⚠ 分类名含非 ASCII，占位符前缀用 ${esc(safeLabel(label))}</span>`
+            : ''}
+        </div>
+        <div class="cw-head-actions panel-actions">
+          <label class="switch-inline" title="关闭后该分类下所有词都不再命中">
+            <input type="checkbox" data-cw-group="${esc(label)}" ${groupOff ? '' : 'checked'} /> 整组启用
+          </label>
+          <button class="btn btn-sm" data-cw-bulk="on">全部启用</button>
+          <button class="btn btn-sm" data-cw-bulk="off">全部停用</button>
+          <button class="btn btn-sm btn-warn" data-cw-delgroup="${esc(label)}">删除分类</button>
+        </div>
+      </div>
+      ${groupOff ? `<div class="note warn">该分类已被「整组停用」——下面的逐词开关暂时不生效。</div>` : ''}
+      <div class="cw-bar">
+        <input class="cw-search" data-cw-search placeholder="在该分类内搜索…" value="${esc(cw.search)}" />
+        <label class="switch-inline">
+          <input type="checkbox" data-cw-onlydisabled ${cw.onlyDisabled ? 'checked' : ''} /> 仅显示已停用
+        </label>
+      </div>
+      ${rows.length ? `<table class="cmp cw-table"><thead><tr>
+          <th>词</th><th>占位符</th><th title="整词匹配：词两侧加边界，防 Acme 命中 AcmeCorp；仅对 ASCII 词有效">整词</th>
+          <th>启用</th><th></th>
+        </tr></thead><tbody>${rows.map(w => {
+          const on = wordEnabled(m, label, w);
+          const singleChar = [...w].length === 1;
+          const wholeApplicable = isAsciiWord(w) && !singleChar;
+          const wholeCell = !wholeApplicable
+            ? `<span class="hint" title="${singleChar ? '单字词自动加边界' : '整词匹配仅对 ASCII 词有效'}">—</span>`
+            : `<input type="checkbox" data-cw-whole="${esc(w)}" ${m.whole.has(w) ? 'checked' : ''} />`;
+          return `<tr>
+            <td class="cw-word">${esc(w)}</td>
+            <td class="mono cmp-tok">{{${esc(safeLabel(label))}_xxxxxx}}</td>
+            <td>${wholeCell}</td>
+            <td><input type="checkbox" data-cw-word="${esc(w)}" ${on ? 'checked' : ''} /></td>
+            <td><button class="btn btn-sm btn-icon" data-cw-del="${esc(w)}" aria-label="删除">✕</button></td>
+          </tr>`;
+        }).join('')}</tbody></table>`
+        : `<div class="cw-empty">${all.length ? '没有符合筛选条件的词' : '该分类下暂无词'}</div>`}
+    `;
+  }
+
+  /** 补齐 disabled/whole 的一致性：删词或改分类后清掉孤儿标记。 */
+  async function saveWordsModel(next, also) {
+    let cfg = await patch(['mask', 'custom_words'], next.custom_words);
+    if (also && also.sensitive_disabled !== undefined) {
+      cfg = await patch(['mask', 'sensitive_disabled'], also.sensitive_disabled);
+    }
+    if (also && also.sensitive_word_disabled !== undefined) {
+      cfg = await patch(['mask', 'sensitive_word_disabled'], also.sensitive_word_disabled);
+    }
+    if (also && also.sensitive_word_whole !== undefined) {
+      cfg = await patch(['mask', 'sensitive_word_whole'], also.sensitive_word_whole);
+    }
+    cw.cfg = cfg;
+    renderWords();
+    return cfg;
+  }
+
+  async function loadWords(cfg) {
+    cw.cfg = cfg || await api('/config');
+    renderWords();
+  }
+
+  $('cwWords').addEventListener('input', updateCwHint);
+  $('cwLabel').addEventListener('input', updateCwHint);
+  function updateCwHint() {
+    const pending = $('cwLabel').value.trim();
+    const tok = safeLabel(pending);
+    const n = splitWords($('cwWords').value).length;
     const parts = [];
-    if (e.message || e.reason) {
-      parts.push(`<div class="detail-note">${esc(e.message || e.reason)}</div>`);
-    }
-    if ((e.unresolved_samples || []).length) {
-      parts.push(`<div class="detail-note">未还原占位符：<span class="mono">${e.unresolved_samples.map(esc).join('、')}</span></div>`);
-    }
-    if ((e.items || []).length) {
-      parts.push(`<div class="detail-section">对照明细
-        <table class="cmp"><thead><tr>
-          <th>类型</th><th>原文</th><th>预览</th><th>占位符（加密后）</th><th>摘要 / 长度</th>
-        </tr></thead><tbody>${e.items.map(it => `<tr>
-          <td class="mono">${it.cred ? '🔒 ' : ''}${esc(it.label)}</td>
-          <td class="mono cmp-orig">${it.original ? esc(it.original) : '<span class="hint">不存明文</span>'}</td>
-          <td class="mono hint">${esc(it.preview || '—')}</td>
-          <td class="mono cmp-tok">${esc(it.tok || it.token || '—')}</td>
-          <td class="mono hint">${it.digest ? 'sha256:' + esc(String(it.digest).slice(0, 12)) : (it.hash || '—')}${it.length ? ' · ' + it.length + '位' : ''}</td>
-        </tr>`).join('')}</tbody></table></div>`);
-    }
-    if (e.dialog) {
-      parts.push(`<div class="detail-section">${e.type === 'MASK' ? '用户消息原文' : '助手回复原文'}
-        <pre class="detail-pre">${esc(e.dialog)}</pre></div>`);
-    }
-    if (!parts.length) parts.push('<div class="detail-box hint">无更多详情</div>');
-    return parts.join('');
+    if (n) parts.push(`待添加 ${n} 个词`);
+    if (pending && tok !== pending) parts.push(`占位符前缀将用 ${tok}（「${pending}」含非 ASCII，会被剔除）`);
+    $('cwHint').textContent = parts.join(' · ');
   }
-  $('btnRefreshLogs').addEventListener('click', () => loadLogs().catch(e => toast(e.message, true)));
-  $('logFilter').addEventListener('change', () => loadLogs().catch(e => toast(e.message, true)));
-  $('btnClearLogs').addEventListener('click', () => {
-    if (!confirm('清空事件日志？（统计摘要保留）')) return;
-    api('/logs/clear', { method: 'POST' }).then(() => { toast('已清空'); loadLogs(); })
-       .catch(e => toast(e.message, true));
-  });
 
-  /* ---------------- 审计 ---------------- */
-  async function loadAudit() {
-    const data = await api('/audit/events?limit=200');
-    const evs = data.events || [];
-    $('auditList').innerHTML = evs.length ? evs.map(a => `<tr class="audit-row">
-      <td class="col-time mono">${esc(fmtTs(a.ts))}</td>
-      <td class="col-sev"><span class="sev sev-${esc(a.severity)}">${esc(a.severity)}</span></td>
-      <td class="col-signal mono">${esc(a.signal_type)}</td>
-      <td class="col-evidence">${esc(a.evidence || '—')}</td>
-      <td class="col-req"><span class="path mono">${esc(a.method || '')} ${esc(a.path || '')}</span></td>
-    </tr>`).join('') : '<tr><td colspan="5" class="empty">暂无审计事件</td></tr>';
-  }
-  loaders.audit = loadAudit;
-  $('btnRefreshAudit').addEventListener('click', () => loadAudit().catch(e => toast(e.message, true)));
-  $('btnClearAudit').addEventListener('click', () => {
-    if (!confirm('清空审计事件？')) return;
-    api('/audit/clear', { method: 'POST' }).then(() => { toast('已清空'); loadAudit(); })
-       .catch(e => toast(e.message, true));
-  });
-
-  /* ---------------- 设置 ---------------- */
-  async function loadSettings() {
-    const cfg = await api('/config');
-    $('upstreamTarget').value = cfg.upstream.target || '';
-    $('serverPort').value = cfg.server.port;
-    $('serverBind').value = cfg.server.bind;
-    $('failClosed').checked = !!cfg.fail_closed;
-    $('responseScan').checked = !!cfg.response_scan;
-    $('streamResponse').checked = !!cfg.stream_response;
-    $('cmdMode').value = cfg.command_block.mode || 'observe';
-    $('retentionDays').value = cfg.log_retention_days;
-    $('panelToken').value = cfg.panel_token || '';
-  }
-  loaders.settings = loadSettings;
-
-  $('btnSave').addEventListener('click', async () => {
-    const cfg = await api('/config');
-    cfg.upstream.target = $('upstreamTarget').value.trim();
-    cfg.server.port = parseInt($('serverPort').value, 10) || cfg.server.port;
-    cfg.server.bind = $('serverBind').value.trim() || cfg.server.bind;
-    cfg.fail_closed = $('failClosed').checked;
-    cfg.response_scan = $('responseScan').checked;
-    cfg.stream_response = $('streamResponse').checked;
-    cfg.command_block.mode = $('cmdMode').value;
-    cfg.log_retention_days = parseInt($('retentionDays').value, 10) || 7;
-    const newTok = $('panelToken').value.trim();
-    if (newTok && newTok !== cfg.panel_token) cfg.panel_token = newTok;
+  $('cwAdd').addEventListener('click', async () => {
+    const list = splitWords($('cwWords').value);
+    const label = $('cwLabel').value.trim() || 'TERM';
+    if (!list.length) return toast('请输入至少一个敏感词', true);
+    if (list.some(w => w.length > 200)) return toast('单个敏感词不能超过 200 字符', true);
     try {
-      const r = await api('/config', { method: 'POST', body: JSON.stringify(cfg) });
-      const w = (r.warnings || []);
-      toast('已保存' + (w.length ? '（' + w.join('；') + '）' : ''), w.length > 0);
-      if ($('panelToken').value.trim() !== cfg.panel_token) {
-        TOKEN = $('panelToken').value.trim();
-        localStorage.setItem(LS_TOKEN, TOKEN);
+      const cur = (cw.cfg || await api('/config')).mask.custom_words || {};
+      const next = Object.assign({}, cur);
+      const added = [];
+      for (const w of list) {
+        if (!Object.prototype.hasOwnProperty.call(next, w)) added.push(w);
+        next[w] = label;
+      }
+      // 整个词表一次 patch：避免 N 次往返，也避开读-改-写竞态
+      await patch(['mask', 'custom_words'], next);
+      $('cwWords').value = '';
+      updateCwHint();
+      cw.label = label;
+      toast(added.length
+        ? `已添加 ${added.length} 个词到「${label}」${list.length > added.length ? `（${list.length - added.length} 个已存在，已改分类）` : ''}`
+        : `已更新 ${list.length} 个词的分类为「${label}」`);
+      await loadWords();
+    } catch (e) { toast('保存失败：' + e.message, true); }
+  });
+
+  // 目录点击（事件委托，只注册一次）
+  $('cwNav').addEventListener('click', ev => {
+    const add = ev.target.closest('[data-cw-new]');
+    if (add) { $('cwLabel').focus(); $('cwLabel').select(); return; }
+    const item = ev.target.closest('[data-cw-label]');
+    if (!item) return;
+    cw.label = item.dataset.cwLabel;
+    cw.search = '';
+    cw.onlyDisabled = false;
+    renderWords();
+  });
+
+  // 词表交互（事件委托）
+  $('cwMain').addEventListener('click', async ev => {
+    const t = ev.target;
+    const cfg = cw.cfg;
+    const m = wmodel(cfg);
+    try {
+      // 删除单个词（含 '.' 的词必须用 segs，点分 path 会被切错）
+      const del = t.closest('[data-cw-del]');
+      if (del) {
+        const w = del.dataset.cwDel;
+        const next = Object.assign({}, cfg.mask.custom_words);
+        delete next[w];
+        const wordOff = JSON.parse(JSON.stringify(m.wordOff));
+        let touchedOff = false;
+        for (const l of Object.keys(wordOff)) {
+          const before = wordOff[l].length;
+          wordOff[l] = wordOff[l].filter(x => x !== w);
+          if (!wordOff[l].length) delete wordOff[l];
+          if (wordOff[l] ? wordOff[l].length !== before : true) touchedOff = true;
+        }
+        const whole = [...m.whole].filter(x => x !== w);
+        await saveWordsModel({ custom_words: next }, {
+          sensitive_word_disabled: wordOff,
+          sensitive_word_whole: whole,
+        });
+        toast('已删除「' + w + '」');
+        return;
+      }
+      // 删除整个分类
+      const delg = t.closest('[data-cw-delgroup]');
+      if (delg) {
+        const label = delg.dataset.cwDelgroup;
+        const n = (m.groups.get(label) || []).length;
+        if (!confirm(`删除分类「${label}」及其 ${n} 个词？`)) return;
+        const next = Object.assign({}, cfg.mask.custom_words);
+        for (const w of (m.groups.get(label) || [])) delete next[w];
+        const wordOff = Object.assign({}, m.wordOff);
+        delete wordOff[label];
+        const whole = [...m.whole].filter(w => !(m.groups.get(label) || []).includes(w));
+        await saveWordsModel({ custom_words: next }, {
+          sensitive_disabled: [...m.off].filter(l => l !== label),
+          sensitive_word_disabled: wordOff,
+          sensitive_word_whole: whole,
+        });
+        toast(`已删除分类「${label}」`);
+        return;
+      }
+      // 全部启用 / 全部停用（本分类）
+      const bulk = t.closest('[data-cw-bulk]');
+      if (bulk) {
+        const label = cw.label;
+        const ws = m.groups.get(label) || [];
+        if (bulk.dataset.cwBulk === 'on') {
+          // 开：清掉整组停用 + 清掉本组逐词停用
+          const wordOff = Object.assign({}, m.wordOff);
+          delete wordOff[label];
+          await saveWordsModel({ custom_words: cfg.mask.custom_words }, {
+            sensitive_disabled: [...m.off].filter(l => l !== label),
+            sensitive_word_disabled: wordOff,
+          });
+        } else {
+          const wordOff = Object.assign({}, m.wordOff);
+          wordOff[label] = ws.slice();
+          await saveWordsModel({ custom_words: cfg.mask.custom_words }, {
+            sensitive_word_disabled: wordOff,
+          });
+        }
+        toast(`「${label}」已${bulk.dataset.cwBulk === 'on' ? '全部启用' : '全部停用'}`);
       }
     } catch (e) { toast('保存失败：' + e.message, true); }
   });
 
-  $('btnRotateToken').addEventListener('click', () => {
-    const CH = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789';
-    const a = new Uint8Array(24);
-    crypto.getRandomValues(a);
-    $('panelToken').value = Array.from(a).map(b => CH[b % CH.length]).join('');
-    toast('已生成新令牌，记得点「保存配置」');
+  $('cwMain').addEventListener('change', async ev => {
+    const t = ev.target;
+    const cfg = cw.cfg;
+    if (!cfg) return;
+    const m = wmodel(cfg);
+    try {
+      // 整组启用
+      if (t.matches('[data-cw-group]')) {
+        const label = t.dataset.cwGroup;
+        const off = new Set(m.off);
+        if (t.checked) off.delete(label); else off.add(label);
+        await saveWordsModel({ custom_words: cfg.mask.custom_words }, {
+          sensitive_disabled: [...off],
+        });
+        toast(`「${label}」已${t.checked ? '启用' : '停用'}`);
+        return;
+      }
+      // 逐词启用
+      if (t.matches('[data-cw-word]')) {
+        const w = t.dataset.cwWord;
+        const label = cw.label;
+        const wordOff = JSON.parse(JSON.stringify(m.wordOff));
+        const list = new Set(wordOff[label] || []);
+        if (t.checked) list.delete(w); else list.add(w);
+        if (list.size) wordOff[label] = [...list]; else delete wordOff[label];
+        await saveWordsModel({ custom_words: cfg.mask.custom_words }, {
+          sensitive_word_disabled: wordOff,
+        });
+        return;
+      }
+      // 整词匹配
+      if (t.matches('[data-cw-whole]')) {
+        const w = t.dataset.cwWhole;
+        const whole = new Set(m.whole);
+        if (t.checked) whole.add(w); else whole.delete(w);
+        await saveWordsModel({ custom_words: cfg.mask.custom_words }, {
+          sensitive_word_whole: [...whole],
+        });
+        return;
+      }
+      if (t.matches('[data-cw-onlydisabled]')) {
+        cw.onlyDisabled = t.checked;
+        renderWords();
+      }
+    } catch (e) { toast('保存失败：' + e.message, true); }
   });
 
-  /* ---------------- 启动 ---------------- */
-  if (TOKEN) {
-    api('/status')
-      .then(enterApp)
-      .catch(() => showLogin());
-  } else {
-    showLogin();
-  }
-  setInterval(() => { if (TOKEN) loadDashboard().catch(() => {}); }, 6000);
-})();
+  $('cwMain').addEventListener('input', ev => {
+    if (ev.target.matches('[data-cw-search]')) {
+      cw.search = ev.target.value;
+      const pos = ev.target.selectionStart;
+      renderWords();
+      const el = $('cwMain').querySelector('[data-cw-search]');
+      if (el) { el.focus(); try { el.setSelectionRange(pos, pos); } catch (e) {} }
+    }
+  });
 
-  /* ---------------- 脱敏测试（隔离，不落库/不进内存映射） ---------------- */
+  /* ==================== 日志（主从双栏） ==================== */
+  const log = { type: '', q: '', offset: 0, limit: 100, total: 0, rows: [], sel: null, auto: false, timer: null };
+
+  function stopLogAuto() {
+    if (log.timer) { clearInterval(log.timer); log.timer = null; }
+    const cb = $('logAuto');
+    if (cb) cb.checked = false;
+    log.auto = false;
+  }
+  function startLogAuto() {
+    stopLogAuto();
+    log.auto = true;
+    log.timer = setInterval(() => {
+      if (currentPage !== 'logs') { stopLogAuto(); return; }
+      log.offset = 0;
+      loadLogs().catch(() => {});
+    }, 5000);
+  }
+
+  function logRowHtml(e) {
+    const t = String(e.type || '');
+    const flags = [];
+    if (e.reason) flags.push(esc(e.reason));
+    if (e.unknown_shape) flags.push('未知形态');
+    if (e.stream_mode) {
+      const actual = e.stream_actual || 'whole';
+      flags.push(actual !== e.stream_mode ? `流式不符(${esc(e.stream_mode)}→${esc(actual)})` : esc(e.stream_mode));
+    }
+    const stat = [];
+    if (e.count) stat.push(`脱敏 ${e.count}`);
+    if (e.restored) stat.push(`还原 ${e.restored}`);
+    if (e.unresolved) stat.push(`未还原 ${e.unresolved}`);
+    if (e.degraded) stat.push(`容错 ${e.degraded}`);
+    if (e.status >= 400) stat.push(`HTTP ${e.status}`);
+    const hits = e.count || e.restored || (e.items || []).length;
+    return `<button class="lrow ${log.sel === e.id ? 'active' : ''}" data-log-id="${e.id}" role="option"
+              aria-selected="${log.sel === e.id ? 'true' : 'false'}">
+        <span class="lrow-top">
+          <span class="lrow-time">${esc(fmtTime(e.ts))}</span>
+          <span class="badge ${esc(t)}">${esc(t)}</span>
+          ${hits ? `<span class="hint">${hits} 命中</span>` : ''}
+          ${e.mask_ms != null ? `<span class="hint mono">${esc(fmtMs(e.mask_ms))}</span>` : ''}
+        </span>
+        <span class="lrow-sub"><span class="lrow-path">${esc(e.method || '')} ${esc(e.path || '')}</span></span>
+        ${flags.length ? `<span class="lrow-sub">${flags.join(' · ')}</span>` : ''}
+        ${stat.length ? `<span class="lrow-sub mono">${stat.join(' · ')}</span>` : ''}
+      </button>`;
+  }
+
+  function logDetailHtml(e) {
+    const type = String(e.type || '');
+    const items = e.items || [];
+    const needles = items.map(it => it.original).filter(Boolean);
+    const parts = [];
+
+    parts.push(`<header class="d-head">
+      <div class="d-head-main">
+        <span class="badge ${esc(type)}">${esc(type)}</span>
+        <span class="mono d-path">${esc(e.method || '')} ${esc(e.path || '')}</span>
+        ${e.status ? `<span class="hint mono">HTTP ${esc(e.status)}</span>` : ''}
+      </div>
+      <div class="d-head-sub">${esc(fmtTs(e.ts))}${e.protocol ? ' · ' + esc(e.protocol) : ''}${e.model ? ' · ' + esc(e.model) : ''}</div>
+    </header>`);
+
+    const kv = [
+      ['耗时', e.mask_ms != null ? fmtMs(e.mask_ms) : ''],
+      ['首字节', e.first_byte_ms != null ? fmtMs(e.first_byte_ms) : ''],
+      ['上游耗时', e.upstream_ms != null ? fmtMs(e.upstream_ms) : ''],
+      ['请求体', fmtBytes(e.req_bytes)],
+      ['响应体', fmtBytes(e.resp_bytes)],
+      ['新增/复用', `${e.new_count || 0} / ${e.reused_count || 0}`],
+      ['会话', e.sid || ''],
+    ].filter(([, v]) => v);
+    if (kv.length) {
+      parts.push(`<div class="d-kv">${kv.map(([k, v]) =>
+        `<div><span>${esc(k)}</span><b>${esc(v)}</b></div>`).join('')}</div>`);
+    }
+
+    // 原文 / 发给上游
+    const orig = e.dialog || '';
+    const up = e.masked_dialog || '';
+    if (up) {
+      parts.push(`<div class="cmp2">
+        <div class="cmp2-col">
+          <div class="cmp2-head"><span class="cmp2-title cmp2-title-orig">原文（客户端发出）</span></div>
+          <pre class="cmp2-pre">${highlight(orig, needles)}</pre>
+        </div>
+        <div class="cmp2-col">
+          <div class="cmp2-head"><span class="cmp2-title cmp2-title-up">发给上游（已脱敏）</span></div>
+          <pre class="cmp2-pre">${highlight(up, [])}</pre>
+        </div>
+      </div>`);
+    } else if (orig) {
+      // 老事件没有 masked_dialog：按命中明细推算，并如实标注
+      const derived = deriveMasked(orig, items);
+      const title = type === 'MASK' ? '原文（客户端发出）'
+        : type === 'RESTORE' ? '助手回复（还原后）' : '正文';
+      if (derived !== orig) {
+        parts.push(`<div class="cmp2">
+          <div class="cmp2-col">
+            <div class="cmp2-head"><span class="cmp2-title cmp2-title-orig">${esc(title)}</span></div>
+            <pre class="cmp2-pre">${highlight(orig, needles)}</pre>
+          </div>
+          <div class="cmp2-col">
+            <div class="cmp2-head"><span class="cmp2-title cmp2-title-up">发给上游（按命中明细推算）</span></div>
+            <pre class="cmp2-pre">${highlight(derived, [])}</pre>
+          </div>
+        </div>`);
+      } else {
+        parts.push(`<div class="detail-section"><div class="detail-title">${esc(title)}</div>
+          <pre class="cmp2-pre">${highlight(orig, needles)}</pre></div>`);
+      }
+    }
+
+    if (items.length) {
+      parts.push(`<div class="detail-section">
+        <div class="detail-title">命中明细 · ${items.length}</div>
+        <table class="cmp cmp-items"><thead><tr>
+          <th>类型</th><th>原文</th><th>占位符</th><th>长度 / 摘要</th>
+        </tr></thead><tbody>${items.map(it => {
+          const src = it.original
+            ? esc(it.original)
+            : (it.preview
+                ? `<span class="item-redacted hint" title="凭据类不存明文，只留打码预览与 sha256 摘要">${esc(it.preview)}</span>`
+                : '<span class="hint">—</span>');
+          const meta = [
+            it.length ? esc(it.length) + ' 位' : '',
+            it.digest ? 'sha256:' + esc(String(it.digest).slice(0, 12)) : '',
+          ].filter(Boolean).join(' · ');
+          return `<tr>
+            <td class="mono">${it.cred ? '🔒 ' : ''}${esc(it.label)}</td>
+            <td class="mono cmp-orig">${src}</td>
+            <td class="mono cmp-tok">${esc(it.tok || it.token || '—')}</td>
+            <td class="mono hint">${meta || '—'}</td>
+          </tr>`;
+        }).join('')}</tbody></table></div>`);
+    }
+
+    if ((e.unresolved_samples || []).length) {
+      parts.push(`<div class="note warn">未还原占位符：<span class="mono">${e.unresolved_samples.map(esc).join('、')}</span></div>`);
+    }
+    if (e.message || e.reason) {
+      parts.push(`<div class="note warn">${esc(e.message || e.reason)}</div>`);
+    }
+    return parts.join('');
+  }
+
+  async function loadLogs() {
+    const q = log.q.trim();
+    const url = `/logs?limit=${log.limit}&offset=${log.offset}`
+      + (log.type ? `&event_type=${encodeURIComponent(log.type)}` : '')
+      + (q ? `&q=${encodeURIComponent(q)}` : '');
+    const data = await api(url);
+    log.rows = data.events || [];
+    log.total = data.total == null ? log.rows.length : data.total;
+
+    $('logList').innerHTML = log.rows.length
+      ? log.rows.map(logRowHtml).join('')
+      : emptyBox('没有符合条件的事件');
+
+    const pages = Math.max(1, Math.ceil(log.total / log.limit));
+    const page = Math.floor(log.offset / log.limit) + 1;
+    $('logMeta').textContent = `共 ${log.total} 条 · 第 ${page}/${pages} 页`
+      + (log.auto ? ' · 自动刷新中' : '');
+    $('logPrev').disabled = log.offset <= 0;
+    $('logNext').disabled = log.offset + log.limit >= log.total;
+
+    // 选中项：优先保留原选择，否则自动选第一条
+    const keep = log.rows.some(e => e.id === log.sel);
+    if (!keep) log.sel = log.rows.length ? log.rows[0].id : null;
+    document.querySelectorAll('#logList .lrow').forEach(el => {
+      const on = Number(el.dataset.logId) === log.sel;
+      el.classList.toggle('active', on);
+      el.setAttribute('aria-selected', on ? 'true' : 'false');
+    });
+    if (log.sel == null) { $('logDetail').innerHTML = emptyBox('左侧选择一条事件'); return; }
+    await showLogDetail(log.sel);
+  }
+  loaders.logs = loadLogs;
+
+  async function showLogDetail(id) {
+    $('logDetail').innerHTML = emptyBox('加载中…');
+    try {
+      const d = await api('/logs/detail?id=' + encodeURIComponent(id));
+      if (log.sel !== id) return; // 期间已切到别的行
+      $('logDetail').innerHTML = logDetailHtml(d.event || d);
+    } catch (e) {
+      $('logDetail').innerHTML = `<div class="note warn">详情加载失败：${esc(e.message)}</div>`;
+    }
+  }
+
+  $('logList').addEventListener('click', ev => {
+    const row = ev.target.closest('.lrow');
+    if (!row) return;
+    const id = Number(row.dataset.logId);
+    if (id === log.sel) return;
+    log.sel = id;
+    document.querySelectorAll('#logList .lrow').forEach(el => {
+      const on = Number(el.dataset.logId) === id;
+      el.classList.toggle('active', on);
+      el.setAttribute('aria-selected', on ? 'true' : 'false');
+    });
+    showLogDetail(id);
+  });
+  $('logType').addEventListener('change', () => {
+    log.type = $('logType').value; log.offset = 0; log.sel = null;
+    loadLogs().catch(e => toast(e.message, true));
+  });
+  let logSearchTimer = null;
+  $('logSearch').addEventListener('input', () => {
+    clearTimeout(logSearchTimer);
+    logSearchTimer = setTimeout(() => {
+      log.q = $('logSearch').value; log.offset = 0; log.sel = null;
+      loadLogs().catch(e => toast(e.message, true));
+    }, 250);
+  });
+  $('logAuto').addEventListener('change', ev => {
+    if (ev.target.checked) { startLogAuto(); toast('已开启自动刷新（5s）'); }
+    else { stopLogAuto(); toast('已关闭自动刷新'); }
+  });
+  $('logRefresh').addEventListener('click', () => loadLogs().catch(e => toast(e.message, true)));
+  $('logPrev').addEventListener('click', () => {
+    log.offset = Math.max(0, log.offset - log.limit); log.sel = null;
+    loadLogs().catch(e => toast(e.message, true));
+  });
+  $('logNext').addEventListener('click', () => {
+    if (log.offset + log.limit >= log.total) return;
+    log.offset += log.limit; log.sel = null;
+    loadLogs().catch(e => toast(e.message, true));
+  });
+  $('logClear').addEventListener('click', () => {
+    if (!confirm('清空事件日志？（统计摘要保留）')) return;
+    api('/logs/clear', { method: 'POST' }).then(() => {
+      toast('已清空'); log.offset = 0; log.sel = null; return loadLogs();
+    }).catch(e => toast(e.message, true));
+  });
+
+  /* ==================== 审计（主从双栏） ==================== */
+  const audit = { sev: '', q: '', rows: [], sel: null };
+
+  function auditRowHtml(a) {
+    return `<button class="lrow ${audit.sel === a.id ? 'active' : ''}" data-audit-id="${a.id}" role="option"
+              aria-selected="${audit.sel === a.id ? 'true' : 'false'}">
+        <span class="lrow-top">
+          <span class="lrow-time">${esc(fmtTime(a.ts))}</span>
+          <span class="sev sev-${esc(a.severity)}">${esc(a.severity)}</span>
+        </span>
+        <span class="lrow-sub"><span class="lrow-path">${esc(a.signal_type)}</span></span>
+        <span class="lrow-evidence">${esc(a.evidence || '')}</span>
+      </button>`;
+  }
+
+  function auditDetailHtml(a) {
+    const kv = [
+      ['时间', fmtTs(a.ts)],
+      ['主机', a.host || ''],
+      ['方法 / 路径', `${a.method || ''} ${a.path || ''}`.trim()],
+      ['会话', a.sid || ''],
+    ].filter(([, v]) => v);
+    return `<header class="d-head">
+        <div class="d-head-main">
+          <span class="sev sev-${esc(a.severity)}">${esc(a.severity)}</span>
+          <span class="mono d-path">${esc(a.signal_type)}</span>
+        </div>
+      </header>
+      <div class="d-kv">${kv.map(([k, v]) =>
+        `<div><span>${esc(k)}</span><b>${esc(v)}</b></div>`).join('')}</div>
+      <div class="detail-section">
+        <div class="detail-title">证据</div>
+        <pre class="cmp2-pre">${highlight(a.evidence || '—', [])}</pre>
+      </div>`;
+  }
+
+  async function loadAudit() {
+    const data = await api('/audit/events?limit=500');
+    audit.rows = data.events || [];
+    renderAudit();
+  }
+  loaders.audit = loadAudit;
+
+  function renderAudit() {
+    const q = audit.q.trim().toLowerCase();
+    const rows = audit.rows.filter(a => {
+      if (audit.sev && a.severity !== audit.sev) return false;
+      if (q) {
+        const hay = `${a.signal_type} ${a.evidence || ''} ${a.path || ''} ${a.host || ''}`.toLowerCase();
+        if (!hay.includes(q)) return false;
+      }
+      return true;
+    });
+    $('auditList').innerHTML = rows.length
+      ? rows.map(auditRowHtml).join('')
+      : emptyBox(audit.rows.length ? '没有符合筛选条件的审计' : '暂无审计事件');
+    $('auditMeta').textContent = audit.rows.length
+      ? `已加载最近 ${audit.rows.length} 条${rows.length !== audit.rows.length ? ` · 命中 ${rows.length}` : ''}`
+      : '';
+    if (!rows.length) { audit.sel = null; $('auditDetail').innerHTML = emptyBox('左侧选择一条审计'); return; }
+    if (!rows.some(a => a.id === audit.sel)) audit.sel = rows[0].id;
+    const cur = rows.find(a => a.id === audit.sel) || audit.rows.find(a => a.id === audit.sel);
+    if (cur) $('auditDetail').innerHTML = auditDetailHtml(cur);
+  }
+
+  $('auditList').addEventListener('click', ev => {
+    const row = ev.target.closest('.lrow');
+    if (!row) return;
+    audit.sel = Number(row.dataset.auditId);
+    renderAudit();
+  });
+  $('auditSev').addEventListener('change', () => {
+    audit.sev = $('auditSev').value;
+    audit.sel = null;
+    renderAudit();
+  });
+  let auditSearchTimer = null;
+  $('auditSearch').addEventListener('input', () => {
+    clearTimeout(auditSearchTimer);
+    auditSearchTimer = setTimeout(() => {
+      audit.q = $('auditSearch').value;
+      renderAudit();
+    }, 200);
+  });
+  $('auditRefresh').addEventListener('click', () => loadAudit().catch(e => toast(e.message, true)));
+  $('auditClear').addEventListener('click', () => {
+    if (!confirm('清空审计事件？')) return;
+    api('/audit/clear', { method: 'POST' }).then(() => {
+      toast('已清空'); audit.sel = null; return loadAudit();
+    }).catch(e => toast(e.message, true));
+  });
+
+  /* ==================== 脱敏测试 ==================== */
   const TEST_PRESETS = {
     basic: '我是张三，手机 13800138000，邮箱 zhangsan@example.com，身份证 110101199003078675。',
     cred: '数据库连接 postgres://admin:Sup3rSecret@10.0.0.5:5432/prod\nAPI Key: sk-abcdefghijklmnopqrstuvwxyz012345',
@@ -599,17 +1091,18 @@
     btn.textContent = '测试中…';
     try {
       const r = await api('/mask/test', { method: 'POST', body: JSON.stringify(body) });
-      $('testMasked').textContent = r.masked;
-      $('testRestored').textContent = r.restored;
+      const items = r.items || [];
+      const needles = items.map(it => it.original).filter(Boolean);
+      $('testMasked').innerHTML = highlight(r.masked, []);
+      $('testRestored').innerHTML = highlight(r.restored, needles);
       $('testSummary').textContent =
         `命中 ${r.count} 项 · ${r.elapsed_ms}ms · 临时映射已销毁（未落库）`;
-      const items = r.items || [];
       $('testItems').innerHTML = items.length
         ? items.map(it => `<tr>
             <td class="mono">${it.cred ? '🔒 ' : ''}${esc(it.label)}</td>
             <td class="mono cmp-orig">${esc(it.original || it.preview || '—')}</td>
             <td class="mono cmp-tok">${esc(it.tok || it.token || '—')}</td>
-            <td class="mono hint">${it.length != null ? it.length + ' 位' : '—'}</td>
+            <td class="mono hint">${it.length != null ? esc(it.length) + ' 位' : '—'}</td>
           </tr>`).join('')
         : '<tr><td colspan="4" class="empty">未命中任何规则</td></tr>';
       $('testItemsWrap').hidden = !items.length;
@@ -621,21 +1114,89 @@
       btn.textContent = '运行测试';
     }
   }
+  loaders.test = async () => {};
+
   $('btnRunTest').addEventListener('click', runMaskTest);
   $('testInput').addEventListener('keydown', ev => {
-    if ((ev.metaKey || ev.ctrlKey) && ev.key === 'Enter') runMaskTest();
+    if ((ev.metaKey || ev.ctrlKey) && ev.key === 'Enter') { ev.preventDefault(); runMaskTest(); }
   });
   document.querySelectorAll('[data-preset]').forEach(b => b.addEventListener('click', () => {
     $('testInput').value = TEST_PRESETS[b.dataset.preset] || '';
     runMaskTest();
   }));
-  ['btnCopyMasked', 'btnCopyRestored'].forEach(id => {
-    const target = id === 'btnCopyMasked' ? 'testMasked' : 'testRestored';
-    $(id).addEventListener('click', async () => {
-      const t = $(target).textContent;
-      try {
-        await navigator.clipboard.writeText(t);
-        toast('已复制');
-      } catch { toast('剪贴板不可用', true); }
-    });
+  $('btnCopyMasked').addEventListener('click', () => copyFrom($('testMasked'), $('btnCopyMasked')));
+  $('btnCopyRestored').addEventListener('click', () => copyFrom($('testRestored'), $('btnCopyRestored')));
+
+  /* ==================== 设置 ==================== */
+  async function loadSettings() {
+    const cfg = await api('/config');
+    $('upstreamTarget').value = cfg.upstream.target || '';
+    $('serverPort').value = cfg.server.port;
+    $('serverBind').value = cfg.server.bind;
+    $('failClosed').checked = !!cfg.fail_closed;
+    $('responseScan').checked = !!cfg.response_scan;
+    $('streamResponse').checked = !!cfg.stream_response;
+    $('cmdMode').value = cfg.command_block.mode || 'observe';
+    $('retentionDays').value = cfg.log_retention_days;
+    $('panelToken').value = cfg.panel_token || '';
+    $('saveMsg').textContent = '';
+  }
+  loaders.settings = loadSettings;
+
+  $('btnSave').addEventListener('click', async () => {
+    try {
+      const cfg = await api('/config');
+      cfg.upstream.target = $('upstreamTarget').value.trim();
+      cfg.server.port = parseInt($('serverPort').value, 10) || cfg.server.port;
+      cfg.server.bind = $('serverBind').value.trim() || cfg.server.bind;
+      cfg.fail_closed = $('failClosed').checked;
+      cfg.response_scan = $('responseScan').checked;
+      cfg.stream_response = $('streamResponse').checked;
+      cfg.command_block.mode = $('cmdMode').value;
+      cfg.log_retention_days = parseInt($('retentionDays').value, 10) || 7;
+      const newTok = $('panelToken').value.trim();
+      if (newTok && newTok !== cfg.panel_token) cfg.panel_token = newTok;
+      const r = await api('/config', { method: 'POST', body: JSON.stringify(cfg) });
+      const w = (r.warnings || []);
+      toast('已保存' + (w.length ? '（' + w.join('；') + '）' : ''), w.length > 0);
+      if ($('panelToken').value.trim() !== cfg.panel_token) {
+        TOKEN = $('panelToken').value.trim();
+        localStorage.setItem(LS_TOKEN, TOKEN);
+      }
+      $('saveMsg').textContent = '已保存 ' + new Date().toLocaleTimeString();
+    } catch (e) { toast('保存失败：' + e.message, true); }
   });
+
+  $('btnRotateToken').addEventListener('click', () => {
+    const CH = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789';
+    const a = new Uint8Array(24);
+    crypto.getRandomValues(a);
+    $('panelToken').value = Array.from(a).map(b => CH[b % CH.length]).join('');
+    toast('已生成新令牌，记得点「保存配置」');
+  });
+
+  // 令牌默认遮蔽显示（防肩窥 / 投屏泄露），需要复制时再点「显示」
+  $('btnToggleToken').addEventListener('click', () => {
+    const el = $('panelToken');
+    const show = el.type === 'password';
+    el.type = show ? 'text' : 'password';
+    const btn = $('btnToggleToken');
+    btn.textContent = show ? '隐藏' : '显示';
+    btn.setAttribute('aria-label', show ? '隐藏令牌' : '显示令牌');
+  });
+
+  /* ==================== 启动 ==================== */
+  if (TOKEN) {
+    api('/status').then(() => {
+      enterApp();
+      switchPage(hashPage() || 'dashboard');
+    }).catch(() => showLogin());
+  } else {
+    showLogin();
+  }
+  setInterval(() => {
+    if (!TOKEN || currentPage !== 'dashboard') return;
+    if (document.hidden) return; // 页面不可见时不轮询，省掉无谓请求
+    loadDashboard().catch(() => {});
+  }, 6000);
+})();

@@ -149,17 +149,6 @@ pub fn on_response(
     }
 }
 
-/// 审计事件落库（由调用方在拿到 event_store 时调用）。
-pub fn persist_audits(
-    store: &crate::store::db::EventStore,
-    bus: &crate::store::events::EventBus,
-    limit: usize,
-) {
-    for ev in bus.recent_audits(limit) {
-        store.enqueue_audit(ev);
-    }
-}
-
 /// 从响应文本提取 model 字段（尽力而为）。
 pub fn extract_response_model(text: &str) -> Option<String> {
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(text) {

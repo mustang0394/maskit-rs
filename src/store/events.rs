@@ -104,6 +104,12 @@ pub struct Event {
     /// 会话摘要（凭据已清洗）
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub dialog: String,
+    /// 用户消息文本在**脱敏后**的形态 —— 即真正发给上游的内容。
+    ///
+    /// 与 `dialog`（客户端发出的原始明文）配对，供控制台做「原文 / 发给上游」对照。
+    /// 它天然是安全的：命中的敏感值已被占位符替代。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub masked_dialog: String,
     /// 本次命中的唯一原文数（MASK）/ 还原数（RESTORE）
     #[serde(default, skip_serializing_if = "is_zero_usize")]
     pub count: usize,
@@ -185,6 +191,7 @@ impl Default for Event {
             stream_actual: String::new(),
             upstream: String::new(),
             dialog: String::new(),
+            masked_dialog: String::new(),
             count: 0,
             masked_total: 0,
             restored: 0,
@@ -224,10 +231,25 @@ pub struct EventBus {
     ring: Mutex<VecDeque<Event>>,
     audits: Mutex<VecDeque<AuditEvent>>,
     next_id: Mutex<u64>,
+    next_audit_id: Mutex<u64>,
     capacity: usize,
     /// 每日计数（Dashboard 用）：requests/masked/restored/blocked
     counters: Mutex<Counters>,
+    /// 落库钩子（装配层注入；测试不注入 → 纯内存）。
+    ///
+    /// 为什么把落库收束到**总线内部**，而不让调用方自己 `enqueue`：
+    /// 调用方拿不到 `emit` 内部赋的 id —— 早期写法是
+    /// `es.enqueue(ev.clone())` 然后 `bus.emit(ev)`，入库那份的 `id` 恒为 0，
+    /// 于是 SQLite 里的事件 id 全是 0（列表能看、点开 404），而且流式
+    /// RESTORE 事件根本没人落库。钩子只在赋 id **之后**被调用，天然对齐。
+    event_hook: Mutex<Option<EventHook>>,
+    audit_hook: Mutex<Option<AuditHook>>,
 }
+
+/// 事件落库钩子。
+type EventHook = std::sync::Arc<dyn Fn(&Event) + Send + Sync + 'static>;
+/// 审计事件落库钩子。
+type AuditHook = std::sync::Arc<dyn Fn(&AuditEvent) + Send + Sync + 'static>;
 
 #[derive(Debug, Default, Clone, Serialize)]
 pub struct Counters {
@@ -247,14 +269,24 @@ impl EventBus {
             ring: Mutex::new(VecDeque::with_capacity(RING_CAPACITY)),
             audits: Mutex::new(VecDeque::new()),
             next_id: Mutex::new(1),
+            next_audit_id: Mutex::new(1),
             capacity: RING_CAPACITY,
             counters: Mutex::new(Counters::default()),
+            event_hook: Mutex::new(None),
+            audit_hook: Mutex::new(None),
         })
     }
 
-    /// 发射事件（非阻塞；ring 满则丢最老）。
-    #[allow(dead_code)] // M6 接线
-    pub fn emit(&self, mut ev: Event) {
+    /// 注入落库钩子（有事件库时由装配层调用）。
+    pub fn set_hooks(&self, event_hook: EventHook, audit_hook: AuditHook) {
+        *self.event_hook.lock().unwrap() = Some(event_hook);
+        *self.audit_hook.lock().unwrap() = Some(audit_hook);
+    }
+
+    /// 发射事件（非阻塞；ring 满则丢最老），返回**已赋 id/ts** 的事件。
+    ///
+    /// 返回事件是为了让调用方能复用它（别再自己猜 id）；不关心时直接忽略即可。
+    pub fn emit(&self, mut ev: Event) -> Event {
         {
             let mut id = self.next_id.lock().unwrap();
             ev.id = *id;
@@ -275,17 +307,66 @@ impl EventBus {
                 _ => {}
             }
         }
-        let mut ring = self.ring.lock().unwrap();
-        if ring.len() >= self.capacity {
-            ring.pop_front();
+        {
+            let mut ring = self.ring.lock().unwrap();
+            if ring.len() >= self.capacity {
+                ring.pop_front();
+            }
+            ring.push_back(ev.clone());
         }
-        ring.push_back(ev);
+        // 锁已释放再回调，避免钩子（会走 SQLite 入队）与总线锁相互阻塞
+        let hook = self.event_hook.lock().unwrap().clone();
+        if let Some(h) = hook {
+            h(&ev);
+        }
+        ev
     }
 
     /// 读取最近事件（新→旧），limit 上限。
     pub fn recent(&self, limit: usize) -> Vec<Event> {
         let ring = self.ring.lock().unwrap();
         ring.iter().rev().take(limit).cloned().collect()
+    }
+
+    /// 内存 ring 的过滤视图（事件库不可用时的降级路径）。
+    pub fn recent_filtered(
+        &self,
+        limit: usize,
+        event_type: Option<&str>,
+        q: Option<&str>,
+    ) -> Vec<Event> {
+        let want = event_type
+            .map(|t| t.trim().to_ascii_uppercase())
+            .filter(|t| !t.is_empty());
+        let needle = q.map(str::trim).filter(|q| !q.is_empty());
+        let ring = self.ring.lock().unwrap();
+        ring.iter()
+            .rev()
+            .filter(|e| {
+                if let Some(w) = &want {
+                    if format!("{:?}", e.event_type).to_ascii_uppercase() != *w {
+                        return false;
+                    }
+                }
+                if let Some(n) = needle {
+                    let hit = e.path.contains(n)
+                        || e.model.contains(n)
+                        || e.reason.contains(n)
+                        || e.message.contains(n)
+                        || e.dialog.contains(n)
+                        || e.masked_dialog.contains(n)
+                        || e.items
+                            .iter()
+                            .any(|i| i.original.contains(n) || i.token.contains(n));
+                    if !hit {
+                        return false;
+                    }
+                }
+                true
+            })
+            .take(limit)
+            .cloned()
+            .collect()
     }
 
     /// 按事件 id 查详情。
@@ -313,21 +394,33 @@ impl EventBus {
         if f.severity < floor && !always {
             return;
         }
-        let mut audits = self.audits.lock().unwrap();
-        if audits.len() >= 1000 {
-            audits.pop_front();
+        let ev = {
+            let mut id = self.next_audit_id.lock().unwrap();
+            let ev = AuditEvent {
+                id: *id,
+                ts: now_secs(),
+                signal_type: f.signal.clone(),
+                severity: f.severity.as_str().to_string(),
+                evidence: f.evidence.clone(),
+                sid: sid.to_string(),
+                host: host.to_string(),
+                method: method.to_string(),
+                path: path.to_string(),
+            };
+            *id += 1;
+            ev
+        };
+        {
+            let mut audits = self.audits.lock().unwrap();
+            if audits.len() >= 1000 {
+                audits.pop_front();
+            }
+            audits.push_back(ev.clone());
         }
-        audits.push_back(AuditEvent {
-            id: 0,
-            ts: now_secs(),
-            signal_type: f.signal.clone(),
-            severity: f.severity.as_str().to_string(),
-            evidence: f.evidence.clone(),
-            sid: sid.to_string(),
-            host: host.to_string(),
-            method: method.to_string(),
-            path: path.to_string(),
-        });
+        let hook = self.audit_hook.lock().unwrap().clone();
+        if let Some(h) = hook {
+            h(&ev);
+        }
     }
 
     /// 读审计事件（新→旧）。
@@ -351,8 +444,11 @@ impl Default for EventBus {
             ring: Mutex::new(VecDeque::with_capacity(RING_CAPACITY)),
             audits: Mutex::new(VecDeque::new()),
             next_id: Mutex::new(1),
+            next_audit_id: Mutex::new(1),
             capacity: RING_CAPACITY,
             counters: Mutex::new(Counters::default()),
+            event_hook: Mutex::new(None),
+            audit_hook: Mutex::new(None),
         }
     }
 }

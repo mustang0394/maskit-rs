@@ -143,6 +143,88 @@ impl EventStore {
             .collect()
     }
 
+    /// 事件分页 + 过滤查询，返回 `(当页事件, 命中总数)`。
+    ///
+    /// * `event_type` — 事件类型（大写，如 `MASK`）；`None`/空 = 不限
+    /// * `q` — 在 `payload` 上做子串匹配（路径 / 模型 / 原因 / 原文 / 占位符
+    ///   都能搜到；`LIKE` 对 ASCII 天然不区分大小写）
+    ///
+    /// 为什么需要 total：控制台的「共 N 条」与分页必须基于全量命中数，
+    /// 而不是当页长度。
+    pub fn fetch_events_page(
+        &self,
+        limit: usize,
+        offset: usize,
+        event_type: Option<&str>,
+        q: Option<&str>,
+    ) -> (Vec<Event>, usize) {
+        let Ok(conn) = open_read(&self.path) else {
+            return (vec![], 0);
+        };
+        let mut wheres: Vec<&str> = Vec::new();
+        let mut binds: Vec<rusqlite::types::Value> = Vec::new();
+        if let Some(t) = event_type.filter(|t| !t.trim().is_empty()) {
+            wheres.push("type = ?");
+            binds.push(rusqlite::types::Value::Text(t.trim().to_ascii_uppercase()));
+        }
+        if let Some(q) = q.filter(|q| !q.trim().is_empty()) {
+            wheres.push("payload LIKE ?");
+            binds.push(rusqlite::types::Value::Text(format!("%{}%", q.trim())));
+        }
+        let where_sql = if wheres.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", wheres.join(" AND "))
+        };
+        let total: usize = conn
+            .query_row(
+                &format!("SELECT COUNT(*) FROM events{where_sql}"),
+                rusqlite::params_from_iter(binds.iter()),
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap_or(0)
+            .max(0) as usize;
+        let events = (|| -> Option<Vec<Event>> {
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT payload FROM events{where_sql} ORDER BY id DESC LIMIT ? OFFSET ?"
+                ))
+                .ok()?;
+            let mut page_binds = binds;
+            page_binds.push(rusqlite::types::Value::Integer(limit as i64));
+            page_binds.push(rusqlite::types::Value::Integer(offset as i64));
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(page_binds.iter()), |r| {
+                    r.get::<_, String>(0)
+                })
+                .ok()?;
+            Some(
+                rows.filter_map(|r| r.ok())
+                    .filter_map(|s| serde_json::from_str::<Event>(&s).ok())
+                    .collect(),
+            )
+        })()
+        .unwrap_or_default();
+        (events, total)
+    }
+
+    /// 按事件 id 取单条（内存 ring 已淘汰时给详情页兜底）。
+    ///
+    /// ⚠️ 查的是 payload 里的 `id`（总线赋的全局事件 id），不是表的自增行号：
+    /// 两者在全量落库时恰好一致，但一旦有入队丢弃（`try_send` 失败）就会漂移，
+    /// 而前端拿到的永远是 payload 里的 id。
+    pub fn fetch_event_by_id(&self, id: u64) -> Option<Event> {
+        let conn = open_read(&self.path).ok()?;
+        let payload: String = conn
+            .query_row(
+                "SELECT payload FROM events WHERE json_extract(payload, '$.id') = ?1 LIMIT 1",
+                params![id as i64],
+                |r| r.get(0),
+            )
+            .ok()?;
+        serde_json::from_str(&payload).ok()
+    }
+
     /// 读审计事件。
     pub fn fetch_audits(&self, limit: usize) -> Vec<AuditEvent> {
         let Ok(conn) = open_read(&self.path) else {
@@ -295,6 +377,31 @@ impl EventStore {
             |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
         )
         .ok()
+    }
+
+    /// 构造「内存 LRU 未命中 → 回查 SQLite 映射表」的兜底钩子。
+    ///
+    /// **必须接线**（在 `main` 里注入到 `SessionStore`）：否则 `placeholder_map`
+    /// 就只剩「写」——拿不到占位符跨 LRU 淘汰/重启的稳定性收益，却自留明文。
+    ///
+    /// 复用**同一个只读连接**：钩子会在每个「内存里没有的原文」上被调用
+    /// （新敏感值必然未命中），若每次 `open_read` 新开连接，高基数请求
+    /// （一次几千个唯一值）会把连接建立成本放大成主开销。
+    pub fn make_lookup_hook(
+        self: &std::sync::Arc<Self>,
+    ) -> crate::mask::session::MappingLookupHook {
+        let path = self.path.clone();
+        let conn = std::sync::Mutex::new(open_read(&path).ok());
+        std::sync::Arc::new(move |orig: &str| {
+            let mut guard = conn.lock().ok()?;
+            let conn = guard.as_mut()?;
+            conn.query_row(
+                "SELECT token, label FROM placeholder_map WHERE orig = ?1 AND expires_at > ?2 LIMIT 1",
+                params![orig, crate::store::events::now_secs()],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )
+            .ok()
+        })
     }
 
     /// 读回未过期的映射（启动时恢复内存表）。

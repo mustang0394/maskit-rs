@@ -228,6 +228,9 @@ pub struct LogsQuery {
     pub offset: usize,
     #[serde(default)]
     pub event_type: Option<String>,
+    /// 全文搜索（路径 / 模型 / 原因 / 原文 / 占位符）
+    #[serde(default)]
+    pub q: Option<String>,
 }
 
 fn default_limit() -> usize {
@@ -236,21 +239,41 @@ fn default_limit() -> usize {
 
 pub async fn get_logs(State(state): State<SharedState>, Query(q): Query<LogsQuery>) -> Response {
     let limit = q.limit.clamp(1, 2000);
-    // 内存 ring 优先；SQLite 兜底（ring 只留 2000 条）
-    let mut events = state.bus.recent(limit.max(200));
-    if events.len() < limit {
-        if let Some(es) = &state.event_store {
-            events = es.fetch_events(limit, q.offset);
+    let etype = q.event_type.as_deref();
+    let search = q.q.as_deref();
+    match &state.event_store {
+        Some(es) => {
+            let (mut events, db_total) = es.fetch_events_page(limit, q.offset, etype, search);
+            // 写线程是异步的（最多 ≤500ms 入队延迟），刚发生的请求可能还没落库。
+            // 首页把内存 ring 里**比库里最新 id 更新**的事件补到最前，
+            // 既保证「刚发的请求立刻可见」，又不会把旧事件重复前置。
+            let mut total = db_total;
+            if q.offset == 0 {
+                let max_db_id = events.first().map(|e| e.id).unwrap_or(0);
+                let fresh: Vec<_> = state
+                    .bus
+                    .recent_filtered(limit, etype, search)
+                    .into_iter()
+                    .filter(|e| e.id > max_db_id)
+                    .collect();
+                total += fresh.len();
+                if !fresh.is_empty() {
+                    events = fresh.into_iter().chain(events).take(limit).collect();
+                }
+            }
+            json_response(
+                StatusCode::OK,
+                &json!({ "events": events, "total": total, "offset": q.offset, "limit": limit }),
+            )
+        }
+        None => {
+            let events = state.bus.recent_filtered(limit, etype, search);
+            json_response(
+                StatusCode::OK,
+                &json!({ "events": events, "total": events.len(), "offset": 0, "limit": limit }),
+            )
         }
     }
-    let filtered: Vec<_> = match &q.event_type {
-        Some(t) => events
-            .into_iter()
-            .filter(|e| format!("{:?}", e.event_type).to_uppercase() == t.to_uppercase())
-            .collect(),
-        None => events,
-    };
-    json_response(StatusCode::OK, &json!({ "events": filtered }))
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -262,10 +285,17 @@ pub async fn get_log_detail(
     State(state): State<SharedState>,
     Query(q): Query<DetailQuery>,
 ) -> Response {
-    match state.bus.by_id(q.id) {
-        Some(ev) => json_response(StatusCode::OK, &ev),
-        None => error_response(StatusCode::NOT_FOUND, "event_not_found"),
+    if let Some(ev) = state.bus.by_id(q.id) {
+        return json_response(StatusCode::OK, &ev);
     }
+    // 内存 ring 只有 2000 条：更早的事件必须回 SQLite 兜底。
+    // 否则列表里能看到的行点开后 404（主从详情布局下这是硬伤）。
+    if let Some(es) = &state.event_store {
+        if let Some(ev) = es.fetch_event_by_id(q.id) {
+            return json_response(StatusCode::OK, &ev);
+        }
+    }
+    error_response(StatusCode::NOT_FOUND, "event_not_found")
 }
 
 pub async fn clear_logs(State(state): State<SharedState>) -> Response {

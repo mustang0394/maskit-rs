@@ -744,3 +744,46 @@ fn legacy_config_defaults_to_keeping_plaintext() {
     // normalized 也不得改写
     assert!(cfg.normalized().mask.log_credential_plaintext);
 }
+
+/// 回归：上游**已配置但不可达**时，会话必须在离开路径上释放。
+///
+/// 请求开始会把会话置为 `inflight = true`（防止请求在飞时被 sweep 误删），
+/// 而 `sweep` 会**跳过** inflight 会话 —— 所以任何一条离开路径漏了
+/// `drop_session`，那个槽位就**永久**留在 `sessions` 里。
+/// 上游连接被拒是最常见的触发场景：实测打 12 次残留 12 个会话，长跑即无界泄漏。
+#[tokio::test]
+async fn unreachable_upstream_does_not_leak_sessions() {
+    let dir = tempfile::tempdir().unwrap();
+    let (center, _) = ConfigCenter::load_or_init(dir.path()).unwrap();
+    let mut cfg = center.get();
+    // 已配置（非空）→ 会走完整脱敏管线（因此会建会话）；端口 9 无人监听 → send 必失败
+    cfg.upstream.target = "http://127.0.0.1:9".into();
+    center.update(cfg);
+    let upstream = Arc::new(UpstreamClient::new_or_placeholder(&center.get().upstream));
+    let bus = EventBus::new();
+    let state = Arc::new(AppState::new(center, bus, upstream, None));
+
+    // 全局 STORE 是进程共享的（同文件其它用例并发跑也会增删会话），
+    // 因此用「相对基线不随请求数增长」判定，而不是绝对等于 0。
+    let before = state.sessions.sessions.len();
+    for i in 0..8 {
+        let app = build_router(state.clone());
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .header("x-forwarded-for", format!("10.1.1.{i}"))
+            .body(Body::from(format!(
+                r#"{{"model":"gpt-4o","messages":[{{"role":"user","content":"电话 1370013700{i}"}}]}}"#
+            )))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+    let after = state.sessions.sessions.len();
+    assert!(
+        after <= before + 1,
+        "上游不可达时残留 inflight 会话（before={before} after={after}，打了 8 次）\
+         —— sweep 不会回收 inflight 会话，这是永久泄漏"
+    );
+}

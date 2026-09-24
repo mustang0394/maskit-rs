@@ -3,6 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="color-scheme" content="dark light" />
 <title>Maskit-RS 控制台</title>
 <link rel="stylesheet" href="/console/style.css" />
 </head>
@@ -30,13 +31,13 @@
 <div class="app" id="app" hidden>
   <header class="topbar">
     <div class="brand">Maskit<span>-RS</span></div>
-    <nav class="tabs" id="tabs">
-      <button class="tab active" data-page="dashboard">概览</button>
-      <button class="tab" data-page="rules">规则</button>
-      <button class="tab" data-page="logs">日志</button>
-      <button class="tab" data-page="audit">审计</button>
-      <button class="tab" data-page="test">测试</button>
-      <button class="tab" data-page="settings">设置</button>
+    <nav class="tabs" id="tabs" role="tablist">
+      <button class="tab active" data-page="dashboard" role="tab" aria-selected="true">概览</button>
+      <button class="tab" data-page="rules" role="tab" aria-selected="false">规则</button>
+      <button class="tab" data-page="logs" role="tab" aria-selected="false">日志</button>
+      <button class="tab" data-page="audit" role="tab" aria-selected="false">审计</button>
+      <button class="tab" data-page="test" role="tab" aria-selected="false">测试</button>
+      <button class="tab" data-page="settings" role="tab" aria-selected="false">设置</button>
     </nav>
     <div class="topbar-right">
       <span class="status" id="topStatus">连接中…</span>
@@ -48,11 +49,11 @@
   </header>
 
   <main>
-    <!-- 概览 -->
+    <!-- ==================== 概览 ==================== -->
     <section class="page active" id="page-dashboard">
       <div class="cards" id="statCards"></div>
       <div class="panel">
-        <h2>运行状态</h2>
+        <div class="panel-head"><h2>运行状态</h2></div>
         <table class="kv" id="statusTable"></table>
         <div class="row">
           <button id="btnPause" class="btn btn-warn">暂停脱敏（纯透传）</button>
@@ -61,7 +62,7 @@
       </div>
     </section>
 
-    <!-- 规则 -->
+    <!-- ==================== 规则 ==================== -->
     <section class="page" id="page-rules">
       <div class="panel">
         <div class="panel-head">
@@ -75,20 +76,27 @@
         <div class="rules-grid" id="ruleToggles"></div>
       </div>
 
+      <!-- 自定义敏感词：主从双栏 -->
       <div class="panel">
         <div class="panel-head">
           <h2>自定义敏感词</h2>
-          <span class="hint">命中后统一替换为 <code>{{TERM_xxxxxx}}</code> 占位符</span>
+          <span class="hint">
+            命中后替换为 <code>{{分类_xxxxxx}}</code>；原文本就在 <code>config.json</code> 里，
+            因此占位符跨重启稳定。以 <code>re:</code> 开头的词按正则处理。
+          </span>
         </div>
-        <div class="row">
-          <input id="newLabel" list="labelOptions" placeholder="分类，如 PERSON（或留空用 TERM）" class="grow" />
-          <datalist id="labelOptions"></datalist>
-          <button class="btn btn-primary" id="btnAddWord">添加</button>
+        <div class="cw-add">
+          <input id="cwLabel" list="cwLabels" placeholder="分类（留空 = TERM）" class="cw-add-label" />
+          <datalist id="cwLabels"></datalist>
+          <textarea id="cwWords" rows="2" spellcheck="false"
+            placeholder="批量粘贴敏感词：每行一个（也支持逗号 / 顿号 / 空格分隔）"></textarea>
+          <button class="btn btn-primary" id="cwAdd">添加</button>
         </div>
-        <textarea id="newWords" class="words-input" rows="3"
-          placeholder="敏感词，每行一个（也可用逗号 / 空格分隔），如：&#10;张三&#10;李四&#10;example.com"></textarea>
-        <div class="hint" id="labelHint"></div>
-        <div class="word-groups" id="wordList"></div>
+        <div class="hint" id="cwHint"></div>
+        <div class="split split-tall">
+          <aside class="split-list cw-nav" id="cwNav" aria-label="分类列表"></aside>
+          <section class="split-detail" id="cwMain"></section>
+        </div>
       </div>
 
       <div class="panel">
@@ -104,14 +112,14 @@
       </div>
     </section>
 
-    <!-- 日志 -->
+    <!-- ==================== 日志 ==================== -->
     <section class="page" id="page-logs">
       <div class="panel">
         <div class="panel-head">
           <h2>事件日志</h2>
           <div class="panel-actions">
-            <select id="logFilter">
-              <option value="">全部事件</option>
+            <select id="logType" aria-label="事件类型">
+              <option value="">全部类型</option>
               <option value="MASK">MASK</option>
               <option value="RESTORE">RESTORE</option>
               <option value="PASS">PASS</option>
@@ -119,88 +127,105 @@
               <option value="BLOCK">BLOCK</option>
               <option value="ERR">ERR</option>
             </select>
-            <button class="btn btn-sm" id="btnRefreshLogs">刷新</button>
-            <button class="btn btn-sm btn-warn" id="btnClearLogs">清空</button>
+            <input id="logSearch" type="search" class="grow-sm"
+                   placeholder="搜索 路径 / 模型 / 原文 / 占位符" aria-label="搜索日志" />
+            <label class="switch-inline" title="每 5 秒自动刷新第一页">
+              <input type="checkbox" id="logAuto" /> 自动刷新
+            </label>
+            <button class="btn btn-sm" id="logRefresh">刷新</button>
+            <button class="btn btn-sm btn-warn" id="logClear">清空</button>
           </div>
         </div>
-        <p class="hint">点行展开完整对照。凭据类（🔒）默认也保留明文，以便核对；
-          如需回到「只留 sha256 摘要」模式，将配置 <code>mask.log_credential_plaintext</code> 设为 <code>false</code>。</p>
-        <div class="table-wrap">
-          <table class="list log-table">
-            <thead><tr>
-              <th class="col-time">时间</th>
-              <th class="col-type">类型</th>
-              <th class="col-req">请求</th>
-              <th class="col-model">模型</th>
-              <th class="col-stat">脱敏 / 还原</th>
-              <th class="col-items">命中明细（原文 → 占位符）</th>
-              <th class="col-ms">耗时</th>
-            </tr></thead>
-            <tbody id="logList"></tbody>
-          </table>
+        <p class="hint">
+          左选事件、右侧看详情。详情里「原文」是客户端发出的内容，「发给上游」是脱敏后
+          实际转发给上游的内容（含 <code>{{占位符}}</code>）。凭据类受
+          <code>mask.log_credential_plaintext</code> 控制。
+        </p>
+        <div class="split">
+          <div class="split-list" id="logList" role="listbox" aria-label="事件列表"></div>
+          <div class="split-detail" id="logDetail"></div>
+        </div>
+        <div class="split-foot">
+          <span class="hint" id="logMeta"></span>
+          <span class="pager">
+            <button class="btn btn-sm" id="logPrev">‹ 上一页</button>
+            <button class="btn btn-sm" id="logNext">下一页 ›</button>
+          </span>
         </div>
       </div>
     </section>
 
-    <!-- 审计 -->
+    <!-- ==================== 审计 ==================== -->
     <section class="page" id="page-audit">
       <div class="panel">
         <div class="panel-head">
           <h2>审计事件</h2>
           <div class="panel-actions">
-            <button class="btn btn-sm" id="btnRefreshAudit">刷新</button>
-            <button class="btn btn-sm btn-warn" id="btnClearAudit">清空</button>
+            <select id="auditSev" aria-label="严重度">
+              <option value="">全部严重度</option>
+              <option value="CRITICAL">CRITICAL</option>
+              <option value="HIGH">HIGH</option>
+              <option value="MEDIUM">MEDIUM</option>
+              <option value="LOW">LOW</option>
+            </select>
+            <input id="auditSearch" type="search" class="grow-sm"
+                   placeholder="搜索 信号 / 证据 / 路径" aria-label="搜索审计" />
+            <button class="btn btn-sm" id="auditRefresh">刷新</button>
+            <button class="btn btn-sm btn-warn" id="auditClear">清空</button>
           </div>
         </div>
-        <p class="hint">被动检测：错误泄露 / 换芯 / 工具重写 / 流异常 / 响应投毒 / 跨请求污染 / 凭据回流 / 危险命令。</p>
-        <div class="table-wrap">
-          <table class="list audit-table">
-            <thead><tr>
-              <th class="col-time">时间</th>
-              <th class="col-sev">严重度</th>
-              <th class="col-signal">信号</th>
-              <th class="col-evidence">证据</th>
-              <th class="col-req">来源</th>
-            </tr></thead>
-            <tbody id="auditList"></tbody>
-          </table>
+        <p class="hint">
+          被动检测：错误泄露 / 换芯 / 工具重写 / 流异常 / 响应投毒 / 跨请求污染 / 凭据回流 / 危险命令。
+        </p>
+        <div class="split">
+          <div class="split-list" id="auditList" role="listbox" aria-label="审计列表"></div>
+          <div class="split-detail" id="auditDetail"></div>
         </div>
+        <div class="split-foot"><span class="hint" id="auditMeta"></span></div>
       </div>
     </section>
 
-    <!-- 设置 -->
-
-    <!-- 脱敏测试 -->
+    <!-- ==================== 脱敏测试 ==================== -->
     <section class="page" id="page-test">
       <div class="panel">
         <div class="panel-head">
           <h2>脱敏测试</h2>
-          <div class="panel-actions">
+          <span class="hint">
+            与生产网关走<strong>同一套</strong>脱敏引擎。本测试使用<strong>独立的临时映射表</strong>，
+            运行结束即销毁 —— <strong>不写入数据库，也不进入内存映射</strong>，不会影响线上占位符的稳定性。
+          </span>
+        </div>
+        <div class="test-form">
+          <label class="inline-field">
+            <span class="field-label">模式</span>
             <select id="testMode">
               <option value="text">纯文本</option>
               <option value="request">完整请求体</option>
             </select>
+          </label>
+          <label class="inline-field">
+            <span class="field-label">协议</span>
             <select id="testProtocol">
               <option value="chat_completions">Chat Completions</option>
               <option value="responses">Responses API</option>
               <option value="anthropic">Anthropic Messages</option>
             </select>
-            <input id="testModel" placeholder="模型名" class="narrow" value="gpt-4o" />
-            <button class="btn btn-primary btn-sm" id="btnRunTest">运行测试</button>
-          </div>
+          </label>
+          <label class="inline-field">
+            <span class="field-label">模型</span>
+            <input id="testModel" class="narrow" value="gpt-4o" spellcheck="false" />
+          </label>
+          <button class="btn btn-primary" id="btnRunTest">运行测试</button>
         </div>
-        <p class="hint">
-          与生产网关走<strong>同一套</strong>脱敏引擎。本测试使用<strong>独立的临时映射表</strong>，
-          运行结束即销毁 —— <strong>不写入数据库，也不进入内存映射</strong>，不会影响线上占位符的稳定性。
-        </p>
-        <textarea id="testInput" class="words-input" rows="4"
-          placeholder="粘贴一段待测文本（Ctrl/Cmd + Enter 直接运行）"></textarea>
-        <div class="preset-row">
+        <textarea id="testInput" class="test-input" rows="4" spellcheck="false"
+          placeholder="粘贴一段待测文本…"></textarea>
+        <div class="test-actions">
           <span class="hint">示例：</span>
           <button class="btn btn-sm" data-preset="basic">基础信息</button>
           <button class="btn btn-sm" data-preset="cred">凭据类</button>
           <button class="btn btn-sm" data-preset="custom">自定义词</button>
           <button class="btn btn-sm" data-preset="mixed">混合</button>
+          <span class="hint kbd-hint">Ctrl / ⌘ + Enter 直接运行</span>
         </div>
       </div>
 
@@ -209,34 +234,35 @@
           <h2>结果</h2>
           <span class="hint" id="testSummary"></span>
         </div>
-        <div class="test-out">
-          <div class="test-block">
-            <div class="test-block-head">
-              <span class="test-block-title">发给上游的内容（已脱敏）</span>
+        <div class="cmp2">
+          <div class="cmp2-col">
+            <div class="cmp2-head">
+              <span class="cmp2-title cmp2-title-up">发给上游（已脱敏）</span>
               <button class="btn btn-sm" id="btnCopyMasked">复制</button>
             </div>
-            <pre class="detail-pre" id="testMasked"></pre>
+            <pre class="cmp2-pre" id="testMasked"></pre>
           </div>
-          <div class="test-block">
-            <div class="test-block-head">
-              <span class="test-block-title">还原后（客户端收到）</span>
+          <div class="cmp2-col">
+            <div class="cmp2-head">
+              <span class="cmp2-title cmp2-title-back">还原后（客户端收到）</span>
               <button class="btn btn-sm" id="btnCopyRestored">复制</button>
             </div>
-            <pre class="detail-pre" id="testRestored"></pre>
+            <pre class="cmp2-pre" id="testRestored"></pre>
           </div>
         </div>
         <div class="detail-section" id="testItemsWrap" hidden>
-          命中明细（原文 → 占位符）
-          <table class="cmp"><thead><tr>
+          <div class="detail-title">命中明细</div>
+          <table class="cmp cmp-items"><thead><tr>
             <th>类型</th><th>原文</th><th>占位符（加密后）</th><th>长度</th>
           </tr></thead><tbody id="testItems"></tbody></table>
         </div>
       </div>
     </section>
 
+    <!-- ==================== 设置 ==================== -->
     <section class="page" id="page-settings">
       <div class="panel">
-        <h2>上游（单一上游，单端口）</h2>
+        <div class="panel-head"><h2>上游（单一上游，单端口）</h2></div>
         <div class="row">
           <label class="field-label" for="upstreamTarget">目标地址</label>
           <input id="upstreamTarget" class="grow" placeholder="https://api.your-relay.com" />
@@ -251,7 +277,7 @@
       </div>
 
       <div class="panel">
-        <h2>行为</h2>
+        <div class="panel-head"><h2>行为</h2></div>
         <label class="switch"><input type="checkbox" id="failClosed" />
           <span>fail-closed：已识别协议脱敏异常时阻断（不放行未脱敏原文）</span></label>
         <label class="switch"><input type="checkbox" id="responseScan" />
@@ -273,12 +299,15 @@
       </div>
 
       <div class="panel">
-        <h2>访问令牌</h2>
+        <div class="panel-head"><h2>访问令牌</h2></div>
         <div class="row">
-          <input id="panelToken" class="grow mono" />
+          <input id="panelToken" type="password" class="grow mono"
+                 autocomplete="new-password" spellcheck="false" />
+          <button class="btn btn-sm" id="btnToggleToken" type="button" aria-label="显示令牌">显示</button>
           <button class="btn" id="btnRotateToken">重新生成</button>
         </div>
-        <p class="hint">修改后需重新登录；至少 16 位。</p>
+        <p class="hint">默认遮蔽显示（防肩窥 / 投屏泄露），点「显示」可查看并复制。
+          修改后需重新登录；长度不限，留空则自动生成。令牌同时也写在数据目录的 <code>config.json</code>。</p>
       </div>
 
       <div class="row sticky-save">
@@ -289,7 +318,7 @@
   </main>
 </div>
 
-<div class="toast" id="toast" hidden></div>
+<div class="toast" id="toast" hidden role="status" aria-live="polite"></div>
 <script src="/console/app.js"></script>
 </body>
 </html>

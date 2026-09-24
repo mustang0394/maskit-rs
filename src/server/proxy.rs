@@ -76,9 +76,8 @@ fn emit(
         message: source.message.clone(),
         ..Default::default()
     };
-    let id = ev.id;
-    bus.emit(ev);
-    id
+    let ev = bus.emit(ev);
+    ev.id
 }
 
 /// 请求元信息（事件用）。
@@ -335,11 +334,16 @@ pub async fn handler(State(state): State<SharedState>, req: Request) -> Response
         // 事件日志 dialog：与遮蔽同一次解析里抽出**原始**对话文本，
         // 避免为了拿全文再解一遍 JSON。
         let dialog = extract_dialog_from_raw(&raw);
-        tree::mask_body(&raw, &ctx).map(|b| (b, dialog))
+        tree::mask_body(&raw, &ctx).map(|b| {
+            // 同样抽一份**脱敏后**的对话文本 = 真正发给上游的内容，
+            // 供控制台做「原文 / 发给上游」对照。
+            let masked_dialog = extract_dialog_from_raw(b.text.as_bytes());
+            (b, dialog, masked_dialog)
+        })
     })
     .await;
 
-    let (masked, req_dialog) = match mask_result {
+    let (masked, req_dialog, req_masked_dialog) = match mask_result {
         Ok(Ok(m)) => m,
         Ok(Err(e)) => {
             // ── 判定⑨：脱敏抛异常 → 503（与协议无关） ──
@@ -412,7 +416,15 @@ pub async fn handler(State(state): State<SharedState>, req: Request) -> Response
         upstream_ms: None,
         req_bytes,
         resp_bytes: 0,
-        dialog: req_dialog.clone(),
+        // 关掉 `log_credential_plaintext` 时，凭据原文也不能从 `dialog` 漏出去
+        // （此前只清了 `items[].original`，dialog 仍存全文明文 → 与文档承诺不符）。
+        dialog: if keep_plaintext {
+            req_dialog.clone()
+        } else {
+            crate::server::response::redact_credentials(&req_dialog)
+        },
+        // 脱敏后的文本本身已用占位符替代了敏感值，无需再洗
+        masked_dialog: req_masked_dialog.clone(),
         items,
         count: new_count.max(store.get(&sid).map(|s| s.last_hits.len()).unwrap_or(0)),
         masked_total: store.get(&sid).map(|s| s.fwd.len()).unwrap_or(0),
@@ -427,9 +439,7 @@ pub async fn handler(State(state): State<SharedState>, req: Request) -> Response
     if let Some(mut s) = store.get_mut(&sid) {
         s.mask_ms = mask_ms;
     }
-    if let Some(es) = &state.event_store {
-        es.enqueue(ev.clone());
-    }
+    // 落库交给总线内部的钩子（赋 id 之后），这里只负责发事件
     state.bus.emit(ev);
 
     // 映射落盘（随机后缀 → 原文）：保证进程重启后历史占位符仍可还原。
@@ -492,10 +502,23 @@ fn inject_identity_for_stream(headers: &mut HeaderMap, body: &[u8]) {
     }
 }
 
-/// 会话键：确定性派生（`SHA-256(client_ip + 首个 user 内容哈希)` 前 16 hex）。
+/// 会话键：`<SHA-256(client_ip + 首个 user 内容) 前 8 字节 hex>` + 每请求唯一后缀。
 ///
-/// Python 用 uuid4（每请求新 sid），改为确定性键以提升多轮复用命中率；
-/// 冲突只影响复用率，不影响正确性。
+/// **为什么必须每请求唯一**（对齐 Python 版的 uuid4，而非纯确定性键）：
+/// 会话槽位承载的是 per-request 状态 —— `fwd`/`rev`/`last_hits`、事件命中明细，
+/// 以及**流式半截占位符的 `pending` 缓冲** —— 且请求（含流）结束即
+/// `drop_session`（`pipeline_tests::stream_session_is_released` 守着不泄漏）。
+/// 早先把它做成纯确定性键（`hash(ip + 首条 user)`）时，两个「同 IP + 同首条
+/// user 消息」的并发请求（客户端重试／并行发送是常态）会：
+///   * 共用同一槽位，后到的 `new_session` **清空**前者已登记的映射；
+///   * 事件命中明细互相串号；
+///   * 流式 `pending` 按协议槽位（content/arguments…）索引，两路互相污染；
+///   * 先结束的一路 `drop_session` 把仍在跑的另一路的会话一起删掉
+///     （`drain_pending_persist` 拿不到 → 映射丢失，违背「全部落盘」）。
+///
+/// 确定性键的唯一收益是「日志能把同一对话归组」，用**前缀**保留：
+/// `session_id = <对话摘要>-<请求 nonce>`，同一对话仍可按前缀过滤；
+/// 而跨请求的占位符一致性本来就由全局 `recent_fwd`/`recent_rev` 负责，不靠 sid。
 fn make_session_id(headers: &HeaderMap, body: &serde_json::Value) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
@@ -510,7 +533,8 @@ fn make_session_id(headers: &HeaderMap, body: &serde_json::Value) -> String {
         h.update(seed.as_bytes());
     }
     let out = h.finalize();
-    out.iter().take(8).map(|b| format!("{b:02x}")).collect()
+    let digest: String = out.iter().take(8).map(|b| format!("{b:02x}")).collect();
+    format!("{digest}-{:08x}", rand::random::<u32>())
 }
 
 /// 取首个 user 内容作为会话键素材。
@@ -620,13 +644,25 @@ async fn forward_inner(
     let fwd = crate::upstream::http_client::forward_headers(headers);
     let path_and_query = uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
     let upstream = state.upstream();
+    // 会话必须在**所有**退出路径上释放。
+    //
+    // 回归：请求开始时会话被置为 `inflight = true`（防空窗被 sweep 误删），而
+    // `sweep` 会**跳过** inflight 会话 —— 所以一旦某条离开路径忘了 drop，
+    // 那个槽位就**永久**留在 `sessions` 里。上游不可达（连接被拒）是最常见的
+    // 触发场景：实测打 12 次即残留 12 个会话，长时间跑就是无界内存泄漏。
+    let release = |sess: &Option<RestoreSession>| {
+        if let Some(s) = sess {
+            state.sessions.drop_session(&s.sid);
+        }
+    };
     let req = match upstream.build_request(method, path_and_query, &fwd, body) {
         Ok(r) => r,
         Err(e) => {
+            release(&session);
             return error_response(
                 StatusCode::BAD_GATEWAY,
                 &format!("upstream_build_failed: {e}"),
-            )
+            );
         }
     };
     match upstream.send(req).await {
@@ -700,13 +736,9 @@ async fn forward_inner(
                             let outcome = crate::server::response::process_and_emit(
                                 &bytes, &ct, &sess.sid, store, &cmdblock, &state.bus, &meta,
                             );
-                            if let Some(es) = &state.event_store {
-                                // RESTORE 事件已在 bus 中，落库
-                                if let Some(last) = state.bus.recent(1).first() {
-                                    es.enqueue(last.clone());
-                                }
-                                crate::audit::persist_audits(es, &state.bus, 20);
-                            }
+                            // RESTORE / 审计事件的落库已收束到总线钩子（见 `AppState::new`），
+                            // 这里不再自己按 id 捡 ring 尾巴——那种写法既有竞态（并发请求
+                            // 会捡错事件），又因为事件 id 尚未赋定而落库 id 恒为 0。
                             // token 用量落库（只统计数量）
                             if !outcome.usage.is_empty() {
                                 if let Some(es) = &state.event_store {
@@ -775,7 +807,10 @@ async fn forward_inner(
                 ),
             }
         }
-        Err(e) => error_response(StatusCode::BAD_GATEWAY, &format!("upstream_failed: {e}")),
+        Err(e) => {
+            release(&session);
+            error_response(StatusCode::BAD_GATEWAY, &format!("upstream_failed: {e}"))
+        }
     }
 }
 
@@ -810,16 +845,25 @@ mod tests {
     }
 
     #[test]
-    fn session_id_is_deterministic() {
+    fn session_id_is_unique_per_request_but_groups_by_context() {
         let body = json!({"messages": [{"role": "user", "content": "hello"}]});
         let h = HeaderMap::new();
         let a = make_session_id(&h, &body);
         let b = make_session_id(&h, &body);
-        assert_eq!(a, b, "同一上下文派生出同一会话键");
-        assert_eq!(a.len(), 16);
-        // 不同内容 → 不同键
+        // 同一对话上下文：摘要前缀相同 → 日志仍可按前缀归组
+        let a_prefix = a.split('-').next().unwrap();
+        let b_prefix = b.split('-').next().unwrap();
+        assert_eq!(a_prefix, b_prefix);
+        assert_eq!(a_prefix.len(), 16);
+        // 但每请求唯一：并发/重试不会共用同一会话槽位
+        assert_ne!(a, b, "每请求必须拿到独立会话槽位");
+        assert_eq!(a.len(), 16 + 1 + 8);
+        // 不同内容 → 不同摘要前缀
         let body2 = json!({"messages": [{"role": "user", "content": "other"}]});
-        assert_ne!(a, make_session_id(&h, &body2));
+        assert_ne!(
+            a_prefix,
+            make_session_id(&h, &body2).split('-').next().unwrap()
+        );
     }
 
     #[test]

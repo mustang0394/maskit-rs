@@ -90,6 +90,15 @@ fn main() {
         }));
     }
 
+    // 占位符映射的两级缓存第二级：内存 LRU 未命中时回查 SQLite 映射表。
+    //
+    // 钩子只在**真实服务器**里接线（不放进 `AppState::new`）：它写的是进程全局
+    // `STORE`，集成测试里每个用例都会建自己的临时事件库，若在 `AppState::new`
+    // 里接线，并发测试之间会互相把钩子指向别人的库。
+    if let Some(es) = &event_store {
+        maskit_rs::mask::session::STORE.set_lookup_hook(es.make_lookup_hook());
+    }
+
     let state = std::sync::Arc::new(server::AppState::new(
         config_center.clone(),
         bus.clone(),
@@ -125,6 +134,9 @@ fn main() {
             std::thread::sleep(std::time::Duration::from_secs(30));
             store_static.sweep(cfg2.mask.session_ttl as f64);
             es.prune(cfg2.log_retention_days as i64);
+            // 过期占位符映射清理。不清理的话 placeholder_map 会无限增长
+            // （一次也不删），而它存的是**原文明文**，磁盘只增不减。
+            es.prune_mappings();
         });
     }
 

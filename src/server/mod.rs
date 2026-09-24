@@ -48,6 +48,17 @@ impl AppState {
         // 播种自定义词确定性占位符（跨重启稳定）
         custom.register_words(&crate::mask::session::STORE);
         let cmdblock = Arc::new(crate::cmdblock::CmdBlockEngine::new(&cfg));
+        // 事件/审计落库收束到总线内部：钩子在**赋 id 之后**被调用，
+        // 从而保证库里 id 与内存 ring 一致（早先调用方自己 enqueue，
+        // 库里 id 恒为 0 → 列表能看、点开 404；流式 RESTORE 还完全没落库）。
+        if let Some(es) = &event_store {
+            let e1 = es.clone();
+            let e2 = es.clone();
+            bus.set_hooks(
+                Arc::new(move |ev: &crate::store::events::Event| e1.enqueue(ev.clone())),
+                Arc::new(move |ev: &crate::store::events::AuditEvent| e2.enqueue_audit(ev.clone())),
+            );
+        }
         Self {
             config,
             bus,
@@ -148,6 +159,10 @@ pub fn build_router(state: SharedState) -> Router {
         // 根路径：上游未配置时返回引导页（直接 502 对首次使用者毫无信息量）。
         // 上游一旦配置，/ 仍原样透传给上游，不劫持真实 API 的根端点。
         .route("/", get(root_landing))
+        // 浏览器会自动请求 /favicon.ico。不接管就会被当成反代流量转发给上游，
+        // 并在事件日志里刷一条 PASS —— 实测**一次页面加载就是一条**，
+        // 把用户想看的真实事件冲得看不见。这里直接 204 + 长缓存。
+        .route("/favicon.ico", get(favicon))
         .merge(console)
         .fallback(proxy::handler)
         .layer(axum::middleware::from_fn(security_headers_middleware))
@@ -159,6 +174,15 @@ pub fn build_router(state: SharedState) -> Router {
             crate::server::console_api::auth_middleware,
         ))
         .with_state(state)
+}
+
+/// `/favicon.ico`：204 + 长缓存，避免它被当成反代流量转发给上游并污染事件日志。
+async fn favicon() -> Response {
+    (
+        StatusCode::NO_CONTENT,
+        [(axum::http::header::CACHE_CONTROL, "public, max-age=604800")],
+    )
+        .into_response()
 }
 
 /// 根路径引导页：仅在「上游未配置」时替代 502。
@@ -193,7 +217,10 @@ async fn root_landing(State(state): State<SharedState>) -> Response {
 </body></html>"#;
     (
         StatusCode::OK,
-        [("content-type", "text/html; charset=utf-8")],
+        [
+            ("content-type", "text/html; charset=utf-8"),
+            ("content-security-policy", CSP),
+        ],
         html,
     )
         .into_response()
@@ -201,6 +228,12 @@ async fn root_landing(State(state): State<SharedState>) -> Response {
 
 /// 安全响应头（对齐 Python `security_headers` 的核心语义）。
 async fn security_headers_middleware(req: Request, next: axum::middleware::Next) -> Response {
+    let path = req.uri().path().to_string();
+    let is_api = path.starts_with("/console/api/");
+    // CSP 只给**我们自己的** HTML 页面加（/console 与根引导页）。
+    // 不能按「响应是 text/html」判：这个网关会把任意路径反代给上游，
+    // 上游若返回 HTML 页面，注入我们的 CSP 会直接把它的内联脚本打死。
+    let is_own_html = path == "/console" || path == "/console/";
     let mut resp = next.run(req).await;
     let h = resp.headers_mut();
     if let Ok(v) = axum::http::HeaderValue::from_str("nosniff") {
@@ -212,8 +245,29 @@ async fn security_headers_middleware(req: Request, next: axum::middleware::Next)
     if let Ok(v) = axum::http::HeaderValue::from_str("no-referrer") {
         h.insert("referrer-policy", v);
     }
+    // 控制台 API 的响应体含 `panel_token`（/config）、日志/审计原文等敏感内容，
+    // 一律禁止任何层级的缓存（浏览器 / 中间代理的磁盘缓存）。
+    if is_api {
+        if let Ok(v) = axum::http::HeaderValue::from_str("no-store") {
+            h.insert("cache-control", v);
+        }
+    }
+    if is_own_html {
+        if let Ok(v) = axum::http::HeaderValue::from_str(CSP) {
+            h.insert("content-security-policy", v);
+        }
+    }
     resp
 }
+
+/// 控制台自己的 CSP。
+///
+/// 控制台是嵌入式单页（脚本全部外链，无内联 script）；`style-src` 需要
+/// `'unsafe-inline'` 是因为根路径引导页用了内联 `<style>` 块。
+/// 作用是纵深防御：控制台一旦被注入，CSP 是挡住凭据外发的第二道防线。
+const CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; \
+     img-src 'self' data:; connect-src 'self'; font-src 'self'; object-src 'none'; \
+     base-uri 'none'; form-action 'self'; frame-ancestors 'none'";
 
 /// 透传转发 handler（M1：body 原样转发上游，响应原样回写）。
 /// M6 将替换为完整脱敏管线。

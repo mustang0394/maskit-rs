@@ -200,7 +200,7 @@ pub fn stream_response(
         // dialog 取 state.kept —— 那是**还原后**的正文（上游回的是占位符，
         // 用户看到的是原文，事件里也该记原文）。
         let mut rmeta = meta.clone();
-        rmeta.resp_dialog = state.kept.clone();
+        rmeta.resp_dialog = dialog_for_log(&state.kept, meta.keep_plaintext);
         emit_restore(&bus, &sid, &rmeta, &stats_total, store, blocked, "stream");
 
         if let Some(hook) = USAGE_HOOK.get() {
@@ -355,6 +355,7 @@ pub fn process_and_emit(
                 .take(crate::mask::tree::DIALOG_MAX_CHARS)
                 .collect()
         });
+    meta.resp_dialog = dialog_for_log(&meta.resp_dialog, meta.keep_plaintext);
     let meta = &meta;
     let stats = RestoreStats {
         restored: outcome.restored,
@@ -468,6 +469,18 @@ pub fn scan_response_pii(
         }
     }
     found
+}
+
+/// 落库前的 dialog 清洗：`log_credential_plaintext=false` 时把凭据明文抹掉。
+///
+/// 回归：此前该开关只作用于 `items[].original`，`dialog` / `resp_dialog` 仍存
+/// 凭据全文明文 —— 与 README 「只留 sha256 摘要与打码预览，原文不落库」的承诺不符。
+fn dialog_for_log(text: &str, keep_plaintext: bool) -> String {
+    if keep_plaintext {
+        text.to_string()
+    } else {
+        redact_credentials(text)
+    }
 }
 
 /// 凭据清洗（对齐 `_redact_credentials`：日志 dialog/preview 落库前洗凭据）。

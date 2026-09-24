@@ -337,3 +337,45 @@ fn mapping_db_file_is_owner_only() {
         assert_eq!(mode, 0o600, "库内含明文凭据，权限应为 0600，实际 {mode:o}");
     }
 }
+
+/// 端到端：内存复用表没有该原文时，`SessionStore` 必须通过
+/// `EventStore::make_lookup_hook` 回查 SQLite，并复用**同一个**占位符。
+///
+/// 这是 `main` 里注入的那条生产路径（两级缓存：内存 LRU + SQLite 真相）。
+/// 若钩子不接线（此前就是），`placeholder_map` 会退化成「只写不读」：
+/// 拿不到跨 LRU 淘汰的占位符稳定性，却白留一份原文明文。
+#[test]
+fn lookup_hook_rehydrates_token_from_sqlite() {
+    use maskit_rs::mask::session::{Session, SessionStore};
+
+    let dir = tempfile::tempdir().unwrap();
+    let es = EventStore::open(dir.path()).unwrap();
+    // 模拟「上一次进程」已落盘的映射（内存表此时是空的）
+    es.save_mappings(
+        &[(
+            "{{PHONE_reuse1}}".to_string(),
+            "13800138000".to_string(),
+            "PHONE".to_string(),
+        )],
+        86400,
+    );
+    es.sync();
+
+    let store = SessionStore::new();
+    store.set_lookup_hook(es.make_lookup_hook());
+    store.new_session("s");
+    let taken = |_t: &str, _s: &str| false;
+    let mut sess = Session::default();
+    store.remember(&mut sess, "13800138000", "PHONE", &taken);
+
+    assert_eq!(
+        sess.fwd.get("13800138000").map(String::as_str),
+        Some("{{PHONE_reuse1}}"),
+        "内存未命中必须回查 SQLite 并复用原占位符（否则上游 prompt cache 失效）"
+    );
+    // 回填后内存表也应命中，且能还原
+    assert_eq!(
+        store.lookup("{{PHONE_reuse1}}", "s"),
+        Some("13800138000".to_string())
+    );
+}

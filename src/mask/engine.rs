@@ -337,6 +337,17 @@ impl<'a> MaskCtx<'a> {
             if !rule.may_hit(&out) {
                 continue;
             }
+            // 占位符防污染（对齐 Python `_mask_excluding_placeholders_ed`）：
+            // 本规则不得改写**已有占位符**的片段。此前只靠「占位符字符集恰好
+            // 不命中各规则正则」侥幸，新加规则随时可能打破（例如 hex 类匹配会
+            // 劈开旧 hex 后缀的占位符）。
+            //
+            // 用**只前进的惰性游标**：匹配与占位符都按起点升序，游标单调推进即可，
+            // 整体 O(匹配数 + 占位符数)。切勿先 collect 成 Vec 再每个匹配线性比对
+            // —— 那是 O(m×p)，长会话（600KB / 2.4 万个占位符）会直接超时。
+            let ph_hay: &str = if out.contains("{{") { &out } else { "" };
+            let mut ph_iter = placeholder::placeholder_rx().find_iter(ph_hay);
+            let mut ph_cur: Option<(usize, usize)> = ph_iter.next().map(|m| (m.start(), m.end()));
             // 单趟完成「校验 + 去重 + 定位」：一次 captures_iter 同时拿到
             // 原文集合与替换区间，避免早期实现的「先收集再 replace_unique」
             // 二次全文扫描（长会话下这是主要开销之一）。
@@ -353,6 +364,19 @@ impl<'a> MaskCtx<'a> {
             let mut matched_any = false;
             for caps in rule.rx.captures_iter(&out) {
                 let m0 = caps.get(0).unwrap();
+                // 惰性游标：跳过完全落在当前匹配之前的占位符（两者均升序）
+                while let Some((_, pe)) = ph_cur {
+                    if pe <= m0.start() {
+                        ph_cur = ph_iter.next().map(|m| (m.start(), m.end()));
+                    } else {
+                        break;
+                    }
+                }
+                if let Some((ps, pe)) = ph_cur {
+                    if m0.start() < pe && m0.end() > ps {
+                        continue; // 与已有占位符重叠 → 跳过
+                    }
+                }
                 let m = caps.get(rule.value_group).unwrap_or(m0);
                 let orig = m.as_str();
                 // 边界 Check（D7 下沉的环视）
@@ -682,6 +706,16 @@ pub fn restore_final(
     if !text.contains('_') && !text.contains('{') {
         return text.to_string();
     }
+    // 安全门（对齐 Python `restore()`）：会话不存在 → **原样返回，绝不还原**。
+    // 还原路径会穿过会话去查全局复用表 `recent_rev`；放行等于让任意自造 sid
+    // 都能借复用表把占位符换回原文。
+    //
+    // 但必须**如实计数**未还原：否则「页面上满屏未还原」在统计里显示为 0
+    // （Python 侧 `_count_orphans_without_session` 就是为这个漏报加的）。
+    if store.get(sid).is_none() {
+        count_orphans_without_session(text, stats);
+        return text.to_string();
+    }
     let mut out = text.to_string();
 
     // 第一遍：容错双花括号（含内部空白/大小写改写）
@@ -700,6 +734,19 @@ pub fn restore_final(
         out = restore_pass_loose(&out, loose, sid, escape, store, stats);
     }
     out
+}
+
+/// 会话不存在时只统计**双花括号**占位符形态的未还原数（绝不还原、绝不猜原文）。
+///
+/// 与 Python `_count_orphans_without_session` 同口径：只认带花括号（容错内部
+/// 空白）的形态，不把正文里普通的 `LABEL_suffix` 标识符算进来。
+fn count_orphans_without_session(text: &str, stats: &mut RestoreStats) {
+    for m in placeholder::braced_placeholder_rx().find_iter(text) {
+        stats.unresolved += 1;
+        if stats.samples.len() < 5 && !stats.samples.contains(&m.as_str().to_string()) {
+            stats.samples.push(m.as_str().to_string());
+        }
+    }
 }
 
 /// 按替换区间重建文本（区间按捕获顺序升序且不重叠）。
@@ -1098,5 +1145,81 @@ mod tests {
         );
         assert!(out.contains("{{EMAIL_bcdfgh}}"), "查不到原文原样放行");
         assert_eq!(stats.unresolved, 1);
+    }
+
+    /// 回归：`safe_label` 允许 12 字符标签，而 `braced_placeholder_rx` 曾漏掉
+    /// label 与 suffix 之间**必需的 `_`**。12 字符标签塞不进去 → 严格遍匹配失败；
+    /// 宽松遍又把它当「已处理的完整 `{{…}}`」跳过 → 该占位符永久还原不回来。
+    #[test]
+    fn twelve_char_label_placeholder_restores() {
+        let parts = test_ctx(&[("张三", "CUSTOMERID2024")]);
+        let masked = mask_with(&parts, "客户张三");
+        assert!(
+            masked.contains("{{CUSTOMERID20_"),
+            "safe_label 应截到 12 字符：{masked}"
+        );
+        let restored = restore_with(&parts, &masked);
+        assert_eq!(restored, "客户张三", "12 字符标签必须能还原：{masked}");
+    }
+
+    /// 回归：模型「转义 + 顺手大写」的形态 `\{\{TERM_BKRHVH\}\}`。
+    /// `escaped_placeholder_rx` 缺 `(?i)`（Python 是 `re.IGNORECASE`）时整条匹配不上。
+    #[test]
+    fn escaped_uppercase_suffix_restores() {
+        let parts = test_ctx(&[("张三", "TERM")]);
+        let masked = mask_with(&parts, "张三");
+        let token = placeholder::placeholder_rx()
+            .find(&masked)
+            .expect("应有占位符")
+            .as_str()
+            .to_string();
+        let label = placeholder::token_label(&token);
+        let suffix = placeholder::token_suffix(&token).to_uppercase();
+        let escaped = format!("\\{{\\{{{label}_{suffix}\\}}\\}}");
+        let mut stats = RestoreStats::default();
+        let out = restore_final(&escaped, "t", false, &parts.1, &mut stats);
+        assert_eq!(out, "张三", "escaped={escaped}");
+        assert_eq!(stats.restored, 1);
+    }
+
+    /// 回归：缺下划线的畸形形态**不是**占位符（Python 同样不认）。
+    /// 早期 `braced` 正则少一个 `_`，会把 `{{TERMxxxxxx}}` 误认并还原。
+    #[test]
+    fn malformed_without_underscore_is_not_restored() {
+        let parts = test_ctx(&[("张三", "TERM")]);
+        let masked = mask_with(&parts, "张三");
+        let malformed = masked.replace('_', "");
+        let mut stats = RestoreStats::default();
+        let out = restore_final(&malformed, "t", false, &parts.1, &mut stats);
+        assert_eq!(out, malformed, "缺下划线不得被还原");
+        assert_eq!(stats.restored, 0);
+    }
+
+    /// 安全门回归（对齐 Python `test_t7`）：会话不存在 → 绝不借全局复用表还原。
+    #[test]
+    fn restore_without_session_is_gated() {
+        let parts = test_ctx(&[("张三", "TERM")]);
+        let masked = mask_with(&parts, "张三");
+        let mut ok = RestoreStats::default();
+        assert_eq!(
+            restore_final(&masked, "t", false, &parts.1, &mut ok),
+            "张三"
+        );
+        // 移除会话：映射仍留在全局 recent_rev 里，但不得再被借出
+        parts.1.drop_session("t");
+        let mut gated = RestoreStats::default();
+        let out = restore_final(&masked, "t", false, &parts.1, &mut gated);
+        assert_eq!(out, masked, "无会话必须原样返回");
+        assert!(gated.unresolved >= 1, "必须如实计入未还原");
+    }
+
+    /// 防污染不变式：已签发的占位符不得被后续规则二次脱敏。
+    #[test]
+    fn existing_placeholders_are_not_re_masked() {
+        let parts = test_ctx(&[("张三", "TERM")]);
+        let ctx = MaskCtx::new(&parts.0, &parts.1, "t".into(), &parts.2);
+        let once = ctx.mask("张三 13800138000 password=Xk9mQ2zR abcd1234@corp.example.com");
+        let twice = ctx.mask(&once);
+        assert_eq!(once, twice, "占位符不得被二次脱敏：{once} -> {twice}");
     }
 }

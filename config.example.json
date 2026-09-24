@@ -42,6 +42,7 @@
     ],
     "max_body_bytes": 33554432,
     "session_ttl": 600,
+    "mapping_ttl": 86400,
     "ner_enabled": false,
     "record_plaintext_words": true,
     "sensitive_disabled": [],

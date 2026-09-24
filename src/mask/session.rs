@@ -99,6 +99,10 @@ pub struct RecentEntry {
 
 /// 内存映射缓存容量上限（超出按最旧 LRU 淘汰；淘汰后由 DB 兜底回填）。
 pub const RECENT_MAX: usize = 10000;
+/// 清理水位余量：只有超过 `RECENT_MAX + PRUNE_SLACK` 才做全表清理。
+///
+/// 摊还的关键 —— 见 [`SessionStore::maybe_prune_recent`]。
+pub const PRUNE_SLACK: usize = RECENT_MAX / 8;
 /// 映射 TTL：全局 24h。内存表与 SQLite 映射表同口径，
 /// 避免「内存还能还原、但 DB 已过期导致重启后还原不回来」的不一致窗口。
 pub const RECENT_TTL: u64 = 24 * 3600;
@@ -331,6 +335,11 @@ impl SessionStore {
         false
     }
 
+    /// 该占位符是否属于自定义词的永久映射（对齐 Python `_is_custom_word_token`）。
+    pub fn is_custom_word_token(&self, token: &str) -> bool {
+        self.custom_rev.contains_key(token)
+    }
+
     /// 取该原文的占位符：TTL 内复用旧的，否则新建并登记（对齐 `_recall_token`）。
     /// `taken(token, suffix)` 由调用方提供后缀冲突检查。
     pub fn recall_token(
@@ -400,7 +409,7 @@ impl SessionStore {
             },
         );
         self.suffix_index_add(&token);
-        self.prune_recent();
+        self.maybe_prune_recent();
         (token, false)
     }
 
@@ -517,13 +526,17 @@ impl SessionStore {
         }
         if hit.is_none() {
             if let Some(rec) = self.recent_rev.get(token) {
-                let is_custom = self.is_custom_word_orig(&rec.token.clone());
-                if is_custom
-                    || placeholder::suffix_indexable(&placeholder::token_suffix(token))
-                    || now() - rec.ts <= self.recent_ttl() as f64
-                {
-                    let orig = rec.token.clone();
-                    drop(rec);
+                let orig = rec.token.clone();
+                let is_custom = self.is_custom_word_orig(&orig) || self.is_custom_word_token(token);
+                let fresh = now() - rec.ts <= self.recent_ttl() as f64;
+                drop(rec);
+                // TTL 判据必须与 Python `_lookup` 一致：自定义词永久，其余按 24h 窗口。
+                //
+                // 回归：早期这里额外放行了 `suffix_indexable(token_suffix(token))`，
+                // 而**所有**新签发的占位符都是 6 位纯辅音后缀、必然满足它 ——
+                // 于是 24h「原文保留窗口」契约对现代占位符完全失效（永不按 TTL 过期），
+                // 且与下方嵌套解包分支的判据自相矛盾。
+                if is_custom || fresh {
                     self.touch_recent(token, &orig);
                     hit = Some(orig);
                 }
@@ -551,7 +564,8 @@ impl SessionStore {
             }
             if inner.is_none() {
                 if let Some(rec) = self.recent_rev.get(&h) {
-                    let is_custom = self.is_custom_word_orig(&rec.token.clone());
+                    let is_custom = self.is_custom_word_orig(&rec.token.clone())
+                        || self.is_custom_word_token(&h);
                     if is_custom || now() - rec.ts <= self.recent_ttl() as f64 {
                         inner = Some(rec.token.clone());
                     }
@@ -571,6 +585,26 @@ impl SessionStore {
             Some(h) if rx.is_match(&h) => None, // 最终仍是占位符 = 无真实明文
             other => other,
         }
+    }
+
+    /// 摊还版清理：只在超过水位时做一次全表 `prune_recent`。
+    ///
+    /// 为什么需要：`prune_recent` 会 collect 全表（每条形如
+    /// `(key.clone(), token.clone(), ts)`，两份 String）并在超限时排序，成本
+    /// O(n log n)。它原先在**每签发一个新占位符**时都跑一次，于是「一个请求里
+    /// N 个互不相同的敏感值」= O(N²)。release 实测：200 个唯一值 64ms、
+    /// 1000 个 112ms、**3000 个 1130ms**（约 10x 于 1000，典型二次方；
+    /// 51KB 的 body 即可触发 1.1s CPU）。
+    ///
+    /// 批式摊还后：每 `PRUNE_SLACK` 次插入才付一次全表成本，且一次清理把长度
+    /// 降到 `RECENT_MAX`，之后的插入都走 O(1) 快路径。
+    ///
+    /// `prune_recent` 本身保持「精确清理」语义，供批量预热与测试直接调用。
+    fn maybe_prune_recent(&self) {
+        if self.recent_fwd.len() <= RECENT_MAX + PRUNE_SLACK {
+            return;
+        }
+        self.prune_recent();
     }
 
     /// TTL + 条数上限清理复用表（对齐 `_prune_recent`）。

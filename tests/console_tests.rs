@@ -443,6 +443,61 @@ async fn security_headers_present() {
         resp.headers().get("referrer-policy").unwrap(),
         "no-referrer"
     );
+    // HTML 文档必须带 CSP（纵深防御：控制台被注入时挡住凭据外发）
+    let csp = resp
+        .headers()
+        .get("content-security-policy")
+        .expect("HTML 响应必须有 CSP")
+        .to_str()
+        .unwrap();
+    assert!(
+        csp.contains("script-src 'self'"),
+        "CSP 必须限制脚本源：{csp}"
+    );
+    assert!(csp.contains("frame-ancestors 'none'"));
+}
+
+/// 控制台 API 的响应不得被缓存（含 panel_token 与日志原文）。
+#[tokio::test]
+async fn api_responses_are_not_cacheable() {
+    let h = Harness::new();
+    let app = build_router(h.state.clone());
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/console/api/status")
+                .header("authorization", format!("Bearer {}", h.token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers().get("cache-control").unwrap(),
+        "no-store",
+        "/console/api/* 必须 no-store"
+    );
+}
+
+/// 回归：`app.js` 必须整体包在**一个** IIFE 里。
+///
+/// 曾把 `})();` 提前闭合在「脱敏测试」段之前，后半段代码被甩到全局作用域，
+/// 引用了 IIFE 内部的 `$`/`api`/`toast` → 脚本在加载期直接抛
+/// `ReferenceError: $ is not defined`，测试页全部按钮失效。
+/// 当时的 console_tests 只做「文本里包含某字符串」的断言，全绿通过。
+#[tokio::test]
+async fn app_js_is_a_single_iife() {
+    let h = Harness::new();
+    let (_, b) = h.req("GET", "/console/app.js", false, None).await;
+    let js = String::from_utf8_lossy(&b);
+    assert!(js.contains("(function () {"), "app.js 必须是 IIFE");
+    assert_eq!(
+        js.matches("})();").count(),
+        1,
+        "app.js 只能有一处 IIFE 闭合；提前闭合会把后续代码甩到全局作用域 → ReferenceError"
+    );
+    assert!(js.trim_end().ends_with("})();"), "IIFE 必须在文件末尾闭合");
 }
 
 // ===========================================================================
@@ -629,69 +684,57 @@ async fn patch_rejects_empty_path() {
     assert_eq!(s, StatusCode::BAD_REQUEST, "空路径必须拒绝");
 }
 
-/// 回归：日志/审计表曾是**空壳 table**（`<table id="logList">` 里没有 thead），
-/// JS 直接往 table 塞 `<tr><td>` —— 7 列数据全无表头，用户看到一堆无法解读的
-/// 单元格，表现为「列表不显示内容」。
+/// 回归：日志/审计的**主从双栏**必须齐全 —— 列表容器 + 详情容器 + 过滤/分页控件。
+///
+/// 历史：日志/审计表曾是**空壳 table**（`<table id="logList">` 里没有 thead），
+/// JS 直接往 table 塞 `<tr><td>`，用户看到一堆无法解读的单元格。现在改成列表 +
+/// 详情面板后，这类「渲染目标与容器对不上」的问题仍要用结构断言守住。
 #[tokio::test]
-async fn log_and_audit_tables_have_headers() {
+async fn log_and_audit_split_panes_exist() {
     let h = Harness::new();
     let (s, body) = h.req("GET", "/console", false, None).await;
     assert_eq!(s, StatusCode::OK);
     let html = String::from_utf8_lossy(&body);
-    // 渲染目标必须是 tbody（而不是裸 table），thead 必须给出列名
-    assert!(
-        html.contains(r#"<tbody id="logList">"#),
-        "日志表渲染目标应为 tbody，不能是裸 table"
-    );
-    assert!(
-        html.contains(r#"<tbody id="auditList">"#),
-        "审计表渲染目标应为 tbody"
-    );
-    for (tbl, cols) in [
-        (
-            "log-table",
-            vec![
-                "时间",
-                "类型",
-                "请求",
-                "模型",
-                "脱敏 / 还原",
-                "命中明细",
-                "耗时",
-            ],
-        ),
-        (
-            "audit-table",
-            vec!["时间", "严重度", "信号", "证据", "来源"],
-        ),
+    for id in [
+        "logList",
+        "logDetail",
+        "auditList",
+        "auditDetail",
+        "logType",
+        "logSearch",
+        "logPrev",
+        "logNext",
+        "auditSev",
+        "auditSearch",
     ] {
-        assert!(html.contains(tbl), "缺少 {tbl} 样式钩子");
-        // 取该表 thead 片段，校验列名齐全
-        let at = html.find(tbl).expect(tbl);
-        let head = &html[at..at + 900];
-        let thead = head
-            .split("<thead>")
-            .nth(1)
-            .and_then(|s| s.split("</thead>").next());
-        let thead = thead.unwrap_or("");
-        for c in cols {
-            assert!(thead.contains(c), "{tbl} 表头缺少列「{c}」");
-        }
+        assert!(
+            html.contains(&format!(r#"id="{id}""#)),
+            "/console 缺少 #{id}"
+        );
     }
-    // colspan 必须与列数一致，否则空态会错位
     let js = {
         let (_, b) = h.req("GET", "/console/app.js", false, None).await;
         String::from_utf8_lossy(&b).to_string()
     };
+    // 详情必须同时给出「原文」与「发给上游」两个对照面
+    assert!(js.contains("原文（客户端发出）"), "详情缺原文面板");
+    assert!(js.contains("发给上游（已脱敏）"), "详情缺「发给上游」面板");
     assert!(
-        js.contains(r#"colspan="7""#) && js.contains(r#"colspan="5""#),
-        "空态 colspan 必须覆盖各自列数"
+        js.contains("masked_dialog"),
+        "详情应使用 masked_dialog 字段"
+    );
+    // 老事件兜底：没有 masked_dialog 时按命中明细推算
+    assert!(js.contains("按命中明细推算"), "缺老事件兜底");
+    // 禁止再出现旧的裸 table 渲染目标
+    assert!(
+        !js.contains(r#"colspan="7""#),
+        "不应再有 7 列表格渲染（已改为列表 + 详情）"
     );
 }
 
 /// 回归：日志明细必须同时展示**原文**与**占位符（加密后）**。
-/// 此前 JS 只取 `it.preview`（打码预览），且字段名用错 —— 后端序列化成
-/// `tok`（serde rename），JS 从未读取，导致两个关键值都不显示。
+/// 之前 JS 只取 `it.preview`（打码预览），且字段名用错 —— 后端序列化成
+/// `tok`（serde rename），JS 从未读取，两个关键值都不显示。
 #[tokio::test]
 async fn log_items_show_original_and_placeholder() {
     let h = Harness::new();
@@ -702,29 +745,28 @@ async fn log_items_show_original_and_placeholder() {
         js.contains("it.tok || it.token"),
         "渲染必须读取后端序列化的 tok 字段"
     );
-    // 必须有原文 → 占位符的对照结构
+    // 原文 / 占位符的对照列
     assert!(
-        js.contains("item-src") && js.contains("item-tok"),
-        "缺少原文/占位符对照元素"
+        js.contains("cmp-orig") && js.contains("cmp-tok"),
+        "缺少原文 → 占位符对照列"
     );
-    assert!(
-        js.contains("itemSource"),
-        "必须实现原文取值（凭据类回退到预览）"
-    );
-    // 不能再被 preview 短路掉原文
+    // 原文不得被 preview 短路；凭据类才回退到打码预览
+    assert!(js.contains("it.original"), "必须渲染原文");
     assert!(
         !js.contains("it.preview || it.original"),
         "原文不得被 preview 短路"
     );
+    assert!(
+        js.contains("凭据类不存明文"),
+        "凭据类应显式说明无明文，而不是留空让人以为坏了"
+    );
     // 详情视图要回源 /logs/detail
     assert!(js.contains("/logs/detail?id="), "详情视图必须回源单条事件");
-    assert!(js.contains("renderLogDetail"), "详情渲染函数缺失");
-    // 统计字段要真的渲染出来（此前 count/restored 压根没用）
-    for f in ["e.count", "e.restored", "e.unresolved", "e.degraded"] {
+    assert!(js.contains("logDetailHtml"), "详情渲染函数缺失");
+    // 统计字段要真的渲染出来
+    for f in ["e.count", "e.restored", "e.unresolved"] {
         assert!(js.contains(f), "统计字段 {f} 未被渲染");
     }
-    // 凭据类要显式说明「不存明文」，而不是留空让人以为坏了
-    assert!(js.contains("不存明文"), "凭据类应显式说明无明文");
 }
 
 // ── 脱敏测试端点（隔离：零落库、零内存残留）─────────────────────
@@ -879,4 +921,119 @@ async fn test_page_exists_and_declares_isolation() {
     let js = String::from_utf8_lossy(&js);
     assert!(js.contains("/mask/test"), "前端必须调用隔离测试端点");
     assert!(js.contains("TEST_PRESETS"), "缺少示例文本");
+}
+
+/// 回归：落库事件的 id 必须非 0、详情必须可取回、且带「发给上游」的脱敏文本。
+///
+/// 早期调用方在 `bus.emit` **之前** enqueue（id 由 `emit` 内部才赋），于是
+/// SQLite 里的事件 id 恒为 0：列表能看、点开必然 404，且所有行 id 相同。
+/// 同时流式路径的 RESTORE 事件完全没人落库。
+#[tokio::test]
+async fn persisted_events_have_real_ids_and_masked_dialog() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::with_owned_dir(dir);
+    // 上游不可达（api.example.com），但 MASK 事件在转发**之前**就已产生
+    let (status, _) = h
+        .req(
+            "POST",
+            "/v1/chat/completions",
+            false,
+            Some(
+                r#"{"model":"gpt-4o","messages":[{"role":"user","content":"我的电话是13800138000"}]}"#,
+            ),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+
+    let es = h.state.event_store.as_ref().expect("自带事件库");
+    es.sync(); // 屏障：确保已入队 == 已落盘
+
+    let (events, total) = es.fetch_events_page(10, 0, Some("MASK"), None);
+    assert!(total >= 1, "MASK 事件必须落库");
+    let ev = &events[0];
+    assert!(ev.id > 0, "落库事件 id 不得为 0（否则详情页点不开）");
+    assert!(
+        es.fetch_event_by_id(ev.id).is_some(),
+        "按 id 必须能取回（详情页的 SQLite 兜底路径）"
+    );
+    // 「原文 / 发给上游」两份文本
+    assert!(ev.dialog.contains("13800138000"), "原文必须保留");
+    assert!(
+        ev.masked_dialog.contains("{{PHONE_"),
+        "必须带发给上游的脱敏文本：{:?}",
+        ev.masked_dialog
+    );
+    assert!(
+        !ev.masked_dialog.contains("13800138000"),
+        "发给上游的文本里不得出现原文"
+    );
+    // 全文搜索（路径 / 原文两个维度）
+    let (_, n) = es.fetch_events_page(10, 0, None, Some("13800138000"));
+    assert!(n >= 1, "搜索应能命中原文");
+    let (_, n2) = es.fetch_events_page(10, 0, None, Some("chat/completions"));
+    assert!(n2 >= 1, "搜索应能命中路径");
+    // 类型过滤
+    let (_, n3) = es.fetch_events_page(10, 0, Some("RESTORE"), None);
+    assert_eq!(n3, 0, "本次请求没有 RESTORE 事件");
+}
+
+/// 回归：审计事件 id 非 0，且每条 finding 只触发一次落库钩子。
+///
+/// 此前是「每个请求结束后把 ring 里最近 20 条重新 enqueue」，于是同一条审计
+/// 会被反复写进 SQLite（N 个请求 → N 份重复行）。
+#[test]
+fn audit_hook_fires_once_per_finding_with_unique_ids() {
+    use maskit_rs::audit::{Finding, Severity};
+    use maskit_rs::store::events::{AuditEvent, EventBus};
+    use std::sync::{Arc, Mutex};
+
+    let bus = EventBus::new();
+    let seen: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(vec![]));
+    let sink = seen.clone();
+    bus.set_hooks(
+        Arc::new(|_e| {}),
+        Arc::new(move |a: &AuditEvent| sink.lock().unwrap().push(a.id)),
+    );
+    let f = Finding {
+        signal: "response_poison".into(),
+        severity: Severity::High,
+        evidence: "CANARY_0_a1b2c3d4".into(),
+        kind: "poison".into(),
+    };
+    bus.emit_audit(&f, "sid", "h", "POST", "/x");
+    bus.emit_audit(&f, "sid", "h", "POST", "/x");
+    let ids = seen.lock().unwrap().clone();
+    assert_eq!(
+        ids.len(),
+        2,
+        "两条 finding 应各触发一次钩子（不得重复入队）"
+    );
+    assert!(ids.iter().all(|i| *i > 0), "审计 id 不得为 0：{ids:?}");
+    assert_ne!(ids[0], ids[1], "审计 id 必须唯一");
+}
+
+/// 回归：`/favicon.ico` 必须被接管（204），不能当反代流量转发给上游。
+///
+/// 浏览器每次加载控制台都会请求它。此前会被转发给上游并在事件日志里刷一条
+/// PASS —— 实测**一次页面加载就是一条**，把用户想看的真实事件冲得看不见。
+#[tokio::test]
+async fn favicon_is_answered_locally_not_proxied() {
+    let h = Harness::new();
+    let app = build_router(h.state.clone());
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/favicon.ico")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT, "favicon 应本地 204");
+    assert!(resp.headers().get("cache-control").is_some(), "应带缓存头");
+    // 且不得产生事件（上游不可达时若被转发就会留下 ERR/PASS 事件）
+    assert!(
+        h.state.bus.recent(10).is_empty(),
+        "favicon 不应进入事件管线"
+    );
 }

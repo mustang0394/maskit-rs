@@ -267,9 +267,7 @@ fn perf_sse_byte_at_a_time_no_blowup() {
 #[test]
 fn perf_adversarial_prefixes_linear() {
     let cfg = full_cfg();
-    let store = SessionStore::new();
     let custom = CustomWords::build(&cfg);
-    store.new_session("adv");
     let cases: [(&str, &str); 5] = [
         ("连接串前缀", "x://"),
         ("反斜杠", "\\"),
@@ -281,10 +279,21 @@ fn perf_adversarial_prefixes_linear() {
         let mut times = Vec::new();
         for mult in [1usize, 8] {
             let text = token.repeat(2000 * mult);
-            let ctx = MaskCtx::new(&cfg, &store, "adv".into(), &custom);
-            let t0 = std::time::Instant::now();
-            let _ = ctx.mask(&text);
-            times.push(t0.elapsed().as_secs_f64() * 1000.0);
+            // 3 次独立复跑取最小值，且**每次都换全新 store**：
+            //   * 共用 store 会让后几次走「命中复用表」的廉价路径，把首次成本藏掉；
+            //   * 而 ratio 的分母可能只有 0.02ms（花括号/反斜杠），一次容器 CPU 配额
+            //     抖动就能把比值推到上百倍。此前整仓串行跑时曾因前一个多线程用例的
+            //     残留线程导致「数字串 1x=0.47ms 8x=55.73ms（117x）」的假失败。
+            let mut best = f64::MAX;
+            for _ in 0..3 {
+                let store = SessionStore::new();
+                store.new_session("adv");
+                let ctx = MaskCtx::new(&cfg, &store, "adv".into(), &custom);
+                let t0 = std::time::Instant::now();
+                let _ = ctx.mask(&text);
+                best = best.min(t0.elapsed().as_secs_f64() * 1000.0);
+            }
+            times.push(best);
         }
         let ratio = times[1] / times[0].max(0.001);
         println!(
@@ -426,4 +435,60 @@ fn perf_clean_body_fast_path() {
     assert!(!out.changed, "无敏感内容必须零改写");
     assert_eq!(out.text.as_bytes(), raw.as_slice(), "零改写必须逐字节一致");
     assert!(ms < 120.0, "零改写 {ms:.1}ms（应接近纯扫描开销）");
+}
+
+// ===========================================================================
+// 高基数 PII：大量**互不相同**的新敏感值
+// ===========================================================================
+
+/// 回归：高基数（一次请求里 N 个唯一新值）不得退化为二次方。
+///
+/// 背景：`prune_recent` 原先在**每签发一个新占位符**时都全表 collect+sort，
+/// 于是一次请求里 N 个唯一值 = O(N²)。release 实测 200→64ms / 1000→112ms /
+/// 3000→1130ms（51KB 的 body 即 1.1s CPU，可被单请求放大）。
+/// 既有性能用例全是「同一个手机号重复填充」，只走复用路径，覆盖不到这条曲线。
+#[test]
+fn perf_many_unique_pii_is_not_quadratic() {
+    let cfg = full_cfg();
+    let custom = CustomWords::build(&cfg);
+
+    let run_once = |n: usize| -> f64 {
+        let store = SessionStore::new();
+        store.new_session("hc");
+        let ctx = MaskCtx::new(&cfg, &store, "hc".into(), &custom);
+        let text: String = (0..n)
+            .map(|i| format!("手机138{:08} ", 10_000_000 + i))
+            .collect();
+        let t0 = std::time::Instant::now();
+        let out = ctx.mask(&text);
+        let ms = t0.elapsed().as_secs_f64() * 1000.0;
+        assert!(out.contains("{{PHONE_"), "必须真的签发占位符");
+        ms
+    };
+    // 每次都用全新 store（否则后几次命中复用表，量不到「大量唯一新值」）
+    // 且取 3 次最小值 —— 单次计时在 0.6 核容器上会被调度抖动放大。
+    let run = |n: usize| -> f64 { (0..3).map(|_| run_once(n)).fold(f64::MAX, f64::min) };
+
+    // 预热：排除规则/正则首次编译成本
+    let _ = run(200);
+
+    let small = run(1000).max(0.1);
+    let big = run(3000);
+    let ratio = big / small;
+    println!(
+        "高基数脱敏：1000 个唯一值 {small:.1}ms，3000 个 {big:.1}ms（比值 {ratio:.2}；\
+         线性期望≈3x，二次方≈9x；CPU 配额 {:.2} 核）",
+        cpu_quota()
+    );
+    // 主判据用**绝对护栏**：旧 O(n²) 实现 3000 个需 1130ms，修好后 ~8ms，
+    // 300ms 有 ~35x 余量，且完全不受比值噪声影响。
+    assert!(
+        big < 300.0,
+        "3000 个唯一值耗时 {big:.1}ms（旧 O(n²) 实现为 1130ms，修好后应 <30ms）"
+    );
+    // 辅助判据：比值。（阈值放宽到 8 以免抖动误报；真二次方在 4x 体量下是 16x）
+    assert!(
+        ratio < 8.0,
+        "高基数脱敏疑似二次方退化：1000→{small:.1}ms 3000→{big:.1}ms（{ratio:.2}x）"
+    );
 }
