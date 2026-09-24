@@ -63,7 +63,12 @@ fn main() {
     let bus = store::events::EventBus::new();
 
     let port = cfg.server.port;
-    let bind = cfg.server.bind.clone();
+    // 容器内必须绑 0.0.0.0：Docker 的 `-p 宿主端口:18701` 是转发到容器
+    // **eth0 地址**（如 172.17.0.x），进程若绑 127.0.0.1 则该转发接不到，
+    // 表现为 curl: (52) Empty reply from server。
+    // 因此提供 MASKIT_RS_BIND 覆盖（Dockerfile/compose 已设为 0.0.0.0）；
+    // 宿主机侧的 `-p 127.0.0.1:18701:18701` 仍只暴露在回环，不对外网开放。
+    let bind = std::env::var("MASKIT_RS_BIND").unwrap_or_else(|_| cfg.server.bind.clone());
     let token = cfg.panel_token.clone();
 
     // SQLite 事件库（与 Python 版同 schema，可直接互读写）

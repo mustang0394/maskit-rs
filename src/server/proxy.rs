@@ -91,6 +91,16 @@ pub struct RequestMeta {
 }
 
 /// 反代 handler（完整管线，M6）。
+/// 根路径 `/` 的代理入口（上游已配置时，`/` 属于上游资源，不劫持）。
+pub async fn proxy_root(state: SharedState) -> Response {
+    let req = Request::builder()
+        .method("GET")
+        .uri("/")
+        .body(Body::empty())
+        .expect("build GET /");
+    handler(State(state), req).await
+}
+
 pub async fn handler(State(state): State<SharedState>, req: Request) -> Response {
     let (parts, body) = req.into_parts();
     let method = parts.method.clone();

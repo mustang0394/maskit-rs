@@ -55,7 +55,11 @@ COPY --chmod=0644 --chown=nonroot:nonroot config.example.json /app/config.exampl
 COPY --chmod=0644 --chown=nonroot:nonroot docker/.keep /data/.keep
 
 VOLUME ["/data"]
+# 绑 0.0.0.0：容器内绑 127.0.0.1 会导致 `-p` 端口映射接不到
+# （表现为 curl: (52) Empty reply from server）。
+# 对外暴露范围由宿主侧 `-p 127.0.0.1:18701:18701` 控制，不因此放开公网。
 ENV MASKIT_RS_DATA_DIR=/data \
+    MASKIT_RS_BIND=0.0.0.0 \
     RUST_LOG=info
 
 USER nonroot:nonroot

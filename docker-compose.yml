@@ -39,6 +39,10 @@ services:
 
     environment:
       MASKIT_RS_DATA_DIR: /data
+      # 必须绑 0.0.0.0：容器内绑 127.0.0.1 时 `-p` 端口映射接不到
+      # （curl 报 (52) Empty reply from server）。对外仍由上面的
+      # `127.0.0.1:18701:18701` 限定为仅本机可访问。
+      MASKIT_RS_BIND: "0.0.0.0"
       RUST_LOG: info
       # TZ: Asia/Shanghai
 

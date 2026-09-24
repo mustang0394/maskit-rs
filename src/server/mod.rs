@@ -1,7 +1,7 @@
 //! axum 路由装配：/console（内嵌 UI + 管理 API）与其余全部路径（LLM 反代）。
 
 use axum::body::Body;
-use axum::extract::Request;
+use axum::extract::{Request, State};
 use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -142,6 +142,9 @@ pub fn build_router(state: SharedState) -> Router {
         .route("/console/{*rest}", get(static_ui::static_asset));
 
     Router::new()
+        // 根路径：上游未配置时返回引导页（直接 502 对首次使用者毫无信息量）。
+        // 上游一旦配置，/ 仍原样透传给上游，不劫持真实 API 的根端点。
+        .route("/", get(root_landing))
         .merge(console)
         .fallback(proxy::handler)
         .layer(axum::middleware::from_fn(security_headers_middleware))
@@ -153,6 +156,44 @@ pub fn build_router(state: SharedState) -> Router {
             crate::server::console_api::auth_middleware,
         ))
         .with_state(state)
+}
+
+/// 根路径引导页：仅在「上游未配置」时替代 502。
+///
+/// 上游一旦配置，`/` 属于上游的资源，交给反代管线原样透传，不劫持。
+async fn root_landing(State(state): State<SharedState>) -> Response {
+    let cfg = state.config.get();
+    if !cfg.upstream.target.trim().is_empty() {
+        return crate::server::proxy::proxy_root(state).await;
+    }
+    let html = r#"<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><title>Maskit-RS</title>
+<style>
+ body{font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans CJK SC",sans-serif;
+      background:#0f1115;color:#e6e8ec;max-width:640px;margin:12vh auto;padding:0 24px}
+ a{color:#4f9cf9} code{background:#1e222b;padding:2px 6px;border-radius:4px;font-size:13px}
+ h1{font-size:22px;margin:0 0 6px} p{color:#b8bec9} ul{padding-left:20px;color:#b8bec9}
+ .box{background:#171a21;border:1px solid #2a2f3a;border-radius:10px;padding:16px 20px;margin-top:18px}
+</style></head><body>
+<h1>Maskit-RS</h1>
+<p>本地 LLM 脱敏网关正在运行。</p>
+<div class="box">
+  <p><strong>Web 控制台：</strong><a href="/console">/console</a></p>
+  <p><strong>下一步：</strong>到控制台「设置」页填入上游地址（如 <code>https://api.your-relay.com</code>），保存后立即生效。</p>
+</div>
+<p style="margin-top:22px">客户端接入：</p>
+<ul>
+  <li>OpenAI SDK / Cursor / Codex：<code>base_url = http://127.0.0.1:18701/v1</code></li>
+  <li>Anthropic SDK / Claude Code：<code>ANTHROPIC_BASE_URL=http://127.0.0.1:18701</code></li>
+  <li>健康检查：<code>GET /console/api/health</code></li>
+</ul>
+</body></html>"#;
+    (
+        StatusCode::OK,
+        [("content-type", "text/html; charset=utf-8")],
+        html,
+    )
+        .into_response()
 }
 
 /// 安全响应头（对齐 Python `security_headers` 的核心语义）。

@@ -44,7 +44,11 @@ WORKDIR /app
 COPY --chmod=0644 --chown=nonroot:nonroot docker/.keep /data/.keep
 
 VOLUME ["/data"]
+# 绑 0.0.0.0：容器内绑 127.0.0.1 会导致 `-p` 端口映射接不到
+# （表现为 curl: (52) Empty reply from server）。
+# 对外暴露范围由宿主侧端口映射控制。
 ENV MASKIT_RS_DATA_DIR=/data \
+    MASKIT_RS_BIND=0.0.0.0 \
     RUST_LOG=info
 
 USER nonroot:nonroot
