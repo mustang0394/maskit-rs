@@ -271,7 +271,9 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/${{ github.repository }}/maskit-rs
+          # github.repository 已经是 <owner>/<repo>，直接用作镜像名，
+          # 不要再拼一次仓库名（否则会得到 .../maskit-rs/maskit-rs）
+          images: ghcr.io/${{ github.repository }}
           tags: |
             type=raw,value=${{ needs.version.outputs.version }}
             type=raw,value=latest
