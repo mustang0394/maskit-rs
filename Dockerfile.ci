@@ -19,9 +19,13 @@
 # ---------------------------------------------------------------------------
 
 # TARGETARCH 取值：amd64 / arm64（不是完整三元组）
+# ⚠️ 必须在 FROM **之后**再声明一次：全局 ARG 只对 FROM 行可见，
+#    阶段内部想用必须重新声明，否则展开为空（表现为 bin//maskit-rs 找不到）。
 ARG TARGETARCH
 
 FROM gcr.io/distroless/cc-debian12:nonroot AS runtime
+
+ARG TARGETARCH
 
 # distroless/cc 提供 glibc + CA 证书（HTTPS 上游需要）；
 # SQLite 已静态链接进二进制，无需系统库。
