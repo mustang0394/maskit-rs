@@ -191,6 +191,88 @@ impl SessionStore {
         }
     }
 
+    /// 为自定义敏感词播种**确定性**占位符（对齐 Python `_sync_custom_word_mappings`）。
+    ///
+    /// 幂等：每次配置热更新/启动都会调用；已登记且 label 未变的词保持原映射（后缀稳定），
+    /// label 变了则重新派生并注销旧 token。
+    ///
+    /// 必须调用：否则 custom_fwd 永远为空，自定义词的占位符每次重启都变，
+    /// 长任务跨重启后历史占位符还原不回来（用户看到裸 {{TERM_xxx}}）。
+    pub fn seed_custom_words(&self, words: &[(String, String)]) {
+        // 1) 清理已移除/禁用的词
+        let active: std::collections::HashSet<&str> =
+            words.iter().map(|(w, _)| w.as_str()).collect();
+        let stale: Vec<String> = self
+            .custom_fwd
+            .iter()
+            .filter(|kv| !active.contains(kv.key().as_str()))
+            .map(|kv| kv.key().clone())
+            .collect();
+        for w in stale {
+            // 先 get 再 remove：避开 DashMap::remove<Q> 的泛型重载在链式调用下的类型误推
+            let tok: Option<String> = self.custom_fwd.get(w.as_str()).map(|r| r.clone());
+            if let Some(tok) = tok {
+                self.custom_fwd.remove(w.as_str());
+                self.custom_rev.remove(tok.as_str());
+                self.suffix_index_del(tok.as_str());
+            }
+        }
+        // 2) 避让集合：自定义词已有后缀 + 全局活跃后缀
+        let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for kv in self.custom_rev.iter() {
+            let sfx = super::placeholder::token_suffix(kv.key());
+            if !sfx.is_empty() {
+                used.insert(sfx);
+            }
+        }
+        for kv in self.recent_suffix.iter() {
+            if let super::session::SuffixIndexValue::Token(t) = kv.value() {
+                let sfx = super::placeholder::token_suffix(t);
+                if !sfx.is_empty() {
+                    used.insert(sfx);
+                }
+            }
+        }
+        let now = now();
+        // 3) 逐词播种（label 未变则保留旧映射）
+        for (word, label) in words {
+            let lab = super::placeholder::safe_label(label);
+            if let Some(tok) = self.custom_fwd.get(word.as_str()).map(|r| r.clone()) {
+                // 映射稳定：占位符标签未变（safe_label 归一后相等）→ 只刷新时间戳。
+                // 注意：即使占位符不变，custom_rev 里的**原始 label** 也要更新，
+                // 否则还原后取到的分类是过期的。
+                if self
+                    .custom_rev
+                    .get(&tok)
+                    .map(|r| super::placeholder::safe_label(&r.label) == lab)
+                    .unwrap_or(false)
+                {
+                    if let Some(mut r) = self.custom_rev.get_mut(&tok) {
+                        r.label = label.clone();
+                        r.ts = now;
+                    }
+                    continue;
+                }
+                // 占位符标签变了：注销旧记录，重新派生
+                self.custom_fwd.remove(word.as_str());
+                self.custom_rev.remove(tok.as_str());
+                self.suffix_index_del(tok.as_str());
+            }
+            let suffix = super::placeholder::deterministic_suffix(word, &mut used);
+            let token = format!("{{{{{lab}_{suffix}}}}}");
+            self.custom_fwd.insert(word.clone(), token.clone());
+            self.custom_rev.insert(
+                token.clone(),
+                RecentEntry {
+                    token: word.clone(),
+                    label: label.clone(),
+                    ts: now,
+                },
+            );
+            self.suffix_index_add(&token);
+        }
+    }
+
     /// 该原文是否属于启用的自定义词（永久豁免 TTL/LRU）。
     pub fn is_custom_word_orig(&self, orig: &str) -> bool {
         if let Some(tok) = self.custom_fwd.get(orig) {

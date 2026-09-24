@@ -58,6 +58,36 @@ pub fn new_token(label: &str, taken: &dyn Fn(&str, &str) -> bool) -> String {
     format!("{{{{{lab}_{}}}}}", rand_suffix())
 }
 
+/// 自定义敏感词的**确定性后缀**（对齐 Python `_deterministic_suffix`）。
+///
+/// 为什么自定义词要确定性、普通敏感值要随机：
+/// - 普通敏感值（手机号/邮箱）必须随机 → 防上游枚举反推原文（安全红线）
+/// - 自定义词由用户显式配置、原文本就在 config.json 里，**不存在泄漏风险**；
+///   而它需要跨进程稳定：长任务 / Agent 工具调用跨越重启时，历史消息里的
+///   `{{TERM_xxx}}` 必须还能还原，否则用户看到裸占位符。
+///
+/// 派生方式：sha256("maskit_cw:{counter}:{word}") 取前 6 字节映射到辅音字母表；
+/// 词表内撞车时递增 counter 重试（保证词表内唯一）。
+pub fn deterministic_suffix(orig: &str, used: &mut std::collections::HashSet<String>) -> String {
+    use sha2::{Digest, Sha256};
+    let alphabet = TOKEN_ALPHABET;
+    let mut counter: u32 = 0;
+    loop {
+        let mut h = Sha256::new();
+        h.update(format!("maskit_cw:{counter}:{orig}").as_bytes());
+        let digest = h.finalize();
+        let suffix: String = digest
+            .iter()
+            .take(6)
+            .map(|b| alphabet[(*b as usize) % alphabet.len()] as char)
+            .collect();
+        if used.insert(suffix.clone()) {
+            return suffix;
+        }
+        counter += 1;
+    }
+}
+
 /// 从 token 取 6 位后缀（小写）；形态不对返回空（对齐 `_token_suffix`）。
 pub fn token_suffix(token: &str) -> String {
     let Some(inner) = token.strip_prefix("{{").and_then(|t| t.strip_suffix("}}")) else {

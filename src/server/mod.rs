@@ -45,6 +45,8 @@ impl AppState {
     ) -> Self {
         let cfg = config.get();
         let custom = Arc::new(CustomWords::build(&cfg));
+        // 播种自定义词确定性占位符（跨重启稳定）
+        custom.register_words(&crate::mask::session::STORE);
         let cmdblock = Arc::new(crate::cmdblock::CmdBlockEngine::new(&cfg));
         Self {
             config,

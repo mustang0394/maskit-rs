@@ -537,3 +537,133 @@ fn whole_word_switch_keeps_cjk_substring_matching() {
     let masked = mask_cfg(&parts, "这是机要文件");
     assert!(!masked.contains("机要"), "CJK 词开启整词开关后仍须命中");
 }
+
+// ===========================================================================
+// 自定义词确定性后缀（对齐 Python `_deterministic_suffix` / `_sync_custom_word_mappings`）
+// 回归：曾缺失播种，导致自定义词占位符每次重启都变，长任务跨重启还原不回来
+// ===========================================================================
+
+#[test]
+fn custom_word_suffix_is_deterministic_across_restart() {
+    // 模拟两次「进程启动」：各自新建 SessionStore（内存态清空），喂同一份配置
+    let words = vec![
+        ("张三".to_string(), "人名".to_string()),
+        ("李四".to_string(), "人名".to_string()),
+        ("机密项目".to_string(), "内部".to_string()),
+    ];
+    let toks1 = {
+        let store = SessionStore::new();
+        store.seed_custom_words(&words);
+        let mut m = std::collections::HashMap::new();
+        for (w, _) in &words {
+            m.insert(w.clone(), store.custom_fwd.get(w.as_str()).unwrap().clone());
+        }
+        m
+    };
+    let toks2 = {
+        let store = SessionStore::new(); // 全新实例 = 重启后状态
+        store.seed_custom_words(&words);
+        let mut m = std::collections::HashMap::new();
+        for (w, _) in &words {
+            m.insert(w.clone(), store.custom_fwd.get(w.as_str()).unwrap().clone());
+        }
+        m
+    };
+    assert_eq!(toks1, toks2, "同一份配置在两次启动间必须得到相同占位符");
+    // 形态合法且后缀是 6 位辅音
+    for (w, tok) in &toks1 {
+        assert!(
+            maskit_rs::mask::placeholder::placeholder_rx().is_match(tok),
+            "{w} → {tok} 形态非法"
+        );
+        let sfx = maskit_rs::mask::placeholder::token_suffix(tok);
+        assert_eq!(sfx.len(), 6);
+        assert!(
+            sfx.bytes().all(|b| b"bcdfghjkmnpqrstvwxz".contains(&b)),
+            "后缀必须是纯辅音：{sfx}"
+        );
+    }
+    // 不同词得到不同占位符
+    let uniq: std::collections::HashSet<&String> = toks1.values().collect();
+    assert_eq!(uniq.len(), words.len(), "不同自定义词不得撞同一个占位符");
+}
+
+#[test]
+fn custom_word_mapping_survives_ttl_expiry() {
+    // 自定义词映射永久有效，不受 session_ttl / LRU 淘汰影响
+    let store = SessionStore::new();
+    store.set_ttl(1); // TTL 设为 1 秒
+    let words = vec![("机密".to_string(), "内部".to_string())];
+    store.seed_custom_words(&words);
+    let tok = store.custom_fwd.get("机密").unwrap().clone();
+    store.prune_recent(); // 触发清理（普通条目会被淘汰，自定义词不会）
+    assert!(
+        store.custom_fwd.contains_key("机密"),
+        "自定义词映射不应被 TTL/LRU 淘汰"
+    );
+    assert_eq!(
+        store.lookup(&tok, "any-session"),
+        Some("机密".to_string()),
+        "自定义词占位符必须始终可还原"
+    );
+}
+
+#[test]
+fn custom_word_removed_is_cleaned_up() {
+    let store = SessionStore::new();
+    store.seed_custom_words(&[
+        ("张三".to_string(), "人名".to_string()),
+        ("李四".to_string(), "人名".to_string()),
+    ]);
+    assert!(store.custom_fwd.contains_key("张三"));
+    assert!(store.custom_fwd.contains_key("李四"));
+    // 配置里删掉「张三」后重新播种
+    store.seed_custom_words(&[("李四".to_string(), "人名".to_string())]);
+    assert!(!store.custom_fwd.contains_key("张三"), "已删除的词应被清理");
+    assert!(store.custom_fwd.contains_key("李四"), "仍启用的词应保留");
+}
+
+#[test]
+fn custom_word_label_change_derives_new_token() {
+    let store = SessionStore::new();
+    store.seed_custom_words(&[("张三".to_string(), "人名".to_string())]);
+    let old = store.custom_fwd.get("张三").unwrap().clone();
+    // label 变了 → 更新映射（对齐 Python：比较 safe_label 归一后的值）
+    store.seed_custom_words(&[("张三".to_string(), "客户".to_string())]);
+    let new = store.custom_fwd.get("张三").unwrap().clone();
+    // 占位符标签未变（都是 TERM）→ 旧记录保留但 label 应刷新为新值
+    assert!(
+        store.custom_rev.contains_key(&old),
+        "占位符未变时记录应保留"
+    );
+    assert_eq!(
+        store.custom_rev.get(&new).map(|r| r.label.clone()),
+        Some("客户".to_string()),
+        "新 label 应生效"
+    );
+    // 占位符标签由 safe_label 归一：「人名」/「客户」都是非 ASCII 标签 → 同样归一为 TERM，
+    // 因此后缀相同是**预期**（与 Python _sync_custom_word_mappings 语义一致）。
+    assert_eq!(old, new, "两个中文 label 归一后同为 TERM，占位符保持稳定");
+    // 换成 ASCII label（归一结果不同）应重新派生
+    store.seed_custom_words(&[("张三".to_string(), "PERSON".to_string())]);
+    let ascii_tok = store.custom_fwd.get("张三").unwrap().clone();
+    assert_ne!(new, ascii_tok, "safe_label 结果变化时应重新派生");
+    assert!(ascii_tok.starts_with("{{PERSON_"));
+}
+
+#[test]
+fn ordinary_secret_uses_random_not_deterministic() {
+    // 普通敏感值（手机号）必须随机：两次独立会话不得得到相同后缀
+    let taken = |_t: &str, _s: &str| false;
+    // 验证：new_token 不使用 deterministic 路径（对同一 label 连续调用足够多次应见不同后缀）
+    let mut suffixes = std::collections::HashSet::new();
+    for _ in 0..50 {
+        let t = maskit_rs::mask::placeholder::new_token("PHONE", &taken);
+        suffixes.insert(maskit_rs::mask::placeholder::token_suffix(&t));
+    }
+    assert!(
+        suffixes.len() > 40,
+        "50 次生成得到 {} 个不同后缀（应接近 50）——普通敏感值必须是随机的",
+        suffixes.len()
+    );
+}

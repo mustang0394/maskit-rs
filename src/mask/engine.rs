@@ -175,7 +175,7 @@ impl CustomWords {
         for (i, (w, _)) in words.iter().enumerate() {
             lower_index.entry(w.to_lowercase()).or_insert(i);
         }
-        Self {
+        let this = Self {
             words,
             lower_index,
             ac,
@@ -183,7 +183,27 @@ impl CustomWords {
             regex_words,
             disabled_labels,
             disabled_words,
-        }
+        };
+        // 播种自定义词的确定性占位符（对齐 Python `_sync_custom_word_mappings`）：
+        // 自定义词原文就在 config.json 里，不存在反推风险；需要跨重启稳定，
+        // 否则长任务里历史消息的 {{TERM_xxx}} 还原不回来。
+        // 由调用方（AppState）在拿到 store 后调用 register_custom_words，
+        // 这里只负责提供 enabled 词表。
+        this
+    }
+
+    /// 启用中的自定义词（供播种调用）。
+    pub fn enabled_words(&self) -> Vec<(String, String)> {
+        self.words
+            .iter()
+            .filter(|(w, l)| self.word_enabled(w, l))
+            .cloned()
+            .collect()
+    }
+
+    /// 在给定会话存储上播种确定性映射。
+    pub fn register_words(&self, store: &SessionStore) {
+        store.seed_custom_words(&self.enabled_words());
     }
 
     pub fn word_enabled(&self, word: &str, label: &str) -> bool {
