@@ -508,3 +508,104 @@ async fn no_price_fields_anywhere_in_config() {
         "主动探针配置位应已移除"
     );
 }
+
+// ── 自定义词批量录入 / 含 '.' 的词 / 删除 ─────────────────────────
+
+/// 回归：Web UI 曾用 `{"path":"mask.custom_words.<词>"}` 逐词 patch。
+/// 词含 `.`（如 example.com、Dr. Smith）会被点分切成多段，写成嵌套结构，
+/// 导致 custom_words 的值类型从 string 变 object，匹配逻辑错乱。
+/// 新增 `segs` 入口后键原样写入。
+#[tokio::test]
+async fn patch_segs_keeps_dotted_word_flat() {
+    let h = Harness::new();
+    for word in ["example.com", "Dr. Smith", "ACME/Inc"] {
+        let body = serde_json::json!({
+            "segs": ["mask", "custom_words", word],
+            "value": "ORG"
+        })
+        .to_string();
+        let (s, v) = h
+            .json("POST", "/console/api/config/patch", Some(&body))
+            .await;
+        assert_eq!(s, StatusCode::OK, "词 {word:?} 应添加成功");
+        assert_eq!(
+            v["config"]["mask"]["custom_words"][word], "ORG",
+            "词 {word:?} 应为扁平键"
+        );
+        assert!(
+            v["config"]["mask"]["custom_words"][word].is_string(),
+            "词 {word:?} 的值必须是字符串（不是嵌套对象）"
+        );
+    }
+    // 切勿出现被切开的子键（GET /config 直接返回 Config 本体，无 config 包装）
+    let (_, v) = h.json("GET", "/console/api/config", None).await;
+    let cw = &v["mask"]["custom_words"];
+    assert!(cw["example"].is_null(), "不应产生子键 example");
+    assert!(cw["com"].is_null(), "不应产生子键 com");
+    assert_eq!(cw.as_object().unwrap().len(), 3, "应恰好 3 个扁平键");
+}
+
+/// 批量录入：一次 patch 写入整张词表（UI 行为），含 '.' 的词不受影响。
+#[tokio::test]
+async fn batch_add_words_in_one_patch() {
+    let h = Harness::new();
+    let words = serde_json::json!({
+        "张三": "PERSON", "李四": "PERSON", "王五": "PERSON", "example.com": "DOMAIN"
+    });
+    let body = serde_json::json!({
+        "segs": ["mask", "custom_words"], "value": words
+    })
+    .to_string();
+    let (s, v) = h
+        .json("POST", "/console/api/config/patch", Some(&body))
+        .await;
+    assert_eq!(s, StatusCode::OK);
+    let cw = &v["config"]["mask"]["custom_words"];
+    // 一个分类下多个词 —— 数据模型原生支持
+    assert_eq!(cw["张三"], "PERSON");
+    assert_eq!(cw["李四"], "PERSON");
+    assert_eq!(cw["王五"], "PERSON");
+    assert_eq!(cw["example.com"], "DOMAIN");
+    assert_eq!(cw.as_object().unwrap().len(), 4);
+}
+
+/// 删除单个词（含 '.' 的）：`value: null` = 删除键，不影响同类其他词。
+#[tokio::test]
+async fn delete_word_with_dot_keeps_others() {
+    let h = Harness::new();
+    let body = serde_json::json!({
+        "segs": ["mask", "custom_words"],
+        "value": {"example.com": "DOMAIN", "张三": "PERSON", "李四": "PERSON"}
+    })
+    .to_string();
+    h.json("POST", "/console/api/config/patch", Some(&body))
+        .await;
+    // 删 example.com
+    let del = serde_json::json!({
+        "segs": ["mask", "custom_words", "example.com"], "value": null
+    })
+    .to_string();
+    let (s, v) = h
+        .json("POST", "/console/api/config/patch", Some(&del))
+        .await;
+    assert_eq!(s, StatusCode::OK);
+    let cw = &v["config"]["mask"]["custom_words"];
+    assert!(cw["example.com"].is_null(), "含 '.' 的词应被准确删除");
+    assert_eq!(cw["张三"], "PERSON", "同分类其他词不受影响");
+    assert_eq!(cw["李四"], "PERSON");
+    assert_eq!(cw.as_object().unwrap().len(), 2);
+}
+
+/// segs 优先于 path；两者都空则报错而非静默写坏。
+#[tokio::test]
+async fn patch_rejects_empty_path() {
+    let h = Harness::new();
+    let (s, _) = h
+        .json(
+            "POST",
+            "/console/api/config/patch",
+            Some(r#"{"value":"X"}"#),
+        )
+        .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "空路径必须拒绝");
+}

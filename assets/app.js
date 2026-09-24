@@ -211,15 +211,35 @@
       }
     });
 
-    // 自定义词
+    // 自定义词：按分类分组展示
     const words = cfg.mask.custom_words || {};
-    const wkeys = Object.keys(words);
-    $('wordList').innerHTML = wkeys.length
-      ? wkeys.map(w => `<span class="chip" title="${esc(w)}（${esc(words[w])}）">
-            <span class="chip-text">${esc(w)}</span>
-            <span class="chip-label">${esc(words[w])}</span>
-            <button data-del-word="${esc(w)}" aria-label="删除">×</button>
-          </span>`).join('')
+    const groups = new Map();
+    for (const [w, l] of Object.entries(words)) {
+      const key = l || 'TERM';
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(w);
+    }
+    // 分类补全：已用过的分类直接选
+    $('labelOptions').innerHTML = [...groups.keys()]
+      .sort()
+      .map(l => `<option value="${esc(l)}"></option>`).join('');
+    // 占位符标签只留 ASCII：中文分类会退化成 TERM，提前告知避免误解
+    const pendingLabel = $('newLabel').value.trim();
+    const tokLabel = safeLabel(pendingLabel);
+    $('labelHint').textContent = pendingLabel && tokLabel !== pendingLabel
+      ? `占位符前缀将使用 ${tokLabel}（${pendingLabel} 含非 ASCII 字符，会被剔除）`
+      : '';
+    $('wordList').innerHTML = groups.size
+      ? [...groups.entries()].sort((a, b) => a[0].localeCompare(b[0])).map(([label, ws]) => `
+          <div class="word-group">
+            <span class="word-group-name">${esc(label)}
+              <span class="tok">{{${esc(safeLabel(label))}_xxxxxx}}</span>
+            </span>
+            ${ws.sort().map(w => `<span class="chip" title="${esc(w)}">
+              <span class="chip-text">${esc(w)}</span>
+              <button data-del-word="${esc(w)}" aria-label="删除">×</button>
+            </span>`).join('')}
+          </div>`).join('')
       : '<span class="hint">暂无自定义敏感词</span>';
 
     // 前缀
@@ -231,18 +251,42 @@
   }
   loaders.rules = loadRules;
 
+  // 占位符标签 ASCII 化（与服务端 safe_label 一致）
+  function safeLabel(label) {
+    const s = String(label || '').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 12);
+    return s || 'TERM';
+  }
+  // 多词切分：换行 / 逗号 / 顿号 / 分号 / 空白
+  function splitWords(text) {
+    return [...new Set(
+      String(text || '').split(/[\n\r,，、;；\s]+/)
+        .map(s => s.trim()).filter(Boolean)
+    )];
+  }
+
   $('btnAddWord').addEventListener('click', async () => {
-    const w = $('newWord').value.trim();
-    const l = $('newLabel').value.trim() || 'TERM';
-    if (!w) return toast('请输入敏感词', true);
+    const list = splitWords($('newWords').value);
+    const label = $('newLabel').value.trim() || 'TERM';
+    if (!list.length) return toast('请输入至少一个敏感词', true);
+    if (list.some(w => w.length > 200)) return toast('单个敏感词不能超过 200 字符', true);
     try {
+      const cfg = await api('/config');
+      const next = Object.assign({}, cfg.mask.custom_words);
+      // 整个词表一次 patch：避免 N 次往返，也避开读-改-写竞态
+      const added = [];
+      for (const w of list) {
+        if (!Object.prototype.hasOwnProperty.call(next, w)) added.push(w);
+        next[w] = label;
+      }
       await api('/config/patch', {
-        method: 'POST', body: JSON.stringify({ path: 'mask.custom_words.' + w, value: l }),
+        method: 'POST', body: JSON.stringify({ segs: ['mask', 'custom_words'], value: next })
       });
-      $('newWord').value = ''; $('newLabel').value = '';
-      toast('已添加「' + w + '」');
+      $('newWords').value = '';
+      toast(added.length
+        ? `已添加 ${added.length} 个词到「${label}」${list.length > added.length ? `（${list.length - added.length} 个已存在，已改分类）` : ''}`
+        : `已更新 ${list.length} 个词的分类为「${label}」`);
       loadRules();
-    } catch (e) { toast(e.message, true); }
+    } catch (e) { toast('保存失败：' + e.message, true); }
   });
 
   $('btnAddPrefix').addEventListener('click', async () => {
@@ -293,13 +337,14 @@
     if (!b) return;
     const w = b.dataset.delWord;
     try {
-      const cfg = await api('/config');
-      const next = Object.assign({}, cfg.mask.custom_words);
-      delete next[w];
-      await api('/config/patch', { method: 'POST', body: JSON.stringify({ path: 'mask.custom_words', value: next }) });
+      // 用 segs 而非点分 path：词含 '.' 时点分会被切成多段而写错位置
+      await api('/config/patch', {
+        method: 'POST',
+        body: JSON.stringify({ segs: ['mask', 'custom_words', w], value: null })
+      });
       toast('已删除「' + w + '」');
       loadRules();
-    } catch (e) { toast(e.message, true); }
+    } catch (e) { toast('删除失败：' + e.message, true); }
   });
 
   $('prefixList').addEventListener('click', async ev => {

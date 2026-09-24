@@ -80,11 +80,14 @@
           <span class="hint">命中后统一替换为 <code>{{TERM_xxxxxx}}</code> 占位符</span>
         </div>
         <div class="row">
-          <input id="newWord" placeholder="敏感词，如 张三" />
-          <input id="newLabel" placeholder="分类，如 人名" />
+          <input id="newLabel" list="labelOptions" placeholder="分类，如 PERSON（或留空用 TERM）" class="grow" />
+          <datalist id="labelOptions"></datalist>
           <button class="btn btn-primary" id="btnAddWord">添加</button>
         </div>
-        <div class="chip-list" id="wordList"></div>
+        <textarea id="newWords" class="words-input" rows="3"
+          placeholder="敏感词，每行一个（也可用逗号 / 空格分隔），如：&#10;张三&#10;李四&#10;example.com"></textarea>
+        <div class="hint" id="labelHint"></div>
+        <div class="word-groups" id="wordList"></div>
       </div>
 
       <div class="panel">

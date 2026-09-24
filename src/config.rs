@@ -554,15 +554,34 @@ impl ConfigCenter {
         path: &str,
         value: serde_json::Value,
     ) -> Result<Vec<ConfigWarning>, String> {
-        let mut cfg_json = serde_json::to_value(self.get()).map_err(|e| e.to_string())?;
         let segs: Vec<String> = path
             .split('.')
             .filter(|s| !s.is_empty())
             .map(str::to_string)
             .collect();
+        self.patch_segs(&segs, value)
+    }
+
+    /// 按**路径段数组**打补丁（推荐入口）。
+    ///
+    /// 字符串 \`path\` 以 \`.\` 分隔，无法表达「键本身含 \`.\`」的路径 —— 例如
+    /// 敏感词 \`example.com\` 走 \`mask.custom_words.example.com\` 会被切成 4 段，
+    /// 写成 \`custom_words → example → com\` 的嵌套结构（值从一个字符串变成对象，
+    /// 匹配逻辑随之错乱）。本方法不经过任何分隔符，键原样写入。
+    ///
+    /// \`value\` 为 \`null\` 时表示**删除该键**（而非写入 null）—— 让删除也能
+    /// 一次原子 patch 完成，不必先读整表再回写（避免读-改-写竞态）。
+    pub fn patch_segs(
+        &self,
+        segs: &[String],
+        value: serde_json::Value,
+    ) -> Result<Vec<ConfigWarning>, String> {
         if segs.is_empty() {
             return Err("patch path 不能为空".into());
         }
+        let segs: Vec<&str> = segs.iter().map(String::as_str).collect();
+        let shown = segs.join(".");
+        let mut cfg_json = serde_json::to_value(self.get()).map_err(|e| e.to_string())?;
         // 构造 JSON Pointer（`~` → `~0`，`/` → `~1` 转义）
         let pointer = format!(
             "/{}",
@@ -576,7 +595,11 @@ impl ConfigCenter {
             let obj = cfg_json
                 .as_object_mut()
                 .ok_or_else(|| "配置根不是对象".to_string())?;
-            obj.insert(segs[0].clone(), value);
+            if value.is_null() {
+                obj.remove(segs[0]);
+            } else {
+                obj.insert(segs[0].to_string(), value);
+            }
         } else {
             let parent_ptr = format!(
                 "/{}",
@@ -588,11 +611,15 @@ impl ConfigCenter {
             );
             let parent = cfg_json
                 .pointer_mut(&parent_ptr)
-                .ok_or_else(|| format!("路径 {path} 的父级不存在"))?;
+                .ok_or_else(|| format!("路径 {shown} 的父级不存在"))?;
             let obj = parent
                 .as_object_mut()
-                .ok_or_else(|| format!("路径 {path} 的父级不是对象"))?;
-            obj.insert(segs[segs.len() - 1].clone(), value);
+                .ok_or_else(|| format!("路径 {shown} 的父级不是对象"))?;
+            if value.is_null() {
+                obj.remove(segs[segs.len() - 1]);
+            } else {
+                obj.insert(segs[segs.len() - 1].to_string(), value);
+            }
         }
         let _ = pointer;
         let new_cfg: Config =
@@ -809,6 +836,133 @@ mod tests {
             cfg.normalized().panel_token.is_empty(),
             "全空白令牌应 trim 为空"
         );
+    }
+
+    /// 回归：敏感词含 `.` 时，点分 `path` 会被切成多段并写成**嵌套结构**，
+    /// 导致 custom_words 的值从「字符串」变成「对象」，匹配逻辑错乱。
+    /// `segs` 入口不做任何分隔符切分，键原样写入。
+    #[test]
+    fn patch_segs_preserves_dots_in_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let (center, _) = ConfigCenter::load_or_init(dir.path()).unwrap();
+        for word in ["example.com", "Dr. Smith", "a.b.c.d", "normal"] {
+            center
+                .patch_segs(
+                    &[
+                        "mask".to_string(),
+                        "custom_words".to_string(),
+                        word.to_string(),
+                    ],
+                    serde_json::json!("域名"),
+                )
+                .unwrap();
+            // 扁平键，值仍是字符串
+            assert_eq!(
+                center.get().mask.custom_words.get(word).map(String::as_str),
+                Some("域名"),
+                "词 {word:?} 应作为扁平键写入"
+            );
+            // 绝不能出现嵌套
+            let v = serde_json::to_value(center.get()).unwrap();
+            let entry = &v["mask"]["custom_words"][word];
+            assert!(
+                entry.is_string(),
+                "词 {word:?} 的值必须是字符串，实际 {:?}",
+                entry
+            );
+        }
+        // 切勿把词拆成子键
+        let v = serde_json::to_value(center.get()).unwrap();
+        assert!(
+            v["mask"]["custom_words"]["example"].is_null(),
+            "不应产生子键 example"
+        );
+        assert!(
+            v["mask"]["custom_words"]["com"].is_null(),
+            "不应产生子键 com"
+        );
+    }
+
+    /// JSON Pointer 特殊字符 `/` 与 `~` 同样必须原样保留。
+    #[test]
+    fn patch_segs_preserves_slash_and_tilde() {
+        let dir = tempfile::tempdir().unwrap();
+        let (center, _) = ConfigCenter::load_or_init(dir.path()).unwrap();
+        for word in ["ACME/Inc", "a~b", "~1/x"] {
+            center
+                .patch_segs(
+                    &[
+                        "mask".to_string(),
+                        "custom_words".to_string(),
+                        word.to_string(),
+                    ],
+                    serde_json::json!("ORG"),
+                )
+                .unwrap();
+            assert_eq!(
+                center.get().mask.custom_words.get(word).map(String::as_str),
+                Some("ORG"),
+                "词 {word:?} 应原样写入"
+            );
+        }
+    }
+
+    /// `value: null` 表示删除键（而非写入 null 导致反序列化失败）。
+    #[test]
+    fn patch_segs_null_deletes_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let (center, _) = ConfigCenter::load_or_init(dir.path()).unwrap();
+        for w in ["example.com", "张三"] {
+            center
+                .patch_segs(
+                    &["mask".into(), "custom_words".into(), w.into()],
+                    serde_json::json!("ORG"),
+                )
+                .unwrap();
+        }
+        assert_eq!(center.get().mask.custom_words.len(), 2);
+        // 删掉含 '.' 的那个
+        center
+            .patch_segs(
+                &["mask".into(), "custom_words".into(), "example.com".into()],
+                serde_json::Value::Null,
+            )
+            .unwrap();
+        let m = &center.get().mask.custom_words;
+        assert!(!m.contains_key("example.com"), "含 '.' 的键应被准确删除");
+        assert_eq!(
+            m.get("张三").map(String::as_str),
+            Some("ORG"),
+            "其他键不受影响"
+        );
+        // 删不存在的键不应报错（幂等）
+        center
+            .patch_segs(
+                &["mask".into(), "custom_words".into(), "nope".into()],
+                serde_json::Value::Null,
+            )
+            .unwrap();
+    }
+
+    /// 旧的点分 path 入口仍应工作（向后兼容）。
+    #[test]
+    fn patch_dotted_path_still_works() {
+        let dir = tempfile::tempdir().unwrap();
+        let (center, _) = ConfigCenter::load_or_init(dir.path()).unwrap();
+        center
+            .patch("mask.custom_words.张三", serde_json::json!("人名"))
+            .unwrap();
+        assert_eq!(
+            center
+                .get()
+                .mask
+                .custom_words
+                .get("张三")
+                .map(String::as_str),
+            Some("人名")
+        );
+        // segs 为空时回落
+        assert!(center.patch("", serde_json::json!(1)).is_err());
     }
 
     #[test]

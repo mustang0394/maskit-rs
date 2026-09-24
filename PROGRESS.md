@@ -384,3 +384,36 @@ pending drain 不泄漏、10050 条 LRU 淘汰、落盘往返/幂等 upsert/TTL 
 - lib 测试 12~41s → **4s**（省掉 11×700ms 硬等）
 - 顺带修正 `prune_removes_old_events`：`prune()` 本身也是异步入队，
   原来第二个 sleep 是对的但同样脆弱
+
+
+## M16：自定义敏感词录入改造（批量 + 分组 + 修 `.` bug）
+
+**问题**（用户提出「一个分类不能有多个敏感词吗？」）：
+
+1. UI 一次只能加一个词，加 N 个词要把分类重填 N 遍
+2. 展示是一排平铺 chip，看不出分组
+3. **真 bug**：新增走 `path: 'mask.custom_words.' + 词`，而服务端按 `.` 切分
+   JSON Pointer。词含 `.`（`example.com`、`Dr. Smith`）会被切成多段，写成
+   `custom_words → example → com` 的**嵌套结构** —— 值类型从 string 变
+   object，匹配逻辑错乱
+
+**后端模型无需改动**：`custom_words: BTreeMap<词, 分类>` 原生支持一个分类下
+多个词（与 Python 版一致）。问题全在 UI 与 patch 契约。
+
+**改动**：
+
+- `ConfigCenter::patch_segs(&[String], value)`：按路径段数组打补丁，不做任何
+  分隔符切分，键原样写入。`patch(path,…)` 保留为薄包装（向后兼容）
+- `PatchBody` 新增 `segs` 字段，与 `path` 二选一（`segs` 优先）
+- `value: null` 表示**删除该键**（而非写入 null 导致反序列化失败）——
+  删除也能一次原子 patch 完成，不必读整表再回写（消除读-改-写竞态）
+- UI：分类改 `datalist` 补全（复用已有分类）；敏感词改 textarea，
+  支持换行/逗号/顿号/分号/空白分隔，一次加多个；整表一次 patch
+- UI：chips 按分类分组渲染，组头同时显示实际占位符前缀
+- UI：输入分类时若含非 ASCII 字符，实时提示会被剔除（如 人名 → TERM）
+
+**测试** +8：含 `.` / `/` / `~` 的词保持扁平；`null` 删除精确且幂等；
+一次 patch 批量写入；一个分类多词；空路径拒绝。e2e 验证
+`example.com` / `Dr. Smith` / `ACME/Inc` 脱敏→还原往返正确。
+
+测试 303 全绿，clippy 零告警。

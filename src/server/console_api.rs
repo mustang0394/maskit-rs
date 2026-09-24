@@ -115,7 +115,13 @@ pub async fn put_config(State(state): State<SharedState>, body: String) -> Respo
 
 #[derive(Debug, serde::Deserialize)]
 pub struct PatchBody {
+    /// 传统点分路径（`mask.custom_words.张三`）。**键含 `.` 时不能用**。
+    #[serde(default)]
     pub path: String,
+    /// 路径段数组（推荐）。`["mask","custom_words","example.com"]` 键原样写入，
+    /// 不做任何分隔符切分。
+    #[serde(default)]
+    pub segs: Vec<String>,
     pub value: Value,
 }
 
@@ -124,7 +130,13 @@ pub async fn patch_config(State(state): State<SharedState>, body: String) -> Res
         Ok(p) => p,
         Err(e) => return error_response(StatusCode::BAD_REQUEST, &format!("invalid_patch: {e}")),
     };
-    match state.config.patch(&patch.path, patch.value) {
+    // segs 优先：点分 path 无法表达含 '.' 的键
+    let patched = if !patch.segs.is_empty() {
+        state.config.patch_segs(&patch.segs, patch.value)
+    } else {
+        state.config.patch(&patch.path, patch.value)
+    };
+    match patched {
         Ok(warnings) => {
             state.rebuild_runtime();
             json_response(
