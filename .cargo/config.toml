@@ -1,0 +1,27 @@
+# 交叉编译配置
+#
+# 背景：CI 要产出 aarch64-unknown-linux-gnu 二进制。不配置交叉工具链时，
+# rustc 与 `cc` crate（rusqlite 的 bundled SQLite 要编 C 代码）都会退回
+# **宿主 x86_64 工具链**，表现为：
+#   1) 链接阶段 `rust-lld: --fix-cortex-a53-843419 is only supported on AArch64`
+#      （AArch64 专属 flag 被喂给了 x86_64 链接器）
+#   2) 即便绕过，C 目标文件与 Rust 目标架构不匹配，仍会链接失败
+#
+# 这里显式指定 aarch64 的 linker / ar，以及给 `cc` crate 用的 C 交叉编译器。
+
+[target.aarch64-unknown-linux-gnu]
+linker = "aarch64-linux-gnu-gcc"
+ar = "aarch64-linux-gnu-ar"
+rustflags = ["-C", "link-arg=-fuse-ld=lld"]
+
+# `cc` crate 读取的环境变量：编译 bundled SQLite 时必须用交叉 gcc，
+# 否则编出来的 .o 是 x86_64 的。
+# force = false 表示不覆盖用户/CI 已显式设置的值。
+[env]
+CC_aarch64_unknown_linux_gnu = { value = "aarch64-linux-gnu-gcc", force = false }
+AR_aarch64_unknown_linux_gnu = { value = "aarch64-linux-gnu-ar", force = false }
+CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER = { value = "aarch64-linux-gnu-gcc", force = false }
+
+[build]
+# 磁盘友好：容器/CI 上 target 目录容易撑爆
+incremental = false

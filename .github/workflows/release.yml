@@ -113,11 +113,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Linux 固定用 22.04（glibc 2.35）构建：产物要进 distroless/cc-debian12
+          # （glibc 2.36）。若在 ubuntu-latest(24.04/glibc 2.39) 上构建，镜像里会报
+          # GLIBC_2.xx not found。Windows 无此问题，保持 latest。
           - name: linux-x86_64
-            os: ubuntu-latest
+            os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
           - name: linux-aarch64
-            os: ubuntu-latest
+            os: ubuntu-22.04
             target: aarch64-unknown-linux-gnu
           - name: windows-x86_64
             os: windows-latest
