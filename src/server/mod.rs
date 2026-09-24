@@ -139,6 +139,7 @@ pub fn build_router(state: SharedState) -> Router {
             post(console_api::test_upstream),
         )
         .route("/console/api/demo/mask", post(console_api::demo_mask))
+        .route("/console/api/mask/test", post(console_api::mask_test))
         .route("/console/api/rotate-token", post(console_api::rotate_token))
         .route("/console/api/data-dir", get(console_api::data_dir))
         .route("/console/{*rest}", get(static_ui::static_asset));

@@ -527,7 +527,11 @@ fn first_user_content(body: &serde_json::Value) -> Option<String> {
 }
 
 /// 构建 MASK 事件明细（凭据类只留 digest/preview）。
-fn build_event_items(store: &SessionStore, sid: &str, keep_plaintext: bool) -> Vec<EventItem> {
+pub(crate) fn build_event_items(
+    store: &SessionStore,
+    sid: &str,
+    keep_plaintext: bool,
+) -> Vec<EventItem> {
     let Some(s) = store.get(sid) else {
         return vec![];
     };

@@ -497,3 +497,36 @@ pending drain 不泄漏、10050 条 LRU 淘汰、落盘往返/幂等 upsert/TTL 
 
 **测试** +6（各协议 dialog 抽取、超长截断、非文本键不混入、开关默认值、
 旧配置兼容、写库层不二次剥离）。306 全绿，clippy 零告警。
+
+
+## M19：控制台「测试」页（隔离脱敏沙盒）
+
+**需求**：输入文本 → 跑脱敏引擎 → 展示**经过网关处理后发给上游的内容**。
+硬约束：**测试的占位符不得进内存映射、不得落库**。
+
+**关键：旧 `demo/mask` 端点本来就不满足硬约束。**
+它复用全局 `STORE`，结尾虽调 `drop_session`，但 `recall_token` 写入的
+`recent_fwd`/`recent_rev` 是**跨会话全局缓存**，`drop_session` 只删
+`sessions` 表条目 —— 测一次就把占位符污染进生产映射，影响 prompt cache。
+
+**解法**：`POST /console/api/mask/test` 用**局部 `SessionStore`**。
+函数返回时整体析构，天然零残留，也无需手工清理；且不调 `save_mappings`，
+不产生任何 DB 写入。
+
+**两种模式**：
+- 纯文本：`ctx.mask(text)` → 还原
+- 完整请求体：包成 Chat Completions / Responses / Anthropic 三种形状，走真实
+  管线 `tree::mask_body`，输出**可直接发给上游的合法 JSON body**
+
+**UI**：新增「测试」页签，文本域 + 模式/协议/模型选择 + 4 个示例按钮，
+结果双栏展示「发给上游的内容 / 还原后」+ 命中明细表（原文 → 占位符）+
+耗时，并显式声明隔离承诺。
+
+**实测隔离**（起真实服务 + mock 上游）：
+- 5 次测试 → 日志事件 **0** 条
+- 测试生成 `{{PHONE_gmzbnq}}`，随后真实代理生成 `{{PHONE_cpbxjw}}`（互不影响）
+- SQLite events / placeholder_map / daily_words = 2 / 1 / 1，**全部来自真实代理**
+
+**测试** +6：全局 store 零增长（连跑 20 次防假阴性）、DB 零写入、
+纯文本往返一致、三协议输出均为合法 JSON 且保留 model、空输入 400、页面存在
+且声明隔离。312 全绿，clippy 零告警。

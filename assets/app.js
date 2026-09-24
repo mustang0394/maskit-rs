@@ -575,3 +575,67 @@
   }
   setInterval(() => { if (TOKEN) loadDashboard().catch(() => {}); }, 6000);
 })();
+
+  /* ---------------- 脱敏测试（隔离，不落库/不进内存映射） ---------------- */
+  const TEST_PRESETS = {
+    basic: '我是张三，手机 13800138000，邮箱 zhangsan@example.com，身份证 110101199003078675。',
+    cred: '数据库连接 postgres://admin:Sup3rSecret@10.0.0.5:5432/prod\nAPI Key: sk-abcdefghijklmnopqrstuvwxyz012345',
+    custom: '请确认 ACME 项目的交付时间，以及第二大股东的意见。',
+    mixed: '你好，我是李四。电话 13900139000，公司内网 192.168.1.100，' +
+           '工号 E12345，密钥 sk-abcdefghijklmnopqrstuvwxyz012345，邮箱 li@example.com。',
+  };
+
+  async function runMaskTest() {
+    const text = $('testInput').value;
+    if (!text.trim()) return toast('请输入待测文本', true);
+    const body = {
+      text,
+      mode: $('testMode').value,
+      protocol: $('testProtocol').value,
+      model: $('testModel').value.trim() || 'gpt-4o',
+    };
+    const btn = $('btnRunTest');
+    btn.disabled = true;
+    btn.textContent = '测试中…';
+    try {
+      const r = await api('/mask/test', { method: 'POST', body: JSON.stringify(body) });
+      $('testMasked').textContent = r.masked;
+      $('testRestored').textContent = r.restored;
+      $('testSummary').textContent =
+        `命中 ${r.count} 项 · ${r.elapsed_ms}ms · 临时映射已销毁（未落库）`;
+      const items = r.items || [];
+      $('testItems').innerHTML = items.length
+        ? items.map(it => `<tr>
+            <td class="mono">${it.cred ? '🔒 ' : ''}${esc(it.label)}</td>
+            <td class="mono cmp-orig">${esc(it.original || it.preview || '—')}</td>
+            <td class="mono cmp-tok">${esc(it.tok || it.token || '—')}</td>
+            <td class="mono hint">${it.length != null ? it.length + ' 位' : '—'}</td>
+          </tr>`).join('')
+        : '<tr><td colspan="4" class="empty">未命中任何规则</td></tr>';
+      $('testItemsWrap').hidden = !items.length;
+      $('testResult').hidden = false;
+    } catch (e) {
+      toast('测试失败：' + e.message, true);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = '运行测试';
+    }
+  }
+  $('btnRunTest').addEventListener('click', runMaskTest);
+  $('testInput').addEventListener('keydown', ev => {
+    if ((ev.metaKey || ev.ctrlKey) && ev.key === 'Enter') runMaskTest();
+  });
+  document.querySelectorAll('[data-preset]').forEach(b => b.addEventListener('click', () => {
+    $('testInput').value = TEST_PRESETS[b.dataset.preset] || '';
+    runMaskTest();
+  }));
+  ['btnCopyMasked', 'btnCopyRestored'].forEach(id => {
+    const target = id === 'btnCopyMasked' ? 'testMasked' : 'testRestored';
+    $(id).addEventListener('click', async () => {
+      const t = $(target).textContent;
+      try {
+        await navigator.clipboard.writeText(t);
+        toast('已复制');
+      } catch { toast('剪贴板不可用', true); }
+    });
+  });

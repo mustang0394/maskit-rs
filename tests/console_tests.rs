@@ -35,6 +35,25 @@ impl Harness {
         }
     }
 
+    /// 需要直接检查 SQLite 落盘时用（自带事件库）。
+    /// 调用方需把 TempDir 的所有权交进来，以便跨请求保留。
+    fn with_owned_dir(dir: tempfile::TempDir) -> Self {
+        let (center, _) = ConfigCenter::load_or_init(dir.path()).unwrap();
+        let mut cfg = center.get();
+        cfg.upstream.target = "https://api.example.com".into();
+        center.update(cfg);
+        let token = center.get().panel_token.clone();
+        let upstream = Arc::new(UpstreamClient::new_or_placeholder(&center.get().upstream));
+        let bus = EventBus::new();
+        let store = EventStore::open(dir.path()).unwrap();
+        let state = Arc::new(AppState::new(center, bus, upstream, Some(store)));
+        Harness {
+            state,
+            token,
+            _dir: dir,
+        }
+    }
+
     async fn req(
         &self,
         method: &str,
@@ -706,4 +725,158 @@ async fn log_items_show_original_and_placeholder() {
     }
     // 凭据类要显式说明「不存明文」，而不是留空让人以为坏了
     assert!(js.contains("不存明文"), "凭据类应显式说明无明文");
+}
+
+// ── 脱敏测试端点（隔离：零落库、零内存残留）─────────────────────
+
+/// 测试占位符**绝不能**进入生产映射表。
+///
+/// 回归风险：旧 `demo/mask` 复用全局 `STORE`，结尾虽调 `drop_session`，但
+/// `recall_token` 写入的 `recent_fwd`/`recent_rev` 是跨会话全局缓存，不会被
+/// 清理 —— 测一次就把占位符污染进生产映射。新端点改用局部 store 规避。
+#[tokio::test]
+async fn mask_test_does_not_pollute_global_store() {
+    let h = Harness::new();
+    let store = h.state.sessions;
+    let before_fwd = store.recent_fwd.len();
+    let before_rev = store.recent_rev.len();
+
+    let (s, v) = h
+        .json(
+            "POST",
+            "/console/api/mask/test",
+            Some(
+                r#"{"text":"电话13800138000，邮箱zhangsan@example.com，key sk-abcdefghijklmnop"}"#,
+            ),
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK);
+    let masked = v["masked"].as_str().unwrap();
+    assert!(masked.contains("{{"), "应产出占位符：{masked}");
+    assert!(!masked.contains("13800138000"), "原文不应残留：{masked}");
+    assert_eq!(v["isolated"], true);
+    assert!(v["count"].as_u64().unwrap() >= 3, "应命中 3 类");
+
+    // 核心断言：全局映射表零增长
+    assert_eq!(
+        store.recent_fwd.len(),
+        before_fwd,
+        "测试不得写入全局 recent_fwd"
+    );
+    assert_eq!(
+        store.recent_rev.len(),
+        before_rev,
+        "测试不得写入全局 recent_rev"
+    );
+    assert!(
+        store.get("mask-test").is_none(),
+        "不应在全局 store 留下测试会话"
+    );
+    // 跑 20 次仍不增长（防「第一次恰好没写」的假阴性）
+    for _ in 0..20 {
+        h.json(
+            "POST",
+            "/console/api/mask/test",
+            Some(r#"{"text":"再测一次 13900139000"}"#),
+        )
+        .await;
+    }
+    assert_eq!(store.recent_fwd.len(), before_fwd, "重复测试仍不得污染");
+    assert_eq!(store.recent_rev.len(), before_rev, "重复测试仍不得污染");
+}
+
+/// 测试结果不写 SQLite。
+#[tokio::test]
+async fn mask_test_writes_nothing_to_db() {
+    let h = Harness::with_owned_dir(tempfile::tempdir().unwrap());
+    for _ in 0..5 {
+        h.json(
+            "POST",
+            "/console/api/mask/test",
+            Some(r#"{"text":"电话13800138000"}"#),
+        )
+        .await;
+    }
+    h.state.event_store.as_ref().unwrap().sync();
+    let es = h.state.event_store.as_ref().unwrap();
+    assert_eq!(es.fetch_events(100, 0).len(), 0, "测试不应产生任何事件记录");
+    assert_eq!(es.mappings_count(), 0, "测试不应写入映射表");
+}
+
+/// 纯文本模式：脱敏 + 还原往返一致。
+#[tokio::test]
+async fn mask_test_roundtrip_text_mode() {
+    let h = Harness::new();
+    let (_, v) = h
+        .json(
+            "POST",
+            "/console/api/mask/test",
+            Some(r#"{"text":"请联系张三，手机13800138000"}"#),
+        )
+        .await;
+    let masked = v["masked"].as_str().unwrap();
+    let restored = v["restored"].as_str().unwrap();
+    assert!(masked.contains("{{"), "应脱敏：{masked}");
+    assert_eq!(restored, "请联系张三，手机13800138000", "还原应完全一致");
+    // 命中明细应含原文与占位符
+    let items = v["items"].as_array().unwrap();
+    assert!(!items.is_empty());
+    let first = &items[0];
+    assert!(first["tok"].is_string(), "明细须带占位符（tok）");
+    assert!(first["label"].is_string());
+}
+
+/// 完整请求体模式：输出应是可直接发给上游的 JSON body。
+#[tokio::test]
+async fn mask_test_request_mode_emits_valid_json() {
+    let h = Harness::new();
+    for proto in ["chat_completions", "responses", "anthropic"] {
+        let body = serde_json::json!({
+            "text": "电话13800138000，邮箱zhangsan@example.com",
+            "mode": "request", "protocol": proto
+        })
+        .to_string();
+        let (s, v) = h.json("POST", "/console/api/mask/test", Some(&body)).await;
+        assert_eq!(s, StatusCode::OK, "{proto}");
+        let masked = v["masked"].as_str().unwrap();
+        assert!(
+            !masked.contains("13800138000"),
+            "{proto} 原文残留：{masked}"
+        );
+        // 必须是合法 JSON（这就是「发给上游的内容」）
+        let parsed: serde_json::Value = serde_json::from_str(masked)
+            .unwrap_or_else(|e| panic!("{proto} 输出非合法 JSON: {e}\n{masked}"));
+        assert!(parsed.get("model").is_some(), "{proto} 应保留 model 字段");
+    }
+}
+
+/// 空输入应报 400。
+#[tokio::test]
+async fn mask_test_rejects_empty_text() {
+    let h = Harness::new();
+    let (s, _) = h
+        .json("POST", "/console/api/mask/test", Some(r#"{"text":"  "}"#))
+        .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+}
+
+/// 测试页必须在导航里，且「不落库」这一关键约束要写在界面上。
+#[tokio::test]
+async fn test_page_exists_and_declares_isolation() {
+    let h = Harness::new();
+    let (_, body) = h.req("GET", "/console", false, None).await;
+    let html = String::from_utf8_lossy(&body);
+    assert!(html.contains(r#"data-page="test""#), "导航缺少「测试」页签");
+    assert!(html.contains(r#"id="page-test""#), "缺少测试页面");
+    assert!(html.contains(r#"id="testInput""#) && html.contains(r#"id="testResult""#));
+    assert!(html.contains(r#"id="btnRunTest""#));
+    // 隔离承诺必须显式告知用户
+    assert!(
+        html.contains("不写入数据库") && html.contains("不进入内存映射"),
+        "页面必须声明测试不落库、不进内存映射"
+    );
+    let (_, js) = h.req("GET", "/console/app.js", false, None).await;
+    let js = String::from_utf8_lossy(&js);
+    assert!(js.contains("/mask/test"), "前端必须调用隔离测试端点");
+    assert!(js.contains("TEST_PRESETS"), "缺少示例文本");
 }

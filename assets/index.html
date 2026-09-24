@@ -35,6 +35,7 @@
       <button class="tab" data-page="rules">规则</button>
       <button class="tab" data-page="logs">日志</button>
       <button class="tab" data-page="audit">审计</button>
+      <button class="tab" data-page="test">测试</button>
       <button class="tab" data-page="settings">设置</button>
     </nav>
     <div class="topbar-right">
@@ -168,6 +169,71 @@
     </section>
 
     <!-- 设置 -->
+
+    <!-- 脱敏测试 -->
+    <section class="page" id="page-test">
+      <div class="panel">
+        <div class="panel-head">
+          <h2>脱敏测试</h2>
+          <div class="panel-actions">
+            <select id="testMode">
+              <option value="text">纯文本</option>
+              <option value="request">完整请求体</option>
+            </select>
+            <select id="testProtocol">
+              <option value="chat_completions">Chat Completions</option>
+              <option value="responses">Responses API</option>
+              <option value="anthropic">Anthropic Messages</option>
+            </select>
+            <input id="testModel" placeholder="模型名" class="narrow" value="gpt-4o" />
+            <button class="btn btn-primary btn-sm" id="btnRunTest">运行测试</button>
+          </div>
+        </div>
+        <p class="hint">
+          与生产网关走<strong>同一套</strong>脱敏引擎。本测试使用<strong>独立的临时映射表</strong>，
+          运行结束即销毁 —— <strong>不写入数据库，也不进入内存映射</strong>，不会影响线上占位符的稳定性。
+        </p>
+        <textarea id="testInput" class="words-input" rows="4"
+          placeholder="粘贴一段待测文本（Ctrl/Cmd + Enter 直接运行）"></textarea>
+        <div class="preset-row">
+          <span class="hint">示例：</span>
+          <button class="btn btn-sm" data-preset="basic">基础信息</button>
+          <button class="btn btn-sm" data-preset="cred">凭据类</button>
+          <button class="btn btn-sm" data-preset="custom">自定义词</button>
+          <button class="btn btn-sm" data-preset="mixed">混合</button>
+        </div>
+      </div>
+
+      <div class="panel" id="testResult" hidden>
+        <div class="panel-head">
+          <h2>结果</h2>
+          <span class="hint" id="testSummary"></span>
+        </div>
+        <div class="test-out">
+          <div class="test-block">
+            <div class="test-block-head">
+              <span class="test-block-title">发给上游的内容（已脱敏）</span>
+              <button class="btn btn-sm" id="btnCopyMasked">复制</button>
+            </div>
+            <pre class="detail-pre" id="testMasked"></pre>
+          </div>
+          <div class="test-block">
+            <div class="test-block-head">
+              <span class="test-block-title">还原后（客户端收到）</span>
+              <button class="btn btn-sm" id="btnCopyRestored">复制</button>
+            </div>
+            <pre class="detail-pre" id="testRestored"></pre>
+          </div>
+        </div>
+        <div class="detail-section" id="testItemsWrap" hidden>
+          命中明细（原文 → 占位符）
+          <table class="cmp"><thead><tr>
+            <th>类型</th><th>原文</th><th>占位符（加密后）</th><th>长度</th>
+          </tr></thead><tbody id="testItems"></tbody></table>
+        </div>
+      </div>
+    </section>
+
     <section class="page" id="page-settings">
       <div class="panel">
         <h2>上游（单一上游，单端口）</h2>

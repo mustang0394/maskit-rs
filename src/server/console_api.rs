@@ -483,6 +483,112 @@ pub async fn demo_mask(State(state): State<SharedState>, body: String) -> Respon
     )
 }
 
+/// 脱敏测试（**完全隔离**：不写全局映射、不落 SQLite）。
+///
+/// 与 \`demo/mask\` 的关键区别：这里用**局部** \`SessionStore\`，而 demo 复用全局
+/// \`STORE\` —— 后者即使结尾 \`drop_session\`，\`recall_token\` 写入的
+/// \`recent_fwd\`/\`recent_rev\` 是跨会话全局缓存，不会被 drop，测试会把占位符
+/// 污染进生产映射。局部 store 在函数返回时整体析构，天然零残留。
+pub async fn mask_test(State(state): State<SharedState>, body: String) -> Response {
+    let req: Value = serde_json::from_str(&body).unwrap_or(json!({}));
+    let text = req.get("text").and_then(|v| v.as_str()).unwrap_or("");
+    let mode = req.get("mode").and_then(|v| v.as_str()).unwrap_or("text");
+    let protocol = req
+        .get("protocol")
+        .and_then(|v| v.as_str())
+        .unwrap_or("chat_completions");
+    let model = req
+        .get("model")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("gpt-4o");
+    if text.trim().is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "请输入待测试文本");
+    }
+
+    // ── 隔离：局部 store，全程不接触 state.sessions（全局 STORE）──
+    let store = crate::mask::session::SessionStore::new();
+    let sid = "mask-test";
+    store.new_session(sid);
+    let custom = state.custom_words();
+    let cfg = state.config.get();
+    custom.register_words(&store);
+
+    let t0 = std::time::Instant::now();
+    let (masked, restored) = if mode == "request" {
+        // 完整请求体模式：走真实网关管线 mask_body，展示**发给上游的完整 body**
+        let wrapped = wrap_request(protocol, model, text);
+        let raw = wrapped.as_bytes();
+        let ctx = crate::mask::engine::MaskCtx::new(&cfg, &store, sid.into(), &custom);
+        match crate::mask::tree::mask_body(raw, &ctx) {
+            Ok(body) => {
+                let masked = body.text.clone();
+                let mut st = crate::mask::engine::RestoreStats::default();
+                let back = crate::mask::tree::restore_tree(
+                    &serde_json::from_str::<Value>(&masked).unwrap_or(Value::Null),
+                    sid,
+                    &store,
+                    &mut st,
+                    0,
+                );
+                let pretty = serde_json::to_string_pretty(&back).unwrap_or_else(|_| masked.clone());
+                (masked, pretty)
+            }
+            Err(e) => {
+                return error_response(StatusCode::BAD_REQUEST, &format!("构造请求体失败: {e}"))
+            }
+        }
+    } else {
+        let ctx = crate::mask::engine::MaskCtx::new(&cfg, &store, sid.into(), &custom);
+        let masked = ctx.mask(text);
+        let mut st = crate::mask::engine::RestoreStats::default();
+        let back = crate::mask::engine::restore_final(&masked, sid, false, &store, &mut st);
+        (masked, back)
+    };
+    let elapsed = t0.elapsed().as_secs_f64() * 1000.0;
+
+    let items = crate::server::proxy::build_event_items(&store, sid, true);
+    let count = items.len();
+    json_response(
+        StatusCode::OK,
+        &json!({
+            "ok": true,
+            "mode": mode,
+            "masked": masked,
+            "restored": restored,
+            "count": count,
+            "items": items,
+            "elapsed_ms": (elapsed * 10.0).round() / 10.0,
+            "isolated": true,
+        }),
+    )
+    // 注意：局部 `store` 在此析构，全部映射随之消失；也不调用 save_mappings。
+}
+
+/// 把待测文本包成各协议的请求体，用于跑完整管线。
+fn wrap_request(protocol: &str, model: &str, text: &str) -> String {
+    match protocol {
+        "responses" => json!({
+            "model": model, "stream": false,
+            "input": [{"role": "user", "content": [{"type": "input_text", "text": text}]}]
+        })
+        .to_string(),
+        "anthropic" => json!({
+            "model": model, "max_tokens": 1024,
+            "messages": [{"role": "user", "content": text}]
+        })
+        .to_string(),
+        _ => json!({
+            "model": model,
+            "messages": [
+                {"role": "system", "content": "你是一个helpful助手"},
+                {"role": "user", "content": text}
+            ]
+        })
+        .to_string(),
+    }
+}
+
 /// 令牌轮换。
 pub async fn rotate_token(State(state): State<SharedState>) -> Response {
     let mut cfg = state.config.get();
