@@ -220,8 +220,8 @@ const sandbox = {
   setTimeout: (fn, ms) => setTimeout(fn, ms),
   clearTimeout: t => clearTimeout(t),
   // 定时器不真跑，否则进程不退出
-  setInterval: () => 0,
-  clearInterval: () => {},
+  setInterval: (fn) => { sandbox.__timers.set(++sandbox.__timerSeq, fn); return sandbox.__timerSeq; },
+  clearInterval: (id) => { sandbox.__timers.delete(id); },
   Date, Math, JSON, Number, String, Object, Array, Set, Map, RegExp, Error, Promise, encodeURIComponent, parseInt, isNaN,
 };
 // window：既是全局对象，也要支撑 addEventListener / location / history
@@ -234,6 +234,8 @@ sandbox.history = { replaceState: (_s, _t, url) => {
 } };
 sandbox.window.addEventListener = (type, fn) => { (sandbox.__winListeners[type] = sandbox.__winListeners[type] || []).push(fn); };
 sandbox.__winListeners = {};
+sandbox.__timers = new Map();
+sandbox.__timerSeq = 0;
 
 const tick = (n = 6) => new Promise(async res => {
   for (let i = 0; i < n; i++) await new Promise(r => setTimeout(r, 0));
@@ -355,6 +357,41 @@ const tick = (n = 6) => new Promise(async res => {
   check(byId.get('testRestored').innerHTML.includes('13800138000'), '测试页：还原结果缺失');
   check(byId.get('testItems').innerHTML.includes('PERSON'), '测试页：命中明细未渲染');
   check(byId.get('testSummary').textContent.includes('命中 2 项'), '测试页：摘要未更新');
+
+  // 自动刷新开关：**点一下必须真的勾上**（回归：startLogAuto 早期误调 stopLogAuto，
+  // 后者把 checkbox 取消勾选 → 表现为「怎么点都勾不上」）。
+  await drive('logs');
+  const auto = byId.get('logAuto');
+  auto.checked = true;                       // 浏览器点击时先自己置位
+  auto.fire('change', { target: auto });      // 再派发 change
+  await tick(2);
+  check(auto.checked === true, '自动刷新：勾选后被程序取消勾选了（UI 与状态不一致）');
+  check(sandbox.__timers.size >= 1, '自动刷新：勾选后没有起定时器');
+  const timersOn = sandbox.__timers.size;
+  auto.checked = false;
+  auto.fire('change', { target: auto });
+  await tick(2);
+  check(auto.checked === false, '自动刷新：取消勾选后仍是勾选态');
+  check(sandbox.__timers.size < timersOn, '自动刷新：取消勾选后定时器没有停');
+  // 页脚文案也要跟着变（回归：关掉后页脚仍写「自动刷新中」）
+  check(!byId.get('logMeta').textContent.includes('自动刷新中'),
+        '取消自动刷新后，页脚仍显示「自动刷新中」');
+  auto.checked = true;
+  auto.fire('change', { target: auto });
+  await tick(2);
+  check(byId.get('logMeta').textContent.includes('自动刷新中'),
+        '开启自动刷新后，页脚未显示「自动刷新中」');
+  auto.checked = false;
+  auto.fire('change', { target: auto });
+  await tick(2);
+  // 离开日志页也应自动停表（并且把 UI 同步成未勾选）
+  auto.checked = true;
+  auto.fire('change', { target: auto });
+  await tick(1);
+  await drive('dashboard');
+  await tick(1);
+  check(auto.checked === false, '离开日志页后自动刷新应自动关闭并同步 UI');
+  await drive('logs');
 
   // 设置页
   await drive('settings');

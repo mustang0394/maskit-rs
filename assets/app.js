@@ -875,20 +875,42 @@
   /* ==================== 日志（主从双栏） ==================== */
   const log = { type: '', q: '', offset: 0, limit: 100, total: 0, rows: [], sel: null, auto: false, timer: null };
 
-  function stopLogAuto() {
+  // 定时器的「停表」与「UI 状态」必须分开。
+  //
+  // 回归：`startLogAuto` 早期直接调了 `stopLogAuto()`，而后者会把 checkbox
+  // 置为未勾选 —— 于是点击「自动刷新」的流程是：浏览器先勾上 → change 事件
+  // → startLogAuto → stopLogAuto → **当场又被取消勾选**。表现就是
+  // 「这个 checkbox 怎么点都勾不上」（而定时器其实已经跑起来了，状态与 UI 不一致）。
+  function clearLogTimer() {
     if (log.timer) { clearInterval(log.timer); log.timer = null; }
-    const cb = $('logAuto');
-    if (cb) cb.checked = false;
     log.auto = false;
   }
+  function stopLogAuto() {
+    clearLogTimer();
+    const cb = $('logAuto');
+    if (cb) cb.checked = false;
+    renderLogMeta();
+  }
   function startLogAuto() {
-    stopLogAuto();
+    clearLogTimer(); // 只停旧表，不动 UI
     log.auto = true;
+    const cb = $('logAuto');
+    if (cb) cb.checked = true; // 与内部状态对齐（也兼顾程序内部调用本函数的情况）
+    renderLogMeta();
     log.timer = setInterval(() => {
       if (currentPage !== 'logs') { stopLogAuto(); return; }
       log.offset = 0;
       loadLogs().catch(() => {});
     }, 5000);
+  }
+
+  // 页脚文案要与 log.auto **同步**：自动刷新开关一变就要重绘，
+  // 否则关掉后页脚还写着「自动刷新中」（UI 与状态不一致，与上一个回归同类）。
+  function renderLogMeta() {
+    const pages = Math.max(1, Math.ceil(log.total / log.limit));
+    const page = Math.floor(log.offset / log.limit) + 1;
+    $('logMeta').textContent = `共 ${log.total} 条 · 第 ${page}/${pages} 页`
+      + (log.auto ? ' · 自动刷新中' : '');
   }
 
   function logRowHtml(e) {
@@ -1032,10 +1054,7 @@
       ? log.rows.map(logRowHtml).join('')
       : emptyBox('没有符合条件的事件');
 
-    const pages = Math.max(1, Math.ceil(log.total / log.limit));
-    const page = Math.floor(log.offset / log.limit) + 1;
-    $('logMeta').textContent = `共 ${log.total} 条 · 第 ${page}/${pages} 页`
-      + (log.auto ? ' · 自动刷新中' : '');
+    renderLogMeta();
     $('logPrev').disabled = log.offset <= 0;
     $('logNext').disabled = log.offset + log.limit >= log.total;
 
