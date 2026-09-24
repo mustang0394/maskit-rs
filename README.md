@@ -199,7 +199,8 @@ docker compose up -d
 # 控制台：http://127.0.0.1:18701/console
 ```
 
-`docker-compose.yml` 已配好端口、持久化卷、日志轮转与 CPU/内存上限。
+`docker-compose.yml` 已配好端口、持久化命名卷、日志轮转与 CPU/内存上限，
+默认用命名卷 `maskit-data`，**无需任何宿主机目录权限改动即可启动**。
 默认是本地构建；要用 GHCR 镜像，把 compose 里 `build` 段换成 `image: ghcr.io/<账号>/maskit-rs:<版本>` 即可（文件末尾有注释示例）。
 
 ### 部署注意

@@ -50,6 +50,10 @@ COPY --chmod=0755 --chown=nonroot:nonroot --from=builder /build/target/release/m
 COPY --chmod=0644 --chown=nonroot:nonroot config.example.json /app/config.example.json
 
 # 建议挂载 /data 持久化配置与事件库
+# distroless 无 shell，不能 RUN mkdir；用 COPY 建目录并指定属主，
+# 这样命名卷初始化时会继承 nonroot 属主（绑定挂载仍需宿主机侧处理属主）
+COPY --chmod=0644 --chown=nonroot:nonroot docker/.keep /data/.keep
+
 VOLUME ["/data"]
 ENV MASKIT_RS_DATA_DIR=/data \
     RUST_LOG=info

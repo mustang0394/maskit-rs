@@ -17,13 +17,25 @@ services:
     container_name: maskit-rs
     restart: unless-stopped
 
+    # 关键：镜像内进程默认以 nonroot(65532) 运行，而宿主机 ./data 由 Docker 以
+    # root:root 创建 → 容器写不进去，报「数据目录初始化失败: Permission denied」。
+    # 这里让进程以**宿主当前用户**身份运行，绑定挂载目录天然可写，
+    # 且落盘的文件宿主用户可直接读写。
+    # 宿主机若确实有 root 权限，也可改成 `user: "65532:65532"` 并
+    # 预先 `sudo chown -R 65532:65532 ./data`。
+    user: "${UID:-65532}:${GID:-65532}"
+
     ports:
       # 单端口：Web 控制台(/console) + 管理 API + LLM 反代 共用
       - "127.0.0.1:18701:18701"
 
     volumes:
-      # 配置与事件库持久化（SQLite），容器重建不丢历史
-      - ./data:/data
+      # 配置与事件库持久化（SQLite），容器重建不丢历史。
+      # 用**命名卷**而非 ./data 绑定挂载：镜像内 /data 已属 nonroot(65532)，
+      # 命名卷初始化会继承该属主，因此开箱即用、无需改宿主机目录权限。
+      # （绑定挂载时宿主目录由 root 创建，容器内 nonroot 写不进去，
+      #   需 `sudo chown -R 65532:65532 ./data` 或加 `user: "$(id -u):$(id -g)"`）
+      - maskit-data:/data
 
     environment:
       MASKIT_RS_DATA_DIR: /data
@@ -31,6 +43,8 @@ services:
       # TZ: Asia/Shanghai
 
     # distroless 镜像没有 shell，无法 exec 排障；需要时用 docker logs
+    user: "65532:65532"   # 与镜像内 nonroot 一致（命名卷场景无需改动）
+
     logging:
       driver: json-file
       options:
@@ -58,3 +72,7 @@ services:
 #       environment:
 #         MASKIT_RS_DATA_DIR: /data
 # ---------------------------------------------------------------------------
+
+volumes:
+  maskit-data:
+    name: maskit-data
