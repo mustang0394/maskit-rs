@@ -258,6 +258,8 @@ jobs:
             esac
           done
           rm -rf bin-linux-*
+          # artifact 不保留可执行位，必须显式补上，否则镜像里 exec 报 permission denied
+          chmod +x bin/amd64/maskit-rs bin/arm64/maskit-rs
           ls -lR bin
 
       - name: 登录 GHCR

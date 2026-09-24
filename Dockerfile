@@ -45,8 +45,9 @@ FROM gcr.io/distroless/cc-debian12:nonroot AS runtime
 WORKDIR /app
 
 # 数据目录（config.json / shield-events.sqlite3 落这里）
-COPY --chown=nonroot:nonroot --from=builder /build/target/release/maskit-rs /usr/local/bin/maskit-rs
-COPY --chown=nonroot:nonroot config.example.json /app/config.example.json
+# --chmod 显式保证执行位（cargo 产物本身已是 755，这里是防御性约束）
+COPY --chmod=0755 --chown=nonroot:nonroot --from=builder /build/target/release/maskit-rs /usr/local/bin/maskit-rs
+COPY --chmod=0644 --chown=nonroot:nonroot config.example.json /app/config.example.json
 
 # 建议挂载 /data 持久化配置与事件库
 VOLUME ["/data"]

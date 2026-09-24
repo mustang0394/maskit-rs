@@ -29,8 +29,10 @@ ARG TARGETARCH
 
 # distroless/cc 提供 glibc + CA 证书（HTTPS 上游需要）；
 # SQLite 已静态链接进二进制，无需系统库。
-COPY bin/${TARGETARCH}/maskit-rs /usr/local/bin/maskit-rs
-COPY config.example.json /app/config.example.json
+# --chmod=0755 不可省：从 artifact 下载回来的文件一律是 644
+#（upload/download-artifact 不保留可执行位），否则容器 exec 报 permission denied。
+COPY --chmod=0755 bin/${TARGETARCH}/maskit-rs /usr/local/bin/maskit-rs
+COPY --chmod=0644 config.example.json /app/config.example.json
 
 WORKDIR /app
 VOLUME ["/data"]
