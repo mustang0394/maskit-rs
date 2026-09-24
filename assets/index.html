@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-theme="dark">
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -7,144 +7,199 @@
 <link rel="stylesheet" href="/console/style.css" />
 </head>
 <body>
-<header class="topbar">
-  <div class="brand">Maskit<span>-RS</span></div>
-  <nav class="tabs">
-    <button class="tab active" data-page="dashboard">概览</button>
-    <button class="tab" data-page="rules">规则</button>
-    <button class="tab" data-page="logs">日志</button>
-    <button class="tab" data-page="audit">审计</button>
-    <button class="tab" data-page="settings">设置</button>
-  </nav>
-  <div class="status" id="topStatus">连接中…</div>
-</header>
 
-<main>
-  <!-- 概览 -->
-  <section class="page active" id="page-dashboard">
-    <div class="cards" id="statCards"></div>
-    <div class="panel">
-      <h2>上游与运行状态</h2>
-      <table class="kv" id="statusTable"></table>
-      <div class="row">
-        <button id="btnPause" class="warn">暂停脱敏（纯透传）</button>
-        <button id="btnResume" class="ok">恢复脱敏</button>
-      </div>
-    </div>
-  </section>
+<!-- ========== 登录页（无令牌时显示） ========== -->
+<div class="login-screen" id="loginScreen" hidden>
+  <form class="login-card" id="loginForm" autocomplete="on">
+    <div class="login-brand">Maskit<span>-RS</span></div>
+    <p class="login-sub">本地 LLM 脱敏网关</p>
+    <label class="field">
+      <span class="field-label">访问令牌</span>
+      <input type="password" id="tokenInput" placeholder="粘贴 config.json 里的 panel_token"
+             autocomplete="current-password" spellcheck="false" required />
+    </label>
+    <p class="login-hint">
+      令牌位于数据目录的 <code>config.json</code>；首次启动会随机生成并打印在日志里。
+    </p>
+    <div class="login-error" id="loginError" hidden></div>
+    <button type="submit" class="btn btn-primary btn-block" id="loginBtn">进入控制台</button>
+  </form>
+</div>
 
-  <!-- 规则 -->
-  <section class="page" id="page-rules">
-    <div class="panel">
-      <h2>内置规则（21 类）</h2>
-      <div class="rules" id="ruleToggles"></div>
+<!-- ========== 主界面 ========== -->
+<div class="app" id="app" hidden>
+  <header class="topbar">
+    <div class="brand">Maskit<span>-RS</span></div>
+    <nav class="tabs" id="tabs">
+      <button class="tab active" data-page="dashboard">概览</button>
+      <button class="tab" data-page="rules">规则</button>
+      <button class="tab" data-page="logs">日志</button>
+      <button class="tab" data-page="audit">审计</button>
+      <button class="tab" data-page="settings">设置</button>
+    </nav>
+    <div class="topbar-right">
+      <span class="status" id="topStatus">连接中…</span>
+      <button class="icon-btn" id="themeToggle" title="切换深色 / 浅色主题" aria-label="切换主题">
+        <span id="themeIcon">☀</span>
+      </button>
+      <button class="icon-btn" id="logoutBtn" title="退出登录" aria-label="退出登录">⎋</button>
     </div>
-    <div class="panel">
-      <h2>自定义敏感词</h2>
-      <div class="row">
-        <input id="newWord" placeholder="敏感词" />
-        <input id="newLabel" placeholder="分类（如 人名）" />
-        <button id="btnAddWord">添加</button>
-      </div>
-      <table class="list" id="wordList"></table>
-    </div>
-    <div class="panel">
-      <h2>密钥前缀规则</h2>
-      <div class="row">
-        <input id="newPrefix" placeholder="如 sk-" />
-        <button id="btnAddPrefix">添加</button>
-      </div>
-      <div id="prefixList" class="chips"></div>
-    </div>
-  </section>
+  </header>
 
-  <!-- 日志 -->
-  <section class="page" id="page-logs">
-    <div class="panel">
-      <div class="row">
-        <select id="logFilter">
-          <option value="">全部事件</option>
-          <option value="MASK">MASK</option>
-          <option value="RESTORE">RESTORE</option>
-          <option value="PASS">PASS</option>
-          <option value="BYPASS">BYPASS</option>
-          <option value="BLOCK">BLOCK</option>
-          <option value="ERR">ERR</option>
-        </select>
-        <button id="btnRefreshLogs">刷新</button>
-        <button id="btnClearLogs" class="warn">清空日志</button>
-        <span class="hint">凭据类命中只显示打码预览与摘要，绝不显示原文</span>
+  <main>
+    <!-- 概览 -->
+    <section class="page active" id="page-dashboard">
+      <div class="cards" id="statCards"></div>
+      <div class="panel">
+        <h2>运行状态</h2>
+        <table class="kv" id="statusTable"></table>
+        <div class="row">
+          <button id="btnPause" class="btn btn-warn">暂停脱敏（纯透传）</button>
+          <button id="btnResume" class="btn btn-ok">恢复脱敏</button>
+        </div>
       </div>
-      <table class="list" id="logList"></table>
-    </div>
-  </section>
+    </section>
 
-  <!-- 审计 -->
-  <section class="page" id="page-audit">
-    <div class="panel">
-      <div class="row">
-        <button id="btnRefreshAudit">刷新</button>
-        <button id="btnClearAudit" class="warn">清空</button>
-        <span class="hint">被动信号：错误泄露 / 换芯 / 投毒 / 注入 / 危险命令（只记录，不改写）</span>
+    <!-- 规则 -->
+    <section class="page" id="page-rules">
+      <div class="panel">
+        <div class="panel-head">
+          <h2>内置规则</h2>
+          <div class="panel-actions">
+            <span class="hint" id="ruleSummary"></span>
+            <button class="btn btn-sm" id="btnRulesAll">全部开启</button>
+            <button class="btn btn-sm" id="btnRulesDefault">恢复默认</button>
+          </div>
+        </div>
+        <div class="rules-grid" id="ruleToggles"></div>
       </div>
-      <table class="list" id="auditList"></table>
-    </div>
-  </section>
 
-  <!-- 设置 -->
-  <section class="page" id="page-settings">
-    <div class="panel">
-      <h2>上游（单一上游，单端口）</h2>
-      <div class="row">
-        <label>目标地址</label>
-        <input id="upstreamTarget" placeholder="https://api.your-relay.com" />
+      <div class="panel">
+        <div class="panel-head">
+          <h2>自定义敏感词</h2>
+          <span class="hint">命中后统一替换为 <code>{{TERM_xxxxxx}}</code> 占位符</span>
+        </div>
+        <div class="row">
+          <input id="newWord" placeholder="敏感词，如 张三" />
+          <input id="newLabel" placeholder="分类，如 人名" />
+          <button class="btn btn-primary" id="btnAddWord">添加</button>
+        </div>
+        <div class="chip-list" id="wordList"></div>
       </div>
-      <div class="row">
-        <label>监听端口</label>
-        <input id="serverPort" type="number" />
-        <label>绑定地址</label>
-        <input id="serverBind" />
-      </div>
-      <div class="row">
-        <label>敏感内容上限（MiB）</label>
-        <input id="maxBodyMib" type="number" />
-        <label>会话 TTL（秒）</label>
-        <input id="sessionTtl" type="number" />
-      </div>
-    </div>
-    <div class="panel">
-      <h2>安全与行为</h2>
-      <div class="row"><label><input type="checkbox" id="failClosed" /> fail-closed（已识别协议脱敏异常时阻断）</label></div>
-      <div class="row"><label><input type="checkbox" id="responseScan" /> 响应侧 PII 扫描（模型幻觉泄漏告警）</label></div>
-      <div class="row"><label><input type="checkbox" id="streamResponse" /> SSE / NDJSON 流式还原</label></div>
-      <div class="row">
-        <label>命令拦截模式</label>
-        <select id="cmdMode">
-          <option value="observe">observe（只记录）</option>
-          <option value="rewrite">rewrite（改写为占位说明）</option>
-          <option value="block">block（停止下发）</option>
-        </select>
-      </div>
-      <div class="row">
-        <label>日志保留（天）</label>
-        <input id="retentionDays" type="number" />
-      </div>
-    </div>
-    <div class="panel">
-      <h2>访问令牌</h2>
-      <div class="row">
-        <input id="panelToken" />
-        <button id="btnRotateToken">重新生成</button>
-      </div>
-      <p class="hint">令牌保存在 config.json；控制台通过 Authorization: Bearer 调用 API。</p>
-    </div>
-    <div class="row">
-      <button id="btnSave" class="ok">保存配置</button>
-      <span id="saveMsg" class="hint"></span>
-    </div>
-  </section>
-</main>
 
+      <div class="panel">
+        <div class="panel-head">
+          <h2>密钥前缀规则</h2>
+          <span class="hint">前缀 + 至少 8 位字符，如 <code>sk-</code></span>
+        </div>
+        <div class="row">
+          <input id="newPrefix" placeholder="如 sk-" />
+          <button class="btn btn-primary" id="btnAddPrefix">添加</button>
+        </div>
+        <div class="chip-list" id="prefixList"></div>
+      </div>
+    </section>
+
+    <!-- 日志 -->
+    <section class="page" id="page-logs">
+      <div class="panel">
+        <div class="panel-head">
+          <h2>事件日志</h2>
+          <div class="panel-actions">
+            <select id="logFilter">
+              <option value="">全部事件</option>
+              <option value="MASK">MASK</option>
+              <option value="RESTORE">RESTORE</option>
+              <option value="PASS">PASS</option>
+              <option value="BYPASS">BYPASS</option>
+              <option value="BLOCK">BLOCK</option>
+              <option value="ERR">ERR</option>
+            </select>
+            <button class="btn btn-sm" id="btnRefreshLogs">刷新</button>
+            <button class="btn btn-sm btn-warn" id="btnClearLogs">清空</button>
+          </div>
+        </div>
+        <p class="hint">凭据类命中只显示打码预览与 sha256 摘要，绝不显示原文。</p>
+        <div class="table-wrap">
+          <table class="list" id="logList"></table>
+        </div>
+      </div>
+    </section>
+
+    <!-- 审计 -->
+    <section class="page" id="page-audit">
+      <div class="panel">
+        <div class="panel-head">
+          <h2>审计事件</h2>
+          <div class="panel-actions">
+            <button class="btn btn-sm" id="btnRefreshAudit">刷新</button>
+            <button class="btn btn-sm btn-warn" id="btnClearAudit">清空</button>
+          </div>
+        </div>
+        <p class="hint">被动检测：错误泄露 / 换芯 / 工具重写 / 流异常 / 响应投毒 / 跨请求污染 / 凭据回流 / 危险命令。</p>
+        <div class="table-wrap">
+          <table class="list" id="auditList"></table>
+        </div>
+      </div>
+    </section>
+
+    <!-- 设置 -->
+    <section class="page" id="page-settings">
+      <div class="panel">
+        <h2>上游（单一上游，单端口）</h2>
+        <div class="row">
+          <label class="field-label" for="upstreamTarget">目标地址</label>
+          <input id="upstreamTarget" class="grow" placeholder="https://api.your-relay.com" />
+        </div>
+        <div class="row">
+          <label class="field-label" for="serverPort">监听端口</label>
+          <input id="serverPort" type="number" class="narrow" />
+          <label class="field-label" for="serverBind">绑定地址</label>
+          <input id="serverBind" class="narrow" />
+        </div>
+        <p class="hint">改端口 / 绑定地址需重启进程生效；改上游地址立即生效。</p>
+      </div>
+
+      <div class="panel">
+        <h2>行为</h2>
+        <label class="switch"><input type="checkbox" id="failClosed" />
+          <span>fail-closed：已识别协议脱敏异常时阻断（不放行未脱敏原文）</span></label>
+        <label class="switch"><input type="checkbox" id="responseScan" />
+          <span>响应侧 PII 扫描（模型幻觉泄漏告警）</span></label>
+        <label class="switch"><input type="checkbox" id="streamResponse" />
+          <span>SSE / NDJSON 流式还原</span></label>
+        <div class="row">
+          <label class="field-label" for="cmdMode">命令拦截模式</label>
+          <select id="cmdMode">
+            <option value="observe">observe — 只记录（默认）</option>
+            <option value="rewrite">rewrite — 改写为占位说明</option>
+            <option value="block">block — 停止下发</option>
+          </select>
+        </div>
+        <div class="row">
+          <label class="field-label" for="retentionDays">日志保留（天）</label>
+          <input id="retentionDays" type="number" class="narrow" />
+        </div>
+      </div>
+
+      <div class="panel">
+        <h2>访问令牌</h2>
+        <div class="row">
+          <input id="panelToken" class="grow mono" />
+          <button class="btn" id="btnRotateToken">重新生成</button>
+        </div>
+        <p class="hint">修改后需重新登录；至少 16 位。</p>
+      </div>
+
+      <div class="row sticky-save">
+        <button class="btn btn-primary" id="btnSave">保存配置</button>
+        <span class="hint" id="saveMsg"></span>
+      </div>
+    </section>
+  </main>
+</div>
+
+<div class="toast" id="toast" hidden></div>
 <script src="/console/app.js"></script>
 </body>
 </html>
