@@ -287,6 +287,14 @@ impl<'a> MaskCtx<'a> {
                     if ph_rx.is_match(m.as_str()) {
                         continue;
                     }
+                    // `sk-ssh-ed25519@openssh.com` / `sk-ecdsa-sha2-nistp256@openssh.com`
+                    // 是 FIDO 安全密钥的**公钥类型串**，不是 `sk-` 开头的秘密。
+                    // 这里的 `sk-` 前缀规则会先把类型串吃掉，只留下
+                    // `@openssh.com AAAA…` 无人认领（实测确认）。放行给 SSH_PUBKEY
+                    // 规则整段处理（连 blob 一起），才是想要的形态。
+                    if out[m.end()..].starts_with("@openssh.com") {
+                        continue;
+                    }
                     let orig = m.as_str();
                     if !token_of.contains_key(orig) {
                         let token = {

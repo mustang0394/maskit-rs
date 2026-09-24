@@ -21,6 +21,7 @@
       "IBAN": false,
       "IDCARD": true,
       "IPV6_PRIVATE": false,
+      "IPV6_PUBLIC": false,
       "IP_INTERNAL": false,
       "IP_PRIVATE": false,
       "IP_PUBLIC": false,
@@ -31,6 +32,7 @@
       "PLATE": false,
       "PRIVATE_KEY": false,
       "SECRET": false,
+      "SSH_PUBKEY": true,
       "TOKEN": false,
       "USCC": false
     },

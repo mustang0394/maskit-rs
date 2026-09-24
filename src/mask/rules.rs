@@ -323,6 +323,22 @@ fn ipv6_r(text: &str, m: Match<'_>, _c: &Captures<'_>) -> bool {
     check_not_followed_by(text, m, |c| c.is_ascii_hexdigit() || c == ':')
 }
 
+/// SSH 公钥左边界：不得紧跟在 [A-Za-z0-9+/=_-] 后面
+/// （防从某个长 token 中截出一段当成密钥）。
+fn ssh_l(text: &str, m: Match<'_>, _c: &Captures<'_>) -> bool {
+    check_not_preceded_by(text, m, |c| {
+        c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '=' | '_' | '-' | '@' | '.')
+    })
+}
+
+/// SSH 公钥右边界：blob 右边不得再跟 base64 字符或 `=`
+/// （否则说明我们只截了更长 base64 的一段）。注释（`user@host`）以空格分隔，不受影响。
+fn ssh_r(text: &str, m: Match<'_>, _c: &Captures<'_>) -> bool {
+    check_not_followed_by(text, m, |c| {
+        c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '=')
+    })
+}
+
 /// 车牌左边界：[A-Za-z0-9]
 fn plate_l(text: &str, m: Match<'_>, _c: &Captures<'_>) -> bool {
     check_not_preceded_by(text, m, |c| c.is_ascii_alphanumeric())
@@ -433,6 +449,34 @@ pub static RULES: Lazy<Vec<Rule>> = Lazy::new(|| {
             exempt = false,
             avoid = false,
             markers = ["PRIVATE KEY"],
+            ci = false
+        ),
+        // SSH 公钥（`authorized_keys` / `known_hosts` / Git hosting 里贴的那种）。
+        //
+        // 为什么能写得这么紧：OpenSSH 公钥的二进制 blob 是 SSH wire format ——
+        // 开头是 4 字节大端「密钥类型字符串长度」+ 类型字符串本身，于是**所有**
+        // 类型的 base64 都必然以 `AAAA` 开头（类型串长度都是个位数）。
+        // 实测：ssh-ed25519 → `AAAAC3NzaC1lZDI1NTE5…`、ssh-rsa → `AAAAB3NzaC1yc2E…`、
+        // ecdsa-sha2-nistp256 → `AAAAE2VjZHNhLXNoYTIt…`。
+        // 再加上 `ssh_pubkey_ok` 会把 blob 解出来、核对内部类型串与外部类型一致，
+        // 基本不存在误报。
+        //
+        // 私钥不在这里：PEM / OpenSSH 私钥已由上面的 PRIVATE_KEY 整块吃掉。
+        // （注：`sk-ssh-ed25519@openssh.com` 这类 FIDO 类型在默认配置下会先被
+        //  `sk-` 秘密前缀规则命中一部分，见 rules 测试里的记录。）
+        rule!(
+            "SSH_PUBKEY",
+            r"(?:ssh-(?:rsa|dss|ed25519|ed448)|ecdsa-sha2-nistp(?:256|384|521)|sk-(?:ssh-ed25519|ecdsa-sha2-nistp256)@openssh\.com)\s+AAAA[A-Za-z0-9+/]{50,}={0,3}",
+            0,
+            [ssh_l, ssh_r],
+            exempt = false,
+            avoid = false,
+            markers = [
+                "ssh-",
+                "ecdsa-sha2-nistp",
+                "sk-ssh-ed25519",
+                "sk-ecdsa-sha2"
+            ],
             ci = false
         ),
         // GitHub tokens
@@ -730,6 +774,23 @@ pub static RULES: Lazy<Vec<Rule>> = Lazy::new(|| {
             markers = ["fe8", "fe9", "fea", "feb", "fc", "fd"],
             ci = true
         ),
+        // 公网 IPv6（全局单播 2000::/3；宽候选 + 语义校验）
+        //
+        // 正则已经锁在「首组为 2xxx/3xxx」上：全局单播首组取值 0x2000..=0x3fff，
+        // 而 0x2000 本身没有前导零可省，因此**真实书写形式必然是 4 位十六进制**。
+        // 这比 IPV6_PRIVATE 的 `[0-9A-Fa-f:]{2,45}` 宽候选要精确得多（后者之所以
+        // 必须够宽，是因为它靠 fe8/fc 等 marker 门控，且 :: 压缩位置不定），
+        // 所以这里不必再靠 marker 省性能，直接进恒候选组。
+        rule!(
+            "IPV6_PUBLIC",
+            r"(?:2[0-9A-Fa-f]{3}|3[0-9A-Fa-f]{3})(?::[0-9A-Fa-f]{0,4}){2,7}",
+            0,
+            [ipv6_l, ipv6_r],
+            exempt = false,
+            avoid = false,
+            markers = [],
+            ci = false
+        ),
         // 公网 IPv4（强防误伤边界 + 语义校验）
         rule!(
             "IP_PUBLIC",
@@ -947,6 +1008,12 @@ pub fn semantic_check(
         "JWT" => validators::jwt_ok(orig),
         "IP_PUBLIC" => validators::ip_public_ok(orig),
         "IPV6_PRIVATE" => validators::ipv6_private_ok(orig),
+        "IPV6_PUBLIC" => validators::ipv6_public_ok(orig),
+        "SSH_PUBKEY" => {
+            // 外部 keytype 与 blob 内部类型串必须一致（见 `ssh_pubkey_ok`）
+            let keytype = orig.split_whitespace().next().unwrap_or("");
+            validators::ssh_pubkey_ok(keytype, orig)
+        }
         "USCC" => validators::uscc_ok(orig),
         "MAC" => true, // 形态已锁分隔符一致（正则展开），无需额外校验
         "CONNSTR" => {
@@ -991,12 +1058,225 @@ mod tests {
         out
     }
 
+    // ── 新增规则：公网 IPv6 / SSH 公钥 ────────────────────────────────────
+    //
+    // 样本是 `ssh-keygen` 真实产物（ed25519 / rsa-3072 / ecdsa-nistp256），
+    // 不是手写的假串 —— 正则的 `AAAA` 前缀假设、以及「ed25519 不补 `=` 填充而
+    // rsa/ecdsa 补」这类差异，全靠它们验证。
+
+    const ED25519_PUB: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPSI4uzX8YR1xYGPTFsx0F/2WN+PorS2jI+09QnnTWFL test-ed25519@example.com";
+    const RSA_PUB: &str = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQC5lIXzkIhCDgax4duXs3+gExVGvKlHuvlF+vHFnQa1jrOQzjbnxZYmxEOQ6bLTnWwoDavaZQvzN7YX5hpLF1XxE4OS7XXkVdLgsM2IN5tPVw6bXDhOCwzKs0LrnEuQJrheIe7Z6gsDPqRcoG8WZMQ/G0Dvq1imMDZ6Ao93eeWG/PZ70Qxx+lM0c1mnxWaJsV2+yOgPPk/bIYLF6Em5T3jlDB+RDFgrhAOoEk8EDY+e6liPWvcthFX/0i3IH7JPHRXkXwNt6t7BnLzJBZfdCJKe5e3pM0CuSkxAFQDUkMaIQyLJd2ce42k6QYbfY0whp901uyXnhM6Y83CvlBCyPjS/Jm+m93QYgLbSDJbVYTLjDKDznzMoBE7kEXe8C5NBEm+75QUlsUc8PbZmvwaNfjHn+yHrwS8PpEXFwgVdOoV5gK+wq+p2hjxOhkXMcDovEkNa2kxx31m8/NH6zS7udSwgQWb9evXjSKZV4eEVsn53hldpf9R4WGnEqp0hAykKHxU= test-rsa@example.com";
+    const ECDSA_PUB: &str = "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBLHaLDPTq8I9kvOKp5cgGA+gZ3eiK6ZrxYgygJDf5GQD5TmfDHUy+CWBb3M0/bmSNhuF8ToJT/2conaBgXnVLIw= test-ecdsa@example.com";
+
+    /// 取「类型 + blob」两段（公钥的密钥部分；注释属于第三段）。
+    fn ssh_key_material(line: &str) -> String {
+        let mut it = line.split_whitespace();
+        format!("{} {}", it.next().unwrap(), it.next().unwrap())
+    }
+
+    #[test]
+    fn ssh_pubkey_masks_real_keys() {
+        for (name, line) in [
+            ("ed25519", ED25519_PUB),
+            ("rsa", RSA_PUB),
+            ("ecdsa", ECDSA_PUB),
+        ] {
+            let hits = mask_hits("SSH_PUBKEY", line);
+            assert_eq!(hits.len(), 1, "{name}: 应命中一次，实际 {hits:?}");
+            // 命中范围必须是「类型 + blob」
+            assert_eq!(hits[0], ssh_key_material(line), "{name}: 命中范围不对");
+            // 注释（含邮箱）不进本次命中，留给 EMAIL 规则
+            assert!(!hits[0].contains('@'), "{name}: 不应把注释一起吃进来");
+        }
+    }
+
+    /// 公钥出现在常见上下文里（YAML 列表、带引号、known_hosts 前缀、行尾注释）
+    /// 都要能命中，且命中范围仍是「类型 + blob」。
+    #[test]
+    fn ssh_pubkey_matches_in_context() {
+        let cases = [
+            format!("authorized_keys:\n  - {ED25519_PUB}"),
+            format!("key = \"{ED25519_PUB}\"\n"),
+            format!("git@github.com: {RSA_PUB}\n"),
+            format!("github.com {ECDSA_PUB}"), // known_hosts 形态
+            format!("{ED25519_PUB}   trailing note"),
+        ];
+        for line in cases {
+            let hits = mask_hits("SSH_PUBKEY", &line);
+            assert_eq!(hits.len(), 1, "上下文形态应命中：{line}");
+            assert!(
+                hits[0].starts_with("ssh-") || hits[0].starts_with("ecdsa-"),
+                "命中范围应以类型开头：{line}"
+            );
+            assert!(hits[0].contains(" AAAA"), "命中范围应含 blob：{line}");
+        }
+    }
+
+    /// 像公钥但**不是**公钥的东西不能命中。
+    #[test]
+    fn ssh_pubkey_ignores_lookalikes() {
+        for bad in [
+            "ssh-rsa",                 // 只有类型
+            "ssh-rsa AAAAB3NzaC1yc2E", // blob 太短
+            "ssh-ed25519 AAAA",        // 极短
+            "ssh-ed25519 notbase64notbase64notbase64notbase64notbase64notbase64!",
+            // blob 长度够、也以 AAAA 开头，但内部类型串与外部不符 → 校验器必须拦下
+            "ssh-rsa AAAAC3NzaC1lZDI1NTE5AAAAIPSI4uzX8YR1xYGPTFsx0F/2NqLz1k8vJ0m3dP4qR5sT6uV",
+            "正文里只是提到了 ssh-rsa 与 ssh-ed25519 这两个词，并没有密钥",
+        ] {
+            assert!(mask_hits("SSH_PUBKEY", bad).is_empty(), "误报：{bad}");
+        }
+    }
+
+    /// 公钥脱敏后能完整还原，且占位符形态合法。
+    #[test]
+    fn ssh_pubkey_roundtrip() {
+        use crate::mask::engine::{restore_final, CustomWords, MaskCtx, RestoreStats};
+        use crate::mask::session::SessionStore;
+        let mut cfg = crate::config::Config::default();
+        for k in crate::config::ALL_BUILTIN_RULES {
+            cfg.mask.builtin_rules.insert(k.to_string(), true);
+        }
+        let store = SessionStore::new();
+        store.new_session("t");
+        let custom = CustomWords::build(&cfg);
+        let ctx = MaskCtx::new(&cfg, &store, "t".into(), &custom);
+        let raw = format!("我的公钥是 {RSA_PUB}");
+        let masked = ctx.mask(&raw);
+        assert!(
+            !masked.contains("AAAAB3NzaC1yc2E"),
+            "公钥 blob 不得残留：{masked}"
+        );
+        assert!(
+            masked.contains("{{SSHPUBKEY_"),
+            "应生成 SSH 公钥占位符：{masked}"
+        );
+        let mut stats = RestoreStats::default();
+        let back = restore_final(&masked, "t", false, &store, &mut stats);
+        assert_eq!(back, raw, "必须能还原");
+        // 注释里的邮箱由 EMAIL 规则单独处理（开公钥规则不应影响它）
+        assert!(
+            !masked.contains("test-rsa@example.com"),
+            "注释里的邮箱也应被脉敏：{masked}"
+        );
+    }
+
+    /// FIDO 安全密钥型公钥（`sk-*@openssh.com`）：必须**整段**被脱敏。
+    ///
+    /// 回归：`sk-` 秘密前缀规则（引擎 step 1，比内置规则先跑）会把类型串
+    /// `sk-ssh-ed25519` 换成占位符，于是只剩 `@openssh.com AAAA…` 没人认领，
+    /// blob 直接上行。现在前缀规则遇到「匹配后面紧跟 `@openssh.com`」时放行。
+    ///
+    /// 这里没有真实 FIDO 密钥（需要硬件），按 SSH wire format 合成 blob：
+    /// u32 长度 + 类型串 + 密钥体。校验器正好会核对这段结构，合成样本同样有效。
+    #[test]
+    fn ssh_pubkey_fido_sk_types() {
+        use base64::Engine as _;
+        let mk = |keytype: &str| {
+            let mut b = (keytype.len() as u32).to_be_bytes().to_vec();
+            b.extend_from_slice(keytype.as_bytes());
+            b.extend_from_slice(&[0x11u8; 32]);
+            base64::engine::general_purpose::STANDARD.encode(&b)
+        };
+        for keytype in [
+            "sk-ssh-ed25519@openssh.com",
+            "sk-ecdsa-sha2-nistp256@openssh.com",
+        ] {
+            let blob = mk(keytype);
+            let line = format!("FIDO 密钥：{keytype} {blob} me@example.com");
+            let hits = mask_hits("SSH_PUBKEY", &line);
+            assert_eq!(hits.len(), 1, "{keytype} 应命中，实际 {hits:?}");
+            assert_eq!(
+                hits[0],
+                format!("{keytype} {blob}"),
+                "{keytype} 命中范围不对"
+            );
+        }
+        // 类型串与 blob 内部不一致 → 校验器拦下
+        let mismatched = format!("sk-ssh-ed25519@openssh.com {}", mk("ssh-ed25519"));
+        assert!(
+            mask_hits("SSH_PUBKEY", &mismatched).is_empty(),
+            "内部类型不符的伪公钥不得命中"
+        );
+        // 真正的 `sk-` 密钥不能因为上面那个例外被放过
+        assert!(
+            mask_hits("SSH_PUBKEY", "sk-abcdefghijklmnopqrstuvwxyz012345").is_empty(),
+            "`sk-` 开头的普通密钥不是 SSH 公钥"
+        );
+    }
+
+    /// 公网 IPv6：全局单播 2000::/3 命中。
+    #[test]
+    fn ipv6_public_masks_global_unicast() {
+        for ok in [
+            "240e:1a2b::9",
+            "2606:4700:4700::1111",
+            "2a00:1450:4001:81a::200e",
+            "3fff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+            "2001:4860:4860::8888",
+            "2001:0db8:0000:0000:0000:0000:0000:0001", // 不压缩写法（文档段，校验器拦）
+        ] {
+            let hits = mask_hits("IPV6_PUBLIC", ok);
+            // 文档段例外：最后一条应被校验器拒绝
+            if ok.starts_with("2001:0db8") {
+                assert!(hits.is_empty(), "文档段不应命中：{ok}");
+                continue;
+            }
+            assert_eq!(hits.len(), 1, "{ok} 应命中，实际 {hits:?}");
+            assert_eq!(hits[0], ok);
+        }
+        // URL 里的方括号形态
+        assert_eq!(
+            mask_hits("IPV6_PUBLIC", "https://[2606:4700::1111]:443/x").len(),
+            1
+        );
+    }
+
+    /// 私网 / 文档段 / 非地址形态都不能被公网规则命中。
+    #[test]
+    fn ipv6_public_ignores_private_doc_and_lookalikes() {
+        for bad in [
+            "fe80::1",           // 链路本地
+            "fd00:1234::1",      // ULA
+            "fc00::1",           // ULA
+            "2001:db8::1",       // RFC 3849 文档段
+            "::1",               // 环回
+            "ff02::1",           // 组播
+            "aa:bb:cc:dd:ee:ff", // MAC 不能被当 IPv6
+            "20:01:23:45:67:89", // 时间码 / MAC 形态
+            "12:34:56",
+            "这段正文里没有地址",
+        ] {
+            assert!(mask_hits("IPV6_PUBLIC", bad).is_empty(), "误报：{bad}");
+        }
+    }
+
+    /// 新增两条规则的默认开关必须与 config 默认值一致（控制台「恢复默认」依赖它）。
+    #[test]
+    fn new_rules_default_flags() {
+        let d = crate::config::default_builtin_rules();
+        assert_eq!(d.get("SSH_PUBKEY"), Some(&true), "SSH 公钥默认应开启");
+        assert_eq!(d.get("IPV6_PUBLIC"), Some(&false), "公网 IPv6 默认应关闭");
+        assert_eq!(
+            crate::config::ALL_BUILTIN_RULES.len(),
+            d.len(),
+            "两处清单长度须一致"
+        );
+    }
+
     #[test]
     fn rules_compile() {
-        assert_eq!(RULES.len(), 32); // 对齐 Python 32 条 pattern
+        // 32 条对齐 Python 版 + 本版新增的 2 条（IPV6_PUBLIC / SSH_PUBKEY）
+        assert_eq!(RULES.len(), 34);
         for r in RULES.iter() {
             assert!(!r.rx.as_str().is_empty());
         }
+        // 标签集合与 config 的 ALL_BUILTIN_RULES 必须一致（否则控制台会出现
+        // 「有开关但没规则」或「有规则但改不了」的孤儿）
+        let labels: std::collections::BTreeSet<&str> = RULES.iter().map(|r| r.label).collect();
+        let allowed: std::collections::BTreeSet<&str> =
+            crate::config::ALL_BUILTIN_RULES.iter().copied().collect();
+        assert_eq!(labels, allowed, "规则 label 与 ALL_BUILTIN_RULES 不一致");
     }
 
     #[test]

@@ -444,6 +444,63 @@ pub fn ipv6_private_ok(orig: &str) -> bool {
     (0xfc00..=0xfdff).contains(&first)
 }
 
+/// IPv6 公网（全局单播 2000::/3）。
+///
+/// 与 `ip_public_ok` 同口径：排除**文档/保留段**，避免把技术文档里的示例地址
+/// 当成真实地址（IPv4 那边对应地排除了 192.0.2.0/24）。这里只排除
+/// `2001:db8::/32`（RFC 3849 专用文档段）；`2001::/32` Teredo、`2002::/16` 6to4
+/// 虽然多是过渡机制，但确实是真实可路由地址，不排除。
+pub fn ipv6_public_ok(orig: &str) -> bool {
+    if orig.matches(':').count() < 2 {
+        return false;
+    }
+    let candidate = orig.split('%').next().unwrap_or(orig);
+    let Some(groups) = parse_ipv6(candidate) else {
+        return false;
+    };
+    let first = groups[0];
+    // 2000::/3 → 0x2000..=0x3fff
+    if !(0x2000..=0x3fff).contains(&first) {
+        return false;
+    }
+    // 2001:db8::/32 文档段
+    if first == 0x2001 && groups[1] == 0x0db8 {
+        return false;
+    }
+    true
+}
+
+/// SSH 公钥校验：把 blob 解出来，核对 SSH wire format 的内部类型串。
+///
+/// blob 的结构是「u32 大端长度 + 类型字符串 + 密钥内容」，所以可以**精确**校验：
+/// 长度字段必须等于外部写的 keytype 长度，且后面的字节就是那个 keytype。
+/// 这样即使正文里恰好出现 `ssh-rsa AAAA…` 形状的字符串，只要 blob 不是真密钥就判否。
+///
+/// 兼容带与不带 `=` 填充的两种 base64（ssh-keygen 对 ed25519 不补 `=`）。
+pub fn ssh_pubkey_ok(keytype: &str, orig: &str) -> bool {
+    use base64::Engine as _;
+    if keytype.is_empty() {
+        return false;
+    }
+    let Some(blob) = orig.split_whitespace().nth(1) else {
+        return false;
+    };
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(blob)
+        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(blob));
+    let Ok(bytes) = bytes else {
+        return false;
+    };
+    if bytes.len() < 4 {
+        return false;
+    }
+    let declared = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+    if declared != keytype.len() || bytes.len() < 4 + declared {
+        return false;
+    }
+    &bytes[4..4 + declared] == keytype.as_bytes()
+}
+
 /// 解析 IPv6 到 8 组 u16。支持 :: 压缩与 %zone 剥离；失败返回 None。
 fn parse_ipv6(s: &str) -> Option<[u16; 8]> {
     let mut out = [0u16; 8];
@@ -817,6 +874,58 @@ mod tests {
         assert!(!ipv6_private_ok("2001:db8::1")); // 文档段
         assert!(!ipv6_private_ok("240e:1a2b::9")); // 公网
         assert!(!ipv6_private_ok("aa:bb:cc:dd:ee:ff")); // MAC 不该当 IPv6
+    }
+
+    #[test]
+    fn ipv6_public() {
+        // 全局单播 2000::/3
+        assert!(ipv6_public_ok("240e:1a2b::9"));
+        assert!(ipv6_public_ok("2606:4700:4700::1111"));
+        assert!(ipv6_public_ok("2a00:1450:4001:81a::200e"));
+        assert!(ipv6_public_ok("2001:4860:4860::8888"));
+        assert!(ipv6_public_ok("3fff::1"));
+        assert!(ipv6_public_ok("2606:4700::1111%eth0")); // zone id
+        assert!(ipv6_public_ok("2606:4700::1111".to_uppercase().as_str())); // 大写
+                                                                            // 2001:db8::/32 是 RFC 3849 文档段，与 ip_public_ok 排除 192.0.2.0/24 同口径
+        assert!(!ipv6_public_ok("2001:db8::1"));
+        assert!(!ipv6_public_ok("2001:0db8:0000::1"));
+        // 私网 / 环回 / 组播 / 非地址
+        assert!(!ipv6_public_ok("fe80::1"));
+        assert!(!ipv6_public_ok("fd00:1234::1"));
+        assert!(!ipv6_public_ok("fc00::1"));
+        assert!(!ipv6_public_ok("::1"));
+        assert!(!ipv6_public_ok("ff02::1"));
+        assert!(!ipv6_public_ok("aa:bb:cc:dd:ee:ff")); // MAC
+        assert!(!ipv6_public_ok("1fff::1")); // 刚好低于 2000::/3
+        assert!(!ipv6_public_ok("4000::1")); // 刚好高于 3fff
+        assert!(!ipv6_public_ok("12:34:56")); // 冒号不够
+        assert!(!ipv6_public_ok("没有地址"));
+    }
+
+    #[test]
+    fn ssh_pubkey_structure() {
+        use base64::Engine as _;
+        // 用真实结构造一个最小样本（会随形式变化而变化，故与 rules 里的真实密钥互补）
+        let mk = |keytype: &str, body: &[u8]| {
+            let mut b = (keytype.len() as u32).to_be_bytes().to_vec();
+            b.extend_from_slice(keytype.as_bytes());
+            b.extend_from_slice(body);
+            format!(
+                "{keytype} {}",
+                base64::engine::general_purpose::STANDARD.encode(&b)
+            )
+        };
+        let ed = mk("ssh-ed25519", &[0u8; 32]);
+        assert!(ssh_pubkey_ok("ssh-ed25519", &ed));
+        // 类型对不上 → 拒绝（这正是「像公钥但内部类型不符」的兵例）
+        assert!(!ssh_pubkey_ok("ssh-rsa", &ed));
+        assert!(!ssh_pubkey_ok("ssh-ed25519", "ssh-ed25519 AAAA"));
+        assert!(!ssh_pubkey_ok("ssh-ed25519", "ssh-ed25519 不是base64!!!!"));
+        assert!(!ssh_pubkey_ok("ssh-ed25519", "ssh-ed25519")); // 没有 blob
+        assert!(!ssh_pubkey_ok("", &ed));
+        // 声明的长度超出实际字节数 → 拒绝
+        let truncated = base64::engine::general_purpose::STANDARD.encode([0, 0, 0, 40u8]);
+        assert!(!ssh_pubkey_ok("ssh-rsa", &format!("ssh-rsa {truncated}")));
     }
 
     #[test]

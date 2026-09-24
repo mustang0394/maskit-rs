@@ -296,11 +296,14 @@
     CONNSTR: '连接串密码', EMAIL: '邮箱地址', HKID: '港澳通行证', IBAN: 'IBAN 银行账号',
     IDCARD: '身份证（15/18 位）', IP_INTERNAL: '内网 IP（10.x / 172.16-31）',
     IP_PRIVATE: '内网 IP（192.168 / 169.254 / 100.64）', IP_PUBLIC: '公网 IP',
-    IPV6_PRIVATE: 'IPv6 私网（fe80:: / fc00::）', JWT: 'JWT 令牌', LANDLINE: '固定电话',
-    MAC: 'MAC 地址', PHONE: '手机号', PLATE: '车牌号', PRIVATE_KEY: 'PEM 私钥',
-    SECRET: '键值对凭据（password=…）', TOKEN: 'Bearer Token', USCC: '统一社会信用代码',
+    IPV6_PRIVATE: 'IPv6 私网（fe80:: / fc00::）', IPV6_PUBLIC: '公网 IPv6（2000::/3）',
+    JWT: 'JWT 令牌', LANDLINE: '固定电话',
+    MAC: 'MAC 地址', PHONE: '手机号', PLATE: '车牌号', PRIVATE_KEY: 'PEM / OpenSSH 私钥',
+    SECRET: '键值对凭据（password=…）', SSH_PUBKEY: 'SSH 公钥（rsa / ed25519 / ecdsa）',
+    TOKEN: 'Bearer Token', USCC: '统一社会信用代码',
   };
-  const RULE_DEFAULT_ON = ['API_KEY', 'CARD', 'CONNSTR', 'EMAIL', 'IDCARD', 'LANDLINE', 'PHONE'];
+  // ⚠️ 必须与服务端 default_builtin_rules() 保持一致（控制台「恢复默认」按这个来）
+  const RULE_DEFAULT_ON = ['API_KEY', 'CARD', 'CONNSTR', 'EMAIL', 'IDCARD', 'LANDLINE', 'PHONE', 'SSH_PUBKEY'];
 
   // 事件委托只注册一次（放在 IIFE 顶层）—— 早期写在 loadRules() 里，
   // 而 loadRules 会被反复调用，每次都新建箭头函数、无法被去重，

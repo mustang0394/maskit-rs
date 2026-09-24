@@ -70,7 +70,10 @@ MASKIT_RS_DATA_DIR=/var/lib/maskit-rs ./target/release/maskit-rs
 
 ## 功能
 
-- **21 类内置规则**（API Key / 银行卡 / 连接串密码 / 邮箱 / 身份证 / 座机 / 手机号 默认开启；PEM 私钥 / JWT / Token / 云厂商 AK / 内网 IP / IPv6 / MAC / 车牌 / IBAN / USCC 等可按需开启），逐条对齐 Python 版语义与边界
+- **23 类内置规则**（API Key / 银行卡 / 连接串密码 / 邮箱 / 身份证 / 座机 / 手机号 / **SSH 公钥** 默认开启；PEM·OpenSSH 私钥 / JWT / Token / 云厂商 AK / 内网 IP / **公网 IPv6** / MAC / 车牌 / IBAN / USCC 等可按需开启），逐条对齐 Python 版语义与边界
+  - **SSH 公钥**：`ssh-rsa` / `ssh-ed25519` / `ecdsa-sha2-nistp*` / FIDO `sk-*@openssh.com`，命中「类型 + base64 blob」；blob 会按 SSH wire format 解出来核对内部类型串，几乎不可能误报。注释里的邮箱由 EMAIL 规则单独处理
+  - **公网 IPv6**：全局单播 `2000::/3`（排除 RFC 3849 文档段 `2001:db8::/32`）。默认**关闭**，与 IPv4 公网 / IPv6 私网保持一致（网络类文档里地址太常见）
+  - SSH **私钥**（`-----BEGIN RSA|OPENSSH … PRIVATE KEY-----` 整块）由 `PRIVATE_KEY` 覆盖，该项默认关闭
 - **自定义敏感词分组**：分组是独立实体（`mask.custom_word_groups` 有序声明 + `mask.custom_words` 的 `{词: 分组}`），可以**只有名字没有词**——先建组、再往组里加词，不必每次重打分组名；支持组内搜索、重命名、整组/逐词启用、整词匹配、批量粘贴；以 `re:` 开头的词按正则处理
 - **多轮一致性**：同一原文在 TTL 内复用同一占位符（`session_ttl`，默认 600s）
 - **路径感知脱敏**：协议位置字段（`role`/`model`/`id` 等）不动，业务区（工具参数）强制扫描
@@ -99,7 +102,7 @@ maskit-rs/
     ├── detect/          # 三大协议识别
     ├── mask/
     │   ├── engine.rs    # mask()/restore() 编排、规则链、自定义词
-    │   ├── rules.rs     # 21 类规则 + 环视下沉校验器（D7）
+    │   ├── rules.rs     # 23 类规则 + 环视下沉校验器（D7）
     │   ├── validators.rs# Luhn/身份证/IBAN/JWT/USCC 等校验器
     │   ├── placeholder.rs # 占位符格式与正则族
     │   ├── session.rs   # 会话映射 + TTL 复用表 + 后缀索引
@@ -124,7 +127,7 @@ maskit-rs/
 | `server.port` / `server.bind` | 监听端口与地址（默认 `18701` / `127.0.0.1`） |
 | `upstream.target` | 唯一上游地址，可带路径前缀（改后热生效） |
 | `upstream.extra_headers` | 注入的静态请求头（凭据类头会被拒绝注入） |
-| `mask.builtin_rules` | 21 类规则开关 |
+| `mask.builtin_rules` | 23 类规则开关 |
 | `mask.custom_words` | 自定义敏感词 `{词: 分类}` |
 | `mask.custom_word_groups` | 自定义敏感词分组名（**有序**，允许空组；Rust 版新增，Python 版不识别） |
 | `mask.sensitive_disabled` | 禁用的词分组（整组关闭） |
@@ -253,7 +256,7 @@ maskit-rs --health-check   # 健康检查（容器 HEALTHCHECK 用，退出码 0
 ```bash
 export CARGO_INCREMENTAL=0   # 磁盘紧张时强烈建议
 cargo build --release         # 产物：target/release/maskit-rs（约 9.4MB）
-cargo test                    # 335 个测试
+cargo test                    # 345 个测试
 cargo test --release --test perf_tests -- --test-threads=1   # 性能基准
 ```
 

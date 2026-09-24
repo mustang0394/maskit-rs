@@ -102,7 +102,16 @@ impl Default for UpstreamConfig {
 /// 默认开启 7 类核心：API_KEY/CARD/CONNSTR/EMAIL/IDCARD/LANDLINE/PHONE。
 pub fn default_builtin_rules() -> std::collections::BTreeMap<String, bool> {
     let on = [
-        "API_KEY", "CARD", "CONNSTR", "EMAIL", "IDCARD", "LANDLINE", "PHONE",
+        "API_KEY",
+        "CARD",
+        "CONNSTR",
+        "EMAIL",
+        "IDCARD",
+        "LANDLINE",
+        "PHONE",
+        // SSH 公钥默认开：形态上以 `AAAA` 开头的 base64 blob + 类型串，
+        // 还会回解 blob 核对内部类型，几乎不可能误报（与 API_KEY 同一类）。
+        "SSH_PUBKEY",
     ];
     let off = [
         "ACCESS_KEY",
@@ -112,6 +121,9 @@ pub fn default_builtin_rules() -> std::collections::BTreeMap<String, bool> {
         "IP_PRIVATE",
         "IP_PUBLIC",
         "IPV6_PRIVATE",
+        // 公网 IPv6 默认关：与 IPv4 公网/IPv6 私网保持一致 ——
+        // 网络类文档里地址很常见，默认开会把技术正文搅得很难读。
+        "IPV6_PUBLIC",
         "JWT",
         "MAC",
         "PLATE",
@@ -144,6 +156,7 @@ pub const ALL_BUILTIN_RULES: &[&str] = &[
     "IP_PRIVATE",
     "IP_PUBLIC",
     "IPV6_PRIVATE",
+    "IPV6_PUBLIC",
     "JWT",
     "LANDLINE",
     "MAC",
@@ -151,6 +164,7 @@ pub const ALL_BUILTIN_RULES: &[&str] = &[
     "PLATE",
     "PRIVATE_KEY",
     "SECRET",
+    "SSH_PUBKEY",
     "TOKEN",
     "USCC",
 ];
