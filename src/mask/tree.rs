@@ -594,10 +594,158 @@ pub fn collect_placeholder_tokens(text: &str) -> Vec<String> {
         .collect()
 }
 
+/// 事件日志 dialog 的长度上限（字符）。
+///
+/// ring 常驻 2000 条，每条都驻留全文会把内存拉爆；同时历史事件回看也不需要
+/// 完整长文。超出部分截断并标注。
+pub const DIALOG_MAX_CHARS: usize = 8000;
+
+/// 从 LLM 请求/响应 JSON 中抽取**对话文本**（供事件日志 `dialog` 字段）。
+///
+/// 不按协议硬编码路径，而是收集常见文本键下的字符串，这样
+/// Chat Completions / Responses / Anthropic / NDJSON 都能覆盖，
+/// 且上游新增字段时不会静默丢内容。
+///
+/// 键名命中：`content` / `text` / `input` / `output_text` / `reasoning` 等。
+/// 数组与对象递归，深度封顶防环。
+pub fn extract_dialog_text(v: &serde_json::Value) -> String {
+    fn is_text_key(k: &str) -> bool {
+        matches!(
+            k,
+            "content" | "text" | "input" | "output_text" | "reasoning" | "thinking"
+        )
+    }
+    /// 只在**文本键**下收集字符串；遇到非文本的容器键（messages / choices /
+    /// output / delta …）则继续结构下钻。
+    fn collect(v: &serde_json::Value, out: &mut String, depth: usize) {
+        if depth > 12 || out.chars().count() >= DIALOG_MAX_CHARS {
+            return;
+        }
+        match v {
+            serde_json::Value::String(s) => {
+                if s.trim().is_empty() {
+                    return;
+                }
+                if !out.is_empty() {
+                    out.push('\n');
+                }
+                out.push_str(s);
+            }
+            serde_json::Value::Array(a) => {
+                for x in a {
+                    collect(x, out, depth + 1);
+                }
+            }
+            serde_json::Value::Object(m) => {
+                for (k, val) in m {
+                    if is_text_key(k) {
+                        collect(val, out, depth + 1);
+                    } else {
+                        // 容器键：只下钻不收集（否则会把 role=user、model=gpt-4 也当正文）
+                        descend(val, out, depth + 1);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    fn descend(v: &serde_json::Value, out: &mut String, depth: usize) {
+        if depth > 12 || out.chars().count() >= DIALOG_MAX_CHARS {
+            return;
+        }
+        match v {
+            serde_json::Value::Array(a) => {
+                for x in a {
+                    descend(x, out, depth + 1);
+                }
+            }
+            serde_json::Value::Object(m) => {
+                for (k, val) in m {
+                    if is_text_key(k) {
+                        collect(val, out, depth + 1);
+                    } else {
+                        descend(val, out, depth + 1);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = String::new();
+    descend(v, &mut out, 0);
+    // 按字符边界截断（避免切碎 UTF-8）
+    if out.chars().count() > DIALOG_MAX_CHARS {
+        let cut: String = out.chars().take(DIALOG_MAX_CHARS).collect();
+        format!("{cut}\n…（已截断，原文更长）")
+    } else {
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::Config;
+
+    fn x(s: &str) -> serde_json::Value {
+        serde_json::from_str(s).unwrap()
+    }
+
+    #[test]
+    fn extract_dialog_chat_request() {
+        let v = x(r#"{"model":"gpt-4","messages":[
+            {"role":"system","content":"你是一个助手"},
+            {"role":"user","content":"我的电话是13800138000"}]}"#);
+        let t = extract_dialog_text(&v);
+        assert!(
+            t.contains("你是一个助手"),
+            "应下钻 messages 容器拿到 content：{t}"
+        );
+        assert!(t.contains("13800138000"));
+        assert!(!t.contains("gpt-4"), "model 不是正文，不应收集：{t}");
+        assert!(!t.contains("user"), "role 不是正文，不应收集：{t}");
+    }
+
+    #[test]
+    fn extract_dialog_chat_response() {
+        let v = x(r#"{"choices":[{"index":0,"message":{"role":"assistant",
+            "content":"已记录13800138000"},"finish_reason":"stop"}]}"#);
+        let t = extract_dialog_text(&v);
+        assert_eq!(t, "已记录13800138000");
+    }
+
+    #[test]
+    fn extract_dialog_responses_api() {
+        let v =
+            x(r#"{"output":[{"content":[{"type":"output_text","text":"来自 Responses API"}]}]}"#);
+        assert_eq!(extract_dialog_text(&v), "来自 Responses API");
+    }
+
+    #[test]
+    fn extract_dialog_anthropic() {
+        let v = x(r#"{"content":[{"type":"text","text":"Claude 的回复"},
+            {"type":"thinking","thinking":"思考过程"}]}"#);
+        let t = extract_dialog_text(&v);
+        assert!(t.contains("Claude 的回复"));
+        assert!(t.contains("思考过程"), "thinking 也应收集");
+    }
+
+    #[test]
+    fn extract_dialog_truncates() {
+        let long = "啊".repeat(DIALOG_MAX_CHARS + 500);
+        let v = serde_json::json!({"messages":[{"content": long}]});
+        let t = extract_dialog_text(&v);
+        assert!(t.contains("已截断"), "超长必须截断并标注");
+        assert!(t.chars().count() <= DIALOG_MAX_CHARS + 20, "截断后长度受限");
+    }
+
+    #[test]
+    fn extract_dialog_no_text_fields() {
+        assert_eq!(
+            extract_dialog_text(&x(r#"{"model":"gpt-4","stream":true}"#)),
+            ""
+        );
+    }
     use crate::mask::engine::CustomWords;
     use serde_json::json;
 

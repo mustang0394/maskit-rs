@@ -197,7 +197,11 @@ pub fn stream_response(
             }
         }
         // RESTORE 事件 + 响应扫描
-        emit_restore(&bus, &sid, &meta, &stats_total, store, blocked, "stream");
+        // dialog 取 state.kept —— 那是**还原后**的正文（上游回的是占位符，
+        // 用户看到的是原文，事件里也该记原文）。
+        let mut rmeta = meta.clone();
+        rmeta.resp_dialog = state.kept.clone();
+        emit_restore(&bus, &sid, &rmeta, &stats_total, store, blocked, "stream");
 
         if let Some(hook) = USAGE_HOOK.get() {
             hook(&meta.model, &usage_total);
@@ -208,7 +212,9 @@ pub fn stream_response(
 }
 
 /// 流式响应元信息。
-#[derive(Clone)]
+/// 派生 Default：后续新增字段时，既有构造点用 `..Default::default()` 即可，
+/// 不必逐处补全（曾因新增 resp_dialog/keep_plaintext 打断所有测试构造）。
+#[derive(Clone, Default)]
 pub struct StreamMeta {
     pub host: String,
     pub method: String,
@@ -218,6 +224,12 @@ pub struct StreamMeta {
     pub status: u16,
     pub req_bytes: usize,
     pub req_dialog: String,
+    /// 还原后的**助手回复**文本（RESTORE 事件的 dialog）。
+    /// 与 req_dialog 区分：Python 口径是「MASK 行 dialog=用户消息，
+    /// RESTORE 行 dialog=助手回复」，此前两者混用了 req_dialog。
+    pub resp_dialog: String,
+    /// 日志是否保留凭据类明文（构造时从配置快照，避免热路径读锁）。
+    pub keep_plaintext: bool,
 }
 
 /// 发 RESTORE 事件（对齐 `_emit_restore_summary`）。
@@ -239,7 +251,7 @@ pub fn emit_restore(
     } else {
         ("no_sensitive_data", 0, 0)
     };
-    let items = build_restore_items(store, sid, stats);
+    let items = build_restore_items(store, sid, stats, meta.keep_plaintext);
     let ev = Event {
         id: 0,
         ts: 0.0,
@@ -266,14 +278,19 @@ pub fn emit_restore(
         restore_status: status.to_string(),
         restored: restored as usize,
         count: restored as usize,
-        dialog: meta.req_dialog.clone(),
+        dialog: meta.resp_dialog.clone(),
         message: String::new(),
         ..Default::default()
     };
     bus.emit(ev);
 }
 
-fn build_restore_items(store: &SessionStore, sid: &str, stats: &RestoreStats) -> Vec<EventItem> {
+fn build_restore_items(
+    store: &SessionStore,
+    sid: &str,
+    stats: &RestoreStats,
+    keep_plaintext: bool,
+) -> Vec<EventItem> {
     let Some(s) = store.get(sid) else {
         return vec![];
     };
@@ -300,7 +317,8 @@ fn build_restore_items(store: &SessionStore, sid: &str, stats: &RestoreStats) ->
         };
         if cred {
             item.digest = crate::mask::validators::cred_digest(orig);
-        } else {
+        }
+        if keep_plaintext || !cred {
             item.original = orig.clone();
         }
         if !restored {
@@ -325,6 +343,19 @@ pub fn process_and_emit(
     meta: &StreamMeta,
 ) -> ResponseOutcome {
     let outcome = process_whole(body, ct, sid, store, cmdblock);
+    let mut meta = meta.clone();
+    // 非流式：dialog = **还原后**的助手回复
+    meta.resp_dialog = serde_json::from_slice::<serde_json::Value>(&outcome.body)
+        .map(|v| crate::mask::tree::extract_dialog_text(&v))
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| {
+            let t = String::from_utf8_lossy(&outcome.body);
+            t.chars()
+                .take(crate::mask::tree::DIALOG_MAX_CHARS)
+                .collect()
+        });
+    let meta = &meta;
     let stats = RestoreStats {
         restored: outcome.restored,
         unresolved: outcome.unresolved,
@@ -356,6 +387,7 @@ pub fn scan_response_pii(
     sid: &str,
     store: &SessionStore,
     builtin_rules: &std::collections::BTreeMap<String, bool>,
+    keep_plaintext: bool,
 ) -> Vec<EventItem> {
     use crate::mask::rules::{self, RULES};
     let s = store.get(sid);
@@ -428,7 +460,8 @@ pub fn scan_response_pii(
             };
             if cred {
                 item.digest = crate::mask::validators::cred_digest(orig);
-            } else {
+            }
+            if keep_plaintext || !cred {
                 item.original = orig.to_string();
             }
             found.push(item);
@@ -547,6 +580,7 @@ mod tests {
             "r",
             &parts.1,
             &parts.0.mask.builtin_rules,
+            true, // 测试里固定保留明文
         );
         assert!(found
             .iter()
@@ -570,6 +604,7 @@ mod tests {
             "r",
             &parts.1,
             &parts.0.mask.builtin_rules,
+            true, // 测试里固定保留明文
         );
         assert!(found.is_empty(), "本会话已知值不得误报：{found:?}");
     }

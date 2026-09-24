@@ -608,7 +608,7 @@ async fn thinking_and_tool_content_roundtrip() {
         protocol: "responses".into(),
         status: 200,
         req_bytes: 0,
-        req_dialog: String::new(),
+        ..Default::default()
     };
     let mut st = StreamState::new(Framing::Sse);
     let tok = "{{TERM_bcdfgh}}";
@@ -670,4 +670,31 @@ async fn stream_restore_works_end_to_end() {
     // 上游确实只收到了占位符
     let up = String::from_utf8_lossy(&h.mock.last_body().unwrap()).to_string();
     assert!(!up.contains("13800138000"), "上游不应收到明文：{up}");
+}
+
+/// 凭据原文是否入事件日志，受 `mask.log_credential_plaintext` 控制。
+/// 默认 true（用户要求：不分类别全部可看）；设为 false 回到凭据红线。
+#[test]
+fn credential_plaintext_in_logs_is_configurable() {
+    use maskit_rs::config::{log_keeps_credential_plaintext, Config};
+    let mut cfg = Config::default();
+    assert!(
+        log_keeps_credential_plaintext(&cfg),
+        "默认应保留凭据明文（用户明确要求）"
+    );
+    cfg.mask.log_credential_plaintext = false;
+    assert!(
+        !log_keeps_credential_plaintext(&cfg),
+        "显式关闭后应回到凭据红线"
+    );
+}
+
+/// 旧配置（无该键）加载后应为 true，不得因缺字段而退回红线。
+#[test]
+fn legacy_config_defaults_to_keeping_plaintext() {
+    let v = serde_json::json!({"mask": {"enabled": true}});
+    let cfg: maskit_rs::config::Config = serde_json::from_value(v).unwrap();
+    assert!(cfg.mask.log_credential_plaintext);
+    // normalized 也不得改写
+    assert!(cfg.normalized().mask.log_credential_plaintext);
 }

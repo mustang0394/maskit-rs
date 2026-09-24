@@ -332,11 +332,14 @@ pub async fn handler(State(state): State<SharedState>, req: Request) -> Response
     let mask_result = tokio::task::spawn_blocking(move || {
         let cfg_ref = config.get();
         let ctx = MaskCtx::new(&cfg_ref, store, sid2.clone(), &custom);
-        tree::mask_body(&raw, &ctx)
+        // 事件日志 dialog：与遮蔽同一次解析里抽出**原始**对话文本，
+        // 避免为了拿全文再解一遍 JSON。
+        let dialog = extract_dialog_from_raw(&raw);
+        tree::mask_body(&raw, &ctx).map(|b| (b, dialog))
     })
     .await;
 
-    let masked = match mask_result {
+    let (masked, req_dialog) = match mask_result {
         Ok(Ok(m)) => m,
         Ok(Err(e)) => {
             // ── 判定⑨：脱敏抛异常 → 503（与协议无关） ──
@@ -383,8 +386,9 @@ pub async fn handler(State(state): State<SharedState>, req: Request) -> Response
     };
     let mask_ms = mask_t0.elapsed().as_secs_f64() * 1000.0;
 
-    // MASK 事件（含命中明细；凭据类不落原文）
-    let items = build_event_items(store, &sid);
+    // MASK 事件（含命中明细 + 用户消息原文）
+    let keep_plaintext = crate::config::log_keeps_credential_plaintext(&state.config.get());
+    let items = build_event_items(store, &sid, keep_plaintext);
     let new_count = store.get(&sid).map(|s| s.new_orig.len()).unwrap_or(0);
     let mut ev_meta = RequestMeta {
         req_bytes,
@@ -408,6 +412,7 @@ pub async fn handler(State(state): State<SharedState>, req: Request) -> Response
         upstream_ms: None,
         req_bytes,
         resp_bytes: 0,
+        dialog: req_dialog.clone(),
         items,
         count: new_count.max(store.get(&sid).map(|s| s.last_hits.len()).unwrap_or(0)),
         masked_total: store.get(&sid).map(|s| s.fwd.len()).unwrap_or(0),
@@ -443,14 +448,29 @@ pub async fn handler(State(state): State<SharedState>, req: Request) -> Response
     let mut headers = parts.headers.clone();
     inject_identity_for_stream(&mut headers, &body_bytes);
     let out_body = Bytes::from(masked.text.clone().into_bytes());
+    // 事件日志 dialog：从**原始**请求体抽对话文本（用户消息）。
+    // 这是用户实际发出去的明文，与 items[].original 合起来构成可核对的对照。
     let sess = RestoreSession {
         sid: sid.clone(),
         protocol: protocol.as_str().to_string(),
         model: model.clone(),
         req_bytes,
-        req_dialog: String::new(),
+        req_dialog,
     };
     forward_with_restore(&state, &method_str, &parts.uri, &headers, out_body, sess).await
+}
+
+/// 从原始请求体（未经脱敏）抽对话文本；非 JSON 或抽不出时回退截断预览。
+fn extract_dialog_from_raw(raw: &[u8]) -> String {
+    serde_json::from_slice::<serde_json::Value>(raw)
+        .map(|v| crate::mask::tree::extract_dialog_text(&v))
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| {
+            // 非 JSON：给前 512 字符，至少让详情页有东西可看
+            let t = String::from_utf8_lossy(raw);
+            t.chars().take(512).collect()
+        })
 }
 
 /// 流式请求声明 identity（对齐 Python：压缩会让流式接管退化）。
@@ -507,7 +527,7 @@ fn first_user_content(body: &serde_json::Value) -> Option<String> {
 }
 
 /// 构建 MASK 事件明细（凭据类只留 digest/preview）。
-fn build_event_items(store: &SessionStore, sid: &str) -> Vec<EventItem> {
+fn build_event_items(store: &SessionStore, sid: &str, keep_plaintext: bool) -> Vec<EventItem> {
     let Some(s) = store.get(sid) else {
         return vec![];
     };
@@ -538,9 +558,12 @@ fn build_event_items(store: &SessionStore, sid: &str) -> Vec<EventItem> {
             hash: crate::mask::placeholder::token_suffix(token),
             restored: false,
         };
+        // 日志是否保留凭据明文由 mask.log_credential_plaintext 决定（默认全留）。
+        // 摘要始终计算：即使有明文，sha256 仍是跨库/跨天的同一性对照。
         if cred {
             item.digest = crate::mask::validators::cred_digest(orig);
-        } else {
+        }
+        if keep_plaintext || !cred {
             item.original = orig.clone();
         }
         items.push(item);
@@ -632,6 +655,10 @@ async fn forward_inner(
                         status: status.as_u16(),
                         req_bytes: sess.req_bytes,
                         req_dialog: sess.req_dialog.clone(),
+                        resp_dialog: String::new(), // 流式由响应侧回填
+                        keep_plaintext: crate::config::log_keeps_credential_plaintext(
+                            &state.config.get(),
+                        ),
                     };
                     let cmdblock = state.cmdblock();
                     let store: &'static crate::mask::session::SessionStore = state.sessions;

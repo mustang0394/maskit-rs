@@ -743,14 +743,10 @@ fn flush_batch(
 }
 
 fn write_event(conn: &Connection, ev: &Event) -> rusqlite::Result<()> {
-    // 凭据红线：items 中凭据类原文不落库（构造时已保证，这里再兜一道）
-    let mut safe = ev.clone();
-    for item in safe.items.iter_mut() {
-        if item.cred || crate::config::is_credential_label(&item.label) {
-            item.original.clear();
-        }
-    }
-    let payload = serde_json::to_string(&safe).unwrap_or_default();
+    // 明文与否已由事件构造时按 `mask.log_credential_plaintext` 决定
+    // （proxy/response 层负责），这里**不再二次剥离** —— 早先的兜底会覆盖
+    // 用户的显式选择，使配置形同虚设。
+    let payload = serde_json::to_string(ev).unwrap_or_default();
     let day = today_str();
     conn.execute(
         "INSERT INTO events (ts, type, payload) VALUES (?1, ?2, ?3)",
@@ -778,15 +774,13 @@ fn write_event(conn: &Connection, ev: &Event) -> rusqlite::Result<()> {
             let cnt = if ev.count > 0 {
                 ev.count
             } else {
-                safe.items.len()
+                ev.items.len()
             };
             bump("masked_items", cnt as i64)?;
-            for item in &safe.items {
-                // Python 口径：非凭据类存原文（UI 需要看是哪个词），凭据类只能存 preview
-                // （原文永不落库是红线）。
-                let word = if item.cred || crate::config::is_credential_label(&item.label) {
-                    item.preview.clone()
-                } else if !item.original.is_empty() {
+            for item in &ev.items {
+                // 有原文就用原文（词频表要能看出是哪个词）；无原文（凭据类在
+                // log_credential_plaintext=false 时）才回退到打码预览。
+                let word = if !item.original.is_empty() {
                     item.original.clone()
                 } else {
                     item.preview.clone()
@@ -803,7 +797,7 @@ fn write_event(conn: &Connection, ev: &Event) -> rusqlite::Result<()> {
             let n = if ev.restored > 0 {
                 ev.restored
             } else {
-                safe.items.len()
+                ev.items.len()
             };
             bump("restored_items", n as i64)?;
         }
@@ -955,20 +949,41 @@ mod tests {
         assert_eq!(evs[0].event_type, EventType::Restore, "新→旧");
     }
 
+    /// 用户已明确要求「不管啥类都显示原文」，故默认**保留**凭据明文。
+    /// 旧断言（`never_persisted`）与该决定相反，已改为下列两个。
     #[test]
-    fn credential_plaintext_never_persisted() {
+    fn credential_plaintext_persisted_by_default() {
         let dir = tempfile::tempdir().unwrap();
         let store = EventStore::open(dir.path()).unwrap();
         let secret = "sk-abcdefghijklmnopqrstuvwxyz012345";
         store.enqueue(sample_event(EventType::Mask, "API_KEY", secret, true));
         store.sync();
-        // 直接读原始 payload 检查
         let conn = Connection::open(store.path()).unwrap();
         let payload: String = conn
             .query_row("SELECT payload FROM events LIMIT 1", [], |r| r.get(0))
             .unwrap();
-        assert!(!payload.contains(secret), "凭据原文绝不能落库");
-        assert!(payload.contains("abc123"), "摘要保留（可做同一性对照）");
+        assert!(
+            payload.contains(secret),
+            "默认应保留凭据原文（用户要求：全类型都可看）"
+        );
+        assert!(payload.contains("abc123"), "摘要仍保留（可做同一性对照）");
+    }
+
+    /// 写库层**不得**再自行剥离：明文与否已由事件构造时按
+    /// `mask.log_credential_plaintext` 决定，二次剥离会让配置形同虚设。
+    /// 关闭开关时，红线由 proxy/response 的 item 构造负责落实。
+    #[test]
+    fn write_event_does_not_second_hand_redact() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = EventStore::open(dir.path()).unwrap();
+        let secret = "sk-abcdefghijklmnopqrstuvwxyz012345";
+        store.enqueue(sample_event(EventType::Mask, "API_KEY", secret, true));
+        store.sync();
+        let evs = store.fetch_events(10, 0);
+        assert!(
+            evs[0].items[0].original.contains(secret),
+            "写库层必须原样保留事件里已有的 original"
+        );
     }
 
     #[test]

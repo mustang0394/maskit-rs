@@ -122,7 +122,8 @@
             <button class="btn btn-sm btn-warn" id="btnClearLogs">清空</button>
           </div>
         </div>
-        <p class="hint">凭据类命中不存明文，只显示打码预览与 sha256 摘要；点行可展开完整对照。</p>
+        <p class="hint">点行展开完整对照。凭据类（🔒）默认也保留明文，以便核对；
+          如需回到「只留 sha256 摘要」模式，将配置 <code>mask.log_credential_plaintext</code> 设为 <code>false</code>。</p>
         <div class="table-wrap">
           <table class="list log-table">
             <thead><tr>

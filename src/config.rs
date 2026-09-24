@@ -28,6 +28,15 @@ pub fn is_credential_label(label: &str) -> bool {
     CREDENTIAL_LABELS.contains(&label)
 }
 
+/// 事件日志是否保留凭据类明文。默认 true（用户要求：不分类别，全部可看）。
+///
+/// 为 false 时恢复凭据红线：凭据类只留 sha256 摘要与打码预览。
+/// 注意这**只影响日志展示层**，不影响占位符映射表（映射表始终全量落盘，
+/// 否则缓存一致性无法保证）。
+pub fn log_keeps_credential_plaintext(cfg: &Config) -> bool {
+    cfg.mask.log_credential_plaintext
+}
+
 // ---------------------------------------------------------------------------
 // 配置结构
 // ---------------------------------------------------------------------------
@@ -158,6 +167,16 @@ pub struct MaskConfig {
     /// 禁用的词分组（整个 label 关闭，对齐 Python `sensitive_disabled`）
     #[serde(default)]
     pub sensitive_disabled: Vec<String>,
+    /// 事件日志是否保留凭据类**明文原文**。
+    ///
+    /// true（默认）：所有类型的 `items[].original` 与 `dialog` 全文均保留明文，
+    ///   控制台可直接看到「原文 → 占位符」的完整对照。
+    /// false：恢复凭据红线 —— 凭据类只留 sha256 摘要与打码预览，原文不落库。
+    ///
+    /// ⚠️ true 会把 API Key / 私钥 / 连接串等**明文写入 SQLite**。数据库文件
+    /// 权限为 0600，但**备份必须加密**；多人可读的主机上建议改回 false。
+    #[serde(default = "default_true")]
+    pub log_credential_plaintext: bool,
     /// 词级禁用 {label: [词...]}（对齐 Python `sensitive_word_disabled`）
     #[serde(default)]
     pub sensitive_word_disabled: std::collections::BTreeMap<String, Vec<String>>,
@@ -212,6 +231,7 @@ impl Default for MaskConfig {
             builtin_rules: default_builtin_rules(),
             custom_words: Default::default(),
             sensitive_disabled: Default::default(),
+            log_credential_plaintext: true,
             sensitive_word_disabled: Default::default(),
             sensitive_word_whole: Default::default(),
             custom_regexes: Default::default(),

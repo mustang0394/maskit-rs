@@ -459,3 +459,41 @@ pending drain 不泄漏、10050 条 LRU 淘汰、落盘往返/幂等 upsert/TTL 
 **遗留**：`Event.dialog` 字段声明了但从未赋值（永远空串），详情里的
 「用户消息原文 / 助手回复原文」因此不显示。接上它意味着把**含明文凭据的
 完整请求体驻留内存**（ring 2000 条），与凭据红线有冲突，需先决策。
+
+
+## M18：日志显示全部原文 + 接上 Event.dialog
+
+用户决定：**不管哪类都显示原文**，并要求接上 `Event.dialog`。
+
+**新增配置** `mask.log_credential_plaintext`（默认 `true`）。选默认开启而非
+硬编码，是为保留一个能关掉的闸 —— 一旦写入 SQLite 就是持久化明文，
+备份泄露不可逆。设 false 即回到凭据红线。
+
+**凭据明文：5 个剥离点全部改造**
+
+- `proxy.rs` MASK item / `response.rs` RESTORE item / 响应 PII 扫描 item
+- `db.rs` write_event 的「兜底剥离」**删除** —— 它会在事件已按配置构造后
+  再次清除，使配置形同虚设
+- `db.rs` daily_words 词频：优先用 original，无则 preview
+
+摘要（sha256）始终计算 —— 即使有明文，摘要仍是跨库/跨天的同一性对照。
+
+**Event.dialog 接线**（此前是**死字段**，声明了但 `Session.req_dialog` 从
+未赋值，永远空串）
+
+- 新增 `tree::extract_dialog_text`：按文本键（content/text/input/
+  output_text/reasoning/thinking）收集，容器键（messages/choices/output）
+  只下钻不收集，避免把 `role=user`、`model=gpt-4` 当正文
+- MASK 事件 = **用户消息**（从原始请求体抽，与遮蔽同一次解析，不重复解 JSON）
+- RESTORE 事件 = **助手回复**（还原后：非流式取 outcome.body，流式取
+  state.kept）
+- 修正语义错误：此前 RESTORE 事件误用 `req_dialog`（请求文本），
+  Python 口径是「MASK=用户消息，RESTORE=助手回复」
+- `DIALOG_MAX_CHARS = 8000` 截断（ring 常驻 2000 条，不限长会拉爆内存）
+- `StreamMeta` 派生 `Default`，后续加字段不再打断所有构造点
+
+**保留未动**：`export_logs` 恒脱敏（截图/分享用的导出，与详情视图分离）、
+审计证据仍走 `redact_credentials`。
+
+**测试** +6（各协议 dialog 抽取、超长截断、非文本键不混入、开关默认值、
+旧配置兼容、写库层不二次剥离）。306 全绿，clippy 零告警。
