@@ -84,24 +84,20 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            maskit-rs/target
-          key: cargo-verify-${{ hashFiles('maskit-rs/Cargo.lock') }}
+            target
+          key: cargo-verify-${{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-verify-
 
       - name: 格式化检查
-        working-directory: maskit-rs
         run: cargo fmt --check
 
       - name: Clippy（零告警门禁）
-        working-directory: maskit-rs
         run: cargo clippy --all-targets -- -D warnings
 
       - name: 单元 + 集成测试
-        working-directory: maskit-rs
         run: cargo test
 
       - name: 性能基准（release + 串行，计时才有意义）
-        working-directory: maskit-rs
         run: cargo test --release --test perf_tests -- --test-threads=1
 
   # ---------------------------------------------------------------------
@@ -144,8 +140,8 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            maskit-rs/target
-          key: cargo-${{ matrix.target }}-${{ hashFiles('maskit-rs/Cargo.lock') }}
+            target
+          key: cargo-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-${{ matrix.target }}-
 
       - name: 安装交叉编译工具链（Linux aarch64）
@@ -155,13 +151,11 @@ jobs:
           sudo apt-get install -y gcc-aarch64-linux-gnu
 
       - name: 构建二进制
-        working-directory: maskit-rs
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: 打包资产（tar.gz）
         if: ${{ !contains(matrix.target, 'windows') }}
         shell: bash
-        working-directory: maskit-rs
         env:
           TARGET: ${{ matrix.target }}
           VERSION: ${{ needs.version.outputs.version }}
@@ -182,7 +176,6 @@ jobs:
       - name: 打包资产（zip）
         if: ${{ contains(matrix.target, 'windows') }}
         shell: pwsh
-        working-directory: maskit-rs
         env:
           TARGET: ${{ matrix.target }}
           VERSION: ${{ needs.version.outputs.version }}
@@ -204,7 +197,7 @@ jobs:
           name: Maskit-RS ${{ needs.version.outputs.version }}
           prerelease: ${{ needs.version.outputs.prerelease }}
           draft: ${{ inputs.draft || false }}
-          files: maskit-rs/dist/*
+          files: dist/*
           fail_on_unmatched_files: true
 
   # ---------------------------------------------------------------------
@@ -244,8 +237,8 @@ jobs:
       - name: 构建并推送（amd64 + arm64）
         uses: docker/build-push-action@v6
         with:
-          context: maskit-rs
-          file: maskit-rs/Dockerfile
+          context: .
+          file: Dockerfile
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
