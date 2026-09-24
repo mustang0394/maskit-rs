@@ -7,10 +7,14 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: '版本号（留空则自动生成，如 v0.1.0-dev.42.20260924-1530）'
+        description: '版本号（留空则自动生成 v0.1.<构建号>）'
         required: false
+      prerelease:
+        description: '标记为【预发布】。默认关闭 = 正式发布'
+        type: boolean
+        default: false
       draft:
-        description: '创建为草稿 Release'
+        description: '先创建为草稿（不发布通知）'
         type: boolean
         default: false
 
@@ -34,11 +38,14 @@ jobs:
         id: gen
         env:
           INPUT_VERSION: ${{ inputs.version }}
+          INPUT_PRERELEASE: ${{ inputs.prerelease }}
           IS_TAG: ${{ startsWith(github.ref, 'refs/tags/') }}
           REF_NAME: ${{ github.ref_name }}
           RUN_NUMBER: ${{ github.run_number }}
         run: |
           set -euo pipefail
+          # 默认正式发布；只有显式勾选 prerelease 才是预发布。
+          # （此前手动触发一律标 prerelease，导致想要的正式版变成 Pre-release）
           if [ "$IS_TAG" = "true" ]; then
             # 推 tag 发布：版本即 tag（tag 本身就是 vX.Y.Z）
             version="${REF_NAME}"
@@ -49,20 +56,19 @@ jobs:
               v*) ;;
               *) version="v$version" ;;
             esac
-            prerelease="true"
+            prerelease="$INPUT_PRERELEASE"
           else
-            # 手动触发且未指定：自动生成带 run 号 + 时间戳的版本
-            # （保证每次发布都有唯一版本，不会都落在 latest 上）
-            stamp="$(date -u +%Y%m%d-%H%M)"
-            version="v0.1.0-dev.${RUN_NUMBER}.${stamp}"
-            prerelease="true"
+            # 未指定版本：自动生成干净递增号 v0.1.<构建号>，
+            # 每次发布唯一（不会都落在 latest），且默认为正式版。
+            version="v0.1.${RUN_NUMBER}"
+            prerelease="$INPUT_PRERELEASE"
           fi
           {
             echo "version=${version}"
             echo "tag=${version}"
             echo "prerelease=${prerelease}"
           } >> "$GITHUB_OUTPUT"
-          echo "发布版本：${version}"
+          echo "发布版本：${version}（prerelease=${prerelease}）"
 
   # ---------------------------------------------------------------------
   # 1. 质量门禁：fmt + clippy + 测试（含性能测试）
