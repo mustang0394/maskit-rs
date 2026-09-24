@@ -721,12 +721,12 @@ fn same_orig_gets_same_token_across_cache_eviction() {
         }
     }));
     let taken = |_t: &str, _s: &str| false;
-    
+
     let first = store.recall_token("alice@example.com", "EMAIL", &taken).0;
     // 手动清空内存表（模拟 LRU 淘汰 / 进程内缓存失效）
     store.recent_fwd.clear();
     store.recent_rev.clear();
-    
+
     let second = store.recall_token("alice@example.com", "EMAIL", &taken).0;
     assert_eq!(first, second, "内存淘汰后必须回查 DB，占位符不得改变");
     assert_eq!(first, "{{EMAIL_aaaaaa}}");
