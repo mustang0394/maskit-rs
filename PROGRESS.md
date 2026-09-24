@@ -417,3 +417,45 @@ pending drain 不泄漏、10050 条 LRU 淘汰、落盘往返/幂等 upsert/TTL 
 `example.com` / `Dr. Smith` / `ACME/Inc` 脱敏→还原往返正确。
 
 测试 303 全绿，clippy 零告警。
+
+
+## M17：日志/审计列表重做（修「不显示内容」）
+
+**现象**：用户反馈日志、审计列表都不显示内容，样式很奇怪。
+
+**诊断**：数据层完全正常（/logs、/audit/events 实测均返回完整数据）。
+四个缺陷全在渲染层：
+
+1. **两张表都是空壳** —— `<table id=logList>` / `<table id=auditList>`
+   内没有任何 thead/tbody，JS 直接往 table 里塞 `<tr><td>`。日志 7 列、
+   审计 5 列全无表头，CSS 里 `th{position:sticky}` 写了却从未渲染 ——
+   用户看到的是一堆无法解读的单元格。
+2. **原文与占位符都没显示** —— JS 只取 `it.preview`（打码预览
+   `1*********0`），且**字段名用错**：后端 `EventItem.token` 带
+   `#[serde(rename = "tok")]`，序列化成 `tok`，JS 从未读取；`original`
+   又被 `preview || original` 短路掉。两个关键值一个都没露出。
+3. **统计字段全是死的** —— JS 引用 `e.unresolved` 但它是
+   `skip_serializing_if=is_zero`；而 `count`/`restored` 压根没渲染。
+4. **详情端点闲置** —— `/logs/detail` 已实现，JS 从不调用。
+
+**参照 Python 实现**（`frontend/src/components/events/EventDetailDialog.tsx`）：
+列表精简，item 对照明文 / 预览 / 占位符 / 摘要 四行，详情回源单条事件。
+
+**改动**：
+
+- 两张表补 `<thead>` 列名 + 渲染目标改 `<tbody>`（空态 colspan 对齐列数）
+- item 渲染为「原文 → 占位符」对照，用 `tok`（兼容 `token`）；
+  凭据类 original 恒空（红线），显式标注「不存明文」+ sha256 摘要
+- 补齐 count / restored / unresolved / degraded 统计徽标
+- 接上 status / stream_mode vs stream_actual / req_bytes / unknown_shape 徽标
+- 点行展开详情（回源 `/logs/detail?id=`），渲染对照表 + message +
+  unresolved_samples
+- 审计表补表头，严重度改彩色徽标，证据列可断行
+- CSS 重做：粘性表头、列宽分层、行悬浮/选中态、对照视觉层次
+
+**测试** +2（表头齐全且列名匹配、渲染读 tok 且不被 preview 短路、统计字段
+真的被渲染、详情回源）。305 全绿，clippy 零告警。
+
+**遗留**：`Event.dialog` 字段声明了但从未赋值（永远空串），详情里的
+「用户消息原文 / 助手回复原文」因此不显示。接上它意味着把**含明文凭据的
+完整请求体驻留内存**（ring 2000 条），与凭据红线有冲突，需先决策。

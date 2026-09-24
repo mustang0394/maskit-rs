@@ -122,9 +122,20 @@
             <button class="btn btn-sm btn-warn" id="btnClearLogs">清空</button>
           </div>
         </div>
-        <p class="hint">凭据类命中只显示打码预览与 sha256 摘要，绝不显示原文。</p>
+        <p class="hint">凭据类命中不存明文，只显示打码预览与 sha256 摘要；点行可展开完整对照。</p>
         <div class="table-wrap">
-          <table class="list" id="logList"></table>
+          <table class="list log-table">
+            <thead><tr>
+              <th class="col-time">时间</th>
+              <th class="col-type">类型</th>
+              <th class="col-req">请求</th>
+              <th class="col-model">模型</th>
+              <th class="col-stat">脱敏 / 还原</th>
+              <th class="col-items">命中明细（原文 → 占位符）</th>
+              <th class="col-ms">耗时</th>
+            </tr></thead>
+            <tbody id="logList"></tbody>
+          </table>
         </div>
       </div>
     </section>
@@ -141,7 +152,16 @@
         </div>
         <p class="hint">被动检测：错误泄露 / 换芯 / 工具重写 / 流异常 / 响应投毒 / 跨请求污染 / 凭据回流 / 危险命令。</p>
         <div class="table-wrap">
-          <table class="list" id="auditList"></table>
+          <table class="list audit-table">
+            <thead><tr>
+              <th class="col-time">时间</th>
+              <th class="col-sev">严重度</th>
+              <th class="col-signal">信号</th>
+              <th class="col-evidence">证据</th>
+              <th class="col-req">来源</th>
+            </tr></thead>
+            <tbody id="auditList"></tbody>
+          </table>
         </div>
       </div>
     </section>

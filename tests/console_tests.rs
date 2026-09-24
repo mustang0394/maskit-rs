@@ -609,3 +609,101 @@ async fn patch_rejects_empty_path() {
         .await;
     assert_eq!(s, StatusCode::BAD_REQUEST, "空路径必须拒绝");
 }
+
+/// 回归：日志/审计表曾是**空壳 table**（`<table id="logList">` 里没有 thead），
+/// JS 直接往 table 塞 `<tr><td>` —— 7 列数据全无表头，用户看到一堆无法解读的
+/// 单元格，表现为「列表不显示内容」。
+#[tokio::test]
+async fn log_and_audit_tables_have_headers() {
+    let h = Harness::new();
+    let (s, body) = h.req("GET", "/console", false, None).await;
+    assert_eq!(s, StatusCode::OK);
+    let html = String::from_utf8_lossy(&body);
+    // 渲染目标必须是 tbody（而不是裸 table），thead 必须给出列名
+    assert!(
+        html.contains(r#"<tbody id="logList">"#),
+        "日志表渲染目标应为 tbody，不能是裸 table"
+    );
+    assert!(
+        html.contains(r#"<tbody id="auditList">"#),
+        "审计表渲染目标应为 tbody"
+    );
+    for (tbl, cols) in [
+        (
+            "log-table",
+            vec![
+                "时间",
+                "类型",
+                "请求",
+                "模型",
+                "脱敏 / 还原",
+                "命中明细",
+                "耗时",
+            ],
+        ),
+        (
+            "audit-table",
+            vec!["时间", "严重度", "信号", "证据", "来源"],
+        ),
+    ] {
+        assert!(html.contains(tbl), "缺少 {tbl} 样式钩子");
+        // 取该表 thead 片段，校验列名齐全
+        let at = html.find(tbl).expect(tbl);
+        let head = &html[at..at + 900];
+        let thead = head
+            .split("<thead>")
+            .nth(1)
+            .and_then(|s| s.split("</thead>").next());
+        let thead = thead.unwrap_or("");
+        for c in cols {
+            assert!(thead.contains(c), "{tbl} 表头缺少列「{c}」");
+        }
+    }
+    // colspan 必须与列数一致，否则空态会错位
+    let js = {
+        let (_, b) = h.req("GET", "/console/app.js", false, None).await;
+        String::from_utf8_lossy(&b).to_string()
+    };
+    assert!(
+        js.contains(r#"colspan="7""#) && js.contains(r#"colspan="5""#),
+        "空态 colspan 必须覆盖各自列数"
+    );
+}
+
+/// 回归：日志明细必须同时展示**原文**与**占位符（加密后）**。
+/// 此前 JS 只取 `it.preview`（打码预览），且字段名用错 —— 后端序列化成
+/// `tok`（serde rename），JS 从未读取，导致两个关键值都不显示。
+#[tokio::test]
+async fn log_items_show_original_and_placeholder() {
+    let h = Harness::new();
+    let (_, b) = h.req("GET", "/console/app.js", false, None).await;
+    let js = String::from_utf8_lossy(&b);
+    // 必须读 tok（并兼容 token）
+    assert!(
+        js.contains("it.tok || it.token"),
+        "渲染必须读取后端序列化的 tok 字段"
+    );
+    // 必须有原文 → 占位符的对照结构
+    assert!(
+        js.contains("item-src") && js.contains("item-tok"),
+        "缺少原文/占位符对照元素"
+    );
+    assert!(
+        js.contains("itemSource"),
+        "必须实现原文取值（凭据类回退到预览）"
+    );
+    // 不能再被 preview 短路掉原文
+    assert!(
+        !js.contains("it.preview || it.original"),
+        "原文不得被 preview 短路"
+    );
+    // 详情视图要回源 /logs/detail
+    assert!(js.contains("/logs/detail?id="), "详情视图必须回源单条事件");
+    assert!(js.contains("renderLogDetail"), "详情渲染函数缺失");
+    // 统计字段要真的渲染出来（此前 count/restored 压根没用）
+    for f in ["e.count", "e.restored", "e.unresolved", "e.degraded"] {
+        assert!(js.contains(f), "统计字段 {f} 未被渲染");
+    }
+    // 凭据类要显式说明「不存明文」，而不是留空让人以为坏了
+    assert!(js.contains("不存明文"), "凭据类应显式说明无明文");
+}

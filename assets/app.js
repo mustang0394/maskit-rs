@@ -361,30 +361,135 @@
   });
 
   /* ---------------- 日志 ---------------- */
+  let logRows = [];        // 列表数据缓存，供详情展开复用
+  let openLogId = null;    // 当前展开的事件 id
+
   async function loadLogs() {
     const f = $('logFilter').value;
     const data = await api('/logs?limit=200' + (f ? '&event_type=' + f : ''));
-    const evs = data.events || [];
-    $('logList').innerHTML = evs.length ? evs.map(renderLogRow).join('')
-      : '<tr><td class="empty">暂无事件</td></tr>';
+    logRows = data.events || [];
+    $('logList').innerHTML = logRows.length
+      ? logRows.map(renderLogRow).join('')
+      : '<tr><td colspan="7" class="empty">暂无事件</td></tr>';
   }
   loaders.logs = loadLogs;
 
+  /** 凭据类：original 恒空（红线），退而显示打码预览 + 摘要 */
+  function itemSource(it) {
+    if (it.original) return esc(it.original);
+    if (it.preview) return `<span class="item-redacted" title="凭据类不存明文">${esc(it.preview)}</span>`;
+    return '<span class="hint">—</span>';
+  }
+
+  /** 单条命中：原文 → 占位符（这就是「加密后的字符串」） */
+  function renderItem(it) {
+    // 后端序列化名是 `tok`（serde rename），不是 `token`
+    const tok = it.tok || it.token || '';
+    const tail = [
+      it.length ? `<span class="hint">${it.length} 位</span>` : '',
+      it.digest ? `<span class="hint mono" title="sha256 摘要">#${esc(String(it.digest).slice(0, 8))}</span>` : '',
+    ].filter(Boolean).join(' ');
+    return `<div class="item">
+      <span class="item-label">${it.cred ? '<span class="lock" title="凭据类">🔒</span>' : ''}${esc(it.label)}</span>
+      <span class="item-src mono">${itemSource(it)}</span>
+      <span class="item-arrow">→</span>
+      <span class="item-tok mono">${tok ? esc(tok) : '<span class="hint">—</span>'}</span>
+      ${tail ? `<span class="item-meta">${tail}</span>` : ''}
+    </div>`;
+  }
+
   function renderLogRow(e) {
     const t = String(e.type || '');
-    const items = (e.items || []).map(it =>
-      `<div>${it.cred ? '🔒 ' : ''}${esc(it.label)}: <span class="mono">${esc(it.preview || it.original || '')}</span>${
-        it.digest ? ' <span class="hint">sha256:' + esc(it.digest.slice(0, 8)) + '</span>' : ''}</div>`).join('');
-    const timing = e.mask_ms != null ? `<span class="hint">脱敏 ${Number(e.mask_ms).toFixed(1)}ms</span>` : '';
-    return `<tr>
-      <td class="mono">${esc(fmtTs(e.ts))}</td>
-      <td><span class="badge ${esc(t)}">${esc(t)}</span></td>
-      <td class="mono">${esc(e.method)} ${esc(e.path)}</td>
-      <td>${esc(e.protocol || '')}${e.unknown_shape ? ' <span class="hint">未知形态</span>' : ''}</td>
-      <td class="mono">${esc(e.model || '')}</td>
-      <td>${timing}${e.unresolved ? ` <span class="hint">未还原 ${e.unresolved}</span>` : ''}</td>
-      <td>${items || `<span class="hint">${esc(e.reason || '')}</span>`}</td>
-    </tr>`;
+    const items = e.items || [];
+    // 统计：count=命中数 restored=还原数，其余为异常计数
+    const stat = [];
+    if (e.count) stat.push(`<span class="st st-mask">脱敏 ${e.count}</span>`);
+    if (e.restored) stat.push(`<span class="st st-restore">还原 ${e.restored}</span>`);
+    if (e.unresolved) stat.push(`<span class="st st-warn">未还原 ${e.unresolved}</span>`);
+    if (e.degraded) stat.push(`<span class="st st-deg">容错 ${e.degraded}</span>`);
+    const flags = [];
+    if (e.stream_mode) {
+      const actual = e.stream_actual || 'whole';
+      const bad = actual !== e.stream_mode;
+      flags.push(`<span class="hint${bad ? ' st-warn' : ''}" title="声明流式 ${esc(e.stream_mode)} / 实际 ${esc(actual)}">${bad ? '流式不符 ' : ''}${esc(e.stream_mode)}</span>`);
+    }
+    if (e.unknown_shape) flags.push('<span class="st-warn">未知形态</span>');
+    if (e.status >= 400) flags.push(`<span class="st-warn">${e.status}</span>`);
+    if (e.req_bytes) flags.push(`<span class="hint">↑${e.req_bytes}</span>`);
+
+    return `<tr class="log-row${openLogId === e.id ? ' open' : ''}" data-log-id="${e.id}">
+      <td class="col-time mono">${esc(fmtTs(e.ts))}</td>
+      <td class="col-type"><span class="badge ${esc(t)}">${esc(t)}</span></td>
+      <td class="col-req"><span class="path mono">${esc(e.method)} ${esc(e.path)}</span>
+        ${flags.length ? `<div class="row-flags">${flags.join(' ')}</div>` : ''}</td>
+      <td class="col-model mono">${esc(e.model || '—')}</td>
+      <td class="col-stat">${stat.join(' ') || '<span class="hint">—</span>'}</td>
+      <td class="col-items">${items.length
+          ? `<div class="item-list">${items.map(renderItem).join('')}</div>`
+          : `<span class="hint">${esc(e.reason || e.message || '无命中')}</span>`}</td>
+      <td class="col-ms mono">${e.mask_ms != null ? esc(Number(e.mask_ms).toFixed(1)) + 'ms' : '—'}</td>
+    </tr>
+    <tr class="log-detail" data-detail-for="${e.id}" hidden><td colspan="7"><div class="detail-box">加载中…</div></td></tr>`;
+  }
+
+  // 点行展开详情（回源 /logs/detail，与 Python 的详情弹窗同源）
+  $('logList').addEventListener('click', async ev => {
+    const tr = ev.target.closest('tr.log-row');
+    if (!tr) return;
+    const id = Number(tr.dataset.logId);
+    const box = document.querySelector(`tr.log-detail[data-detail-for="${id}"] td`);
+    if (openLogId === id) {           // 再次点击收起
+      box.parentElement.hidden = true;
+      tr.classList.remove('open');
+      openLogId = null;
+      return;
+    }
+    // 先把之前展开的收起来
+    if (openLogId !== null) {
+      const prev = document.querySelector(`tr.log-detail[data-detail-for="${openLogId}"]`);
+      if (prev) prev.hidden = true;
+      const prevRow = document.querySelector(`tr.log-row[data-log-id="${openLogId}"]`);
+      if (prevRow) prevRow.classList.remove('open');
+    }
+    openLogId = id;
+    tr.classList.add('open');
+    box.parentElement.hidden = false;
+    box.innerHTML = '<div class="detail-box hint">加载中…</div>';
+    try {
+      const d = await api('/logs/detail?id=' + id);
+      box.innerHTML = renderLogDetail(d);
+    } catch (e) {
+      box.innerHTML = `<div class="detail-box hint">详情加载失败：${esc(e.message)}</div>`;
+    }
+  });
+
+  function renderLogDetail(d) {
+    const e = d.event || d;
+    const parts = [];
+    if (e.message || e.reason) {
+      parts.push(`<div class="detail-note">${esc(e.message || e.reason)}</div>`);
+    }
+    if ((e.unresolved_samples || []).length) {
+      parts.push(`<div class="detail-note">未还原占位符：<span class="mono">${e.unresolved_samples.map(esc).join('、')}</span></div>`);
+    }
+    if ((e.items || []).length) {
+      parts.push(`<div class="detail-section">对照明细
+        <table class="cmp"><thead><tr>
+          <th>类型</th><th>原文</th><th>预览</th><th>占位符（加密后）</th><th>摘要 / 长度</th>
+        </tr></thead><tbody>${e.items.map(it => `<tr>
+          <td class="mono">${it.cred ? '🔒 ' : ''}${esc(it.label)}</td>
+          <td class="mono cmp-orig">${it.original ? esc(it.original) : '<span class="hint">不存明文</span>'}</td>
+          <td class="mono hint">${esc(it.preview || '—')}</td>
+          <td class="mono cmp-tok">${esc(it.tok || it.token || '—')}</td>
+          <td class="mono hint">${it.digest ? 'sha256:' + esc(String(it.digest).slice(0, 12)) : (it.hash || '—')}${it.length ? ' · ' + it.length + '位' : ''}</td>
+        </tr>`).join('')}</tbody></table></div>`);
+    }
+    if (e.dialog) {
+      parts.push(`<div class="detail-section">${e.type === 'MASK' ? '用户消息原文' : '助手回复原文'}
+        <pre class="detail-pre">${esc(e.dialog)}</pre></div>`);
+    }
+    if (!parts.length) parts.push('<div class="detail-box hint">无更多详情</div>');
+    return parts.join('');
   }
   $('btnRefreshLogs').addEventListener('click', () => loadLogs().catch(e => toast(e.message, true)));
   $('logFilter').addEventListener('change', () => loadLogs().catch(e => toast(e.message, true)));
@@ -398,13 +503,13 @@
   async function loadAudit() {
     const data = await api('/audit/events?limit=200');
     const evs = data.events || [];
-    $('auditList').innerHTML = evs.length ? evs.map(a => `<tr>
-      <td class="mono">${esc(fmtTs(a.ts))}</td>
-      <td class="sev-${esc(a.severity)}">${esc(a.severity)}</td>
-      <td class="mono">${esc(a.signal_type)}</td>
-      <td>${esc(a.evidence)}</td>
-      <td class="mono hint">${esc(a.method)} ${esc(a.path)}</td>
-    </tr>`).join('') : '<tr><td class="empty">暂无审计事件</td></tr>';
+    $('auditList').innerHTML = evs.length ? evs.map(a => `<tr class="audit-row">
+      <td class="col-time mono">${esc(fmtTs(a.ts))}</td>
+      <td class="col-sev"><span class="sev sev-${esc(a.severity)}">${esc(a.severity)}</span></td>
+      <td class="col-signal mono">${esc(a.signal_type)}</td>
+      <td class="col-evidence">${esc(a.evidence || '—')}</td>
+      <td class="col-req"><span class="path mono">${esc(a.method || '')} ${esc(a.path || '')}</span></td>
+    </tr>`).join('') : '<tr><td colspan="5" class="empty">暂无审计事件</td></tr>';
   }
   loaders.audit = loadAudit;
   $('btnRefreshAudit').addEventListener('click', () => loadAudit().catch(e => toast(e.message, true)));
