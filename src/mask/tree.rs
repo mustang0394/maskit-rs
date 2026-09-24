@@ -8,8 +8,8 @@ use serde_json::{Map, Value};
 
 use super::engine::{restore_final, MaskCtx, RestoreStats};
 use super::exemptions::{
-    business_keys, protected_key_names, skip_numeric_keys, skip_subtree_keys, ROOT_WRAP_KEY,
-    MASK_MAX_DEPTH,
+    business_keys, protected_key_names, skip_numeric_keys, skip_subtree_keys, MASK_MAX_DEPTH,
+    ROOT_WRAP_KEY,
 };
 use super::placeholder;
 use super::session::SessionStore;
@@ -31,7 +31,10 @@ pub struct ParsedBody {
 pub fn load_json_pairs(text: &str) -> Option<ParsedBody> {
     let value: Value = serde_json::from_str(text).ok()?;
     let has_dup = detect_duplicate_keys(text);
-    Some(ParsedBody { value, has_dup_keys: has_dup })
+    Some(ParsedBody {
+        value,
+        has_dup_keys: has_dup,
+    })
 }
 
 /// 检测 JSON 文本中的重复键（任意层级）。
@@ -229,7 +232,11 @@ pub fn mask_tree(
         }
         Value::Object(map) => {
             // 协议元数据对象整棵跳过
-            if !in_business && key.map(|k| skip_subtree_keys().contains(k)).unwrap_or(false) {
+            if !in_business
+                && key
+                    .map(|k| skip_subtree_keys().contains(k))
+                    .unwrap_or(false)
+            {
                 return Ok(obj.clone());
             }
             let mut out = Map::new();
@@ -289,9 +296,7 @@ pub fn restore_tree(
             for (k, v) in map {
                 let escape = super::exemptions::json_str_keys().contains(k.as_str());
                 let restored = match v {
-                    Value::String(s) => {
-                        Value::String(restore_final(s, sid, escape, store, stats))
-                    }
+                    Value::String(s) => Value::String(restore_final(s, sid, escape, store, stats)),
                     other => restore_tree(other, sid, store, stats, depth + 1),
                 };
                 out.insert(k.clone(), restored);
@@ -312,7 +317,10 @@ pub const SPLICE_MAX_FORMS: usize = 128;
 /// 在原始字节上就地替换被脱敏的原文（保住客户端排版/转义风格）。
 ///
 /// 调用方**必须**校验 `json.loads(结果) == masked_root`，不过就退回重序列化。
-pub fn splice_mask(raw: &[u8], pairs: &std::collections::HashMap<String, String>) -> Option<Vec<u8>> {
+pub fn splice_mask(
+    raw: &[u8],
+    pairs: &std::collections::HashMap<String, String>,
+) -> Option<Vec<u8>> {
     if pairs.is_empty() || raw.is_empty() || raw.len() > SPLICE_MAX {
         return None;
     }
@@ -433,7 +441,10 @@ pub fn mask_body(raw: &[u8], ctx: &MaskCtx<'_>) -> Result<MaskedBody, String> {
             body_shape: None,
         });
     };
-    let ParsedBody { value, has_dup_keys } = parsed;
+    let ParsedBody {
+        value,
+        has_dup_keys,
+    } = parsed;
     let root_is_object = value.is_object();
     let mut body = if root_is_object {
         value.clone()
@@ -536,7 +547,11 @@ fn serialize_compact(v: &Value, ascii: bool) -> String {
                 let cp = c as u32;
                 if cp > 0xFFFF {
                     let v2 = cp - 0x10000;
-                    out.push_str(&format!("\\u{:04x}\\u{:04x}", 0xD800 + (v2 >> 10), 0xDC00 + (v2 & 0x3FF)));
+                    out.push_str(&format!(
+                        "\\u{:04x}\\u{:04x}",
+                        0xD800 + (v2 >> 10),
+                        0xDC00 + (v2 & 0x3FF)
+                    ));
                 } else {
                     out.push_str(&format!("\\u{cp:04x}"));
                 }
@@ -565,7 +580,10 @@ pub fn first_diff_byte(a: &[u8], b: &[u8]) -> isize {
 
 /// 从请求体提取 model（对齐 `_extract_model`）。
 pub fn extract_model(body: &Value) -> String {
-    body.get("model").and_then(Value::as_str).unwrap_or("").to_string()
+    body.get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string()
 }
 
 /// 响应侧 PII 扫描所需的占位符集合（对齐 `_seed_known` 语义的辅助）。
@@ -653,11 +671,16 @@ mod tests {
     #[test]
     fn mask_body_splice_preserves_layout() {
         let c = Ctx2::new(&[("张三", "NAME")]);
-        let raw = r#"{"model": "gpt-4o", "messages": [{"role": "user", "content": "我叫张三，请看看"}]}"#.as_bytes();
+        let raw =
+            r#"{"model": "gpt-4o", "messages": [{"role": "user", "content": "我叫张三，请看看"}]}"#
+                .as_bytes();
         let out = c.mask_body(raw);
         assert!(out.changed);
         assert!(!out.reserialized, "应走字节级 splice");
-        assert!(out.text.contains(r#"": ""#), "客户端排版（冒号后空格）必须保留");
+        assert!(
+            out.text.contains(r#"": ""#),
+            "客户端排版（冒号后空格）必须保留"
+        );
         assert!(!out.text.contains("张三"), "原文脱敏");
         assert!(out.text.contains("{{NAME_"), "签发占位符");
         // 首个差异位正好在被脱敏的值上
@@ -665,7 +688,10 @@ mod tests {
             .windows("张三".len())
             .position(|w| w == "张三".as_bytes())
             .unwrap();
-        assert_eq!(out.first_diff_byte as usize, anchor, "只允许被脱敏的那一段变化");
+        assert_eq!(
+            out.first_diff_byte as usize, anchor,
+            "只允许被脱敏的那一段变化"
+        );
     }
 
     #[test]
@@ -687,7 +713,11 @@ mod tests {
         let out = c.mask_body(raw);
         assert!(!out.text.contains("13812345678"), "键名脱敏（B2）");
         let v: Value = serde_json::from_str(&out.text).unwrap();
-        assert!(v.as_object().unwrap().keys().any(|k| k.contains("{{PHONE_")));
+        assert!(v
+            .as_object()
+            .unwrap()
+            .keys()
+            .any(|k| k.contains("{{PHONE_")));
     }
 
     #[test]
@@ -719,12 +749,17 @@ mod tests {
         let raw = r#"{"messages":[{"role":"user","content":"hi"},{"role":"assistant","tool_calls":[{"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{\"name\":\"张三\",\"phone\":\"13812345678\"}"}}]}]}"#.as_bytes();
         let out = c.mask_body(raw);
         let v: Value = serde_json::from_str(&out.text).unwrap();
-        let args = v["messages"][1]["tool_calls"][0]["function"]["arguments"].as_str().unwrap();
+        let args = v["messages"][1]["tool_calls"][0]["function"]["arguments"]
+            .as_str()
+            .unwrap();
         assert!(!args.contains("张三"), "工具参数业务区必须脱敏");
         assert!(!args.contains("13812345678"));
         // 协议字段保留
         assert_eq!(v["messages"][1]["tool_calls"][0]["id"], "call_1");
-        assert_eq!(v["messages"][1]["tool_calls"][0]["function"]["name"], "lookup");
+        assert_eq!(
+            v["messages"][1]["tool_calls"][0]["function"]["name"],
+            "lookup"
+        );
     }
 
     #[test]
@@ -733,8 +768,17 @@ mod tests {
         let raw = r#"{"system":[{"type":"text","text":"我的手机号13812345678","cache_control":{"type":"ephemeral"}}],"messages":[{"role":"user","content":"hi"}]}"#.as_bytes();
         let out = c.mask_body(raw);
         let v: Value = serde_json::from_str(&out.text).unwrap();
-        assert_eq!(v["system"][0]["cache_control"]["type"], "ephemeral", "协议元数据整棵跳过");
-        assert!(!v["system"][0]["text"].as_str().unwrap().contains("13812345678"), "同一块正文照常脱敏");
+        assert_eq!(
+            v["system"][0]["cache_control"]["type"], "ephemeral",
+            "协议元数据整棵跳过"
+        );
+        assert!(
+            !v["system"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("13812345678"),
+            "同一块正文照常脱敏"
+        );
     }
 
     #[test]
@@ -742,7 +786,10 @@ mod tests {
         let c = Ctx2::new(&[("张三", "NAME")]);
         let raw = r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"response_format":{"type":"json_schema","json_schema":{"name":"r","schema":{"type":"object","properties":{"owner":{"enum":["张三"]}}}}}}"#.as_bytes();
         let out = c.mask_body(raw);
-        assert!(!out.text.contains("张三"), "response_format 内业务取值仍须脱敏（反向锁）");
+        assert!(
+            !out.text.contains("张三"),
+            "response_format 内业务取值仍须脱敏（反向锁）"
+        );
     }
 
     #[test]
@@ -773,7 +820,8 @@ mod tests {
     #[test]
     fn restore_tree_masks_and_restores() {
         let c = Ctx2::new(&[("张三", "NAME")]);
-        let raw = r#"{"model":"gpt-4o","messages":[{"role":"user","content":"客户张三"}]}"#.as_bytes();
+        let raw =
+            r#"{"model":"gpt-4o","messages":[{"role":"user","content":"客户张三"}]}"#.as_bytes();
         let masked = c.mask_body(raw);
         let v: Value = serde_json::from_str(&masked.text).unwrap();
         let mut stats = RestoreStats::default();
@@ -796,7 +844,9 @@ mod tests {
         let v = json!({"tool_calls": [{"function": {"arguments": args}}]});
         let mut stats = RestoreStats::default();
         let restored = restore_tree(&v, "j", &c.store, &mut stats, 0);
-        let out_args = restored["tool_calls"][0]["function"]["arguments"].as_str().unwrap();
+        let out_args = restored["tool_calls"][0]["function"]["arguments"]
+            .as_str()
+            .unwrap();
         let parsed: Value = serde_json::from_str(out_args).unwrap();
         assert_eq!(parsed["name"], "张\"三", "JSON 字符串字段还原必须转义");
     }

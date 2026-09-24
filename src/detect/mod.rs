@@ -102,7 +102,10 @@ fn first_role_valid(obj: &serde_json::Map<String, Value>) -> bool {
         return false;
     };
     match first.get("role").and_then(Value::as_str) {
-        Some(r) => matches!(r, "user" | "assistant" | "system" | "tool" | "function" | "developer"),
+        Some(r) => matches!(
+            r,
+            "user" | "assistant" | "system" | "tool" | "function" | "developer"
+        ),
         None => false,
     }
 }
@@ -126,17 +129,26 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}],
             "stream": true
         });
-        assert_eq!(detect_protocol("/anything/at/all", Some(&body)), Protocol::ChatCompletions);
+        assert_eq!(
+            detect_protocol("/anything/at/all", Some(&body)),
+            Protocol::ChatCompletions
+        );
         assert!(is_stream_request(Some(&body)));
     }
 
     #[test]
     fn chat_completions_by_path_fallback() {
         let body = json!({"model": "gpt-4o", "prompt": "hi"});
-        assert_eq!(detect_protocol("/v1/chat/completions", Some(&body)), Protocol::ChatCompletions);
+        assert_eq!(
+            detect_protocol("/v1/chat/completions", Some(&body)),
+            Protocol::ChatCompletions
+        );
         // 老式 completions
         let body2 = json!({"prompt": "hi"});
-        assert_eq!(detect_protocol("/v1/completions", Some(&body2)), Protocol::ChatCompletions);
+        assert_eq!(
+            detect_protocol("/v1/completions", Some(&body2)),
+            Protocol::ChatCompletions
+        );
     }
 
     #[test]
@@ -146,9 +158,15 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}],
             "max_tokens": 100
         });
-        assert_eq!(detect_protocol("/v1/messages", Some(&body)), Protocol::Anthropic);
+        assert_eq!(
+            detect_protocol("/v1/messages", Some(&body)),
+            Protocol::Anthropic
+        );
         // anthropic_version 是最强信号：即使 path 不含 /messages
-        assert_eq!(detect_protocol("/v1/anything", Some(&body)), Protocol::Anthropic);
+        assert_eq!(
+            detect_protocol("/v1/anything", Some(&body)),
+            Protocol::Anthropic
+        );
     }
 
     #[test]
@@ -159,9 +177,15 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}],
             "max_tokens": 100
         });
-        assert_eq!(detect_protocol("/v1/messages", Some(&body)), Protocol::Anthropic);
+        assert_eq!(
+            detect_protocol("/v1/messages", Some(&body)),
+            Protocol::Anthropic
+        );
         // path 不含 /messages → 不识别（body 形态与 ChatCompletions 太像，靠 path 区分）
-        assert_eq!(detect_protocol("/v1/chat/completions", Some(&body)), Protocol::ChatCompletions);
+        assert_eq!(
+            detect_protocol("/v1/chat/completions", Some(&body)),
+            Protocol::ChatCompletions
+        );
     }
 
     #[test]
@@ -171,7 +195,10 @@ mod tests {
             "messages": [{"role": "weird", "content": "hi"}],
             "max_tokens": 1
         });
-        assert_eq!(detect_protocol("/v1/messages", Some(&body)), Protocol::Unknown);
+        assert_eq!(
+            detect_protocol("/v1/messages", Some(&body)),
+            Protocol::Unknown
+        );
     }
 
     #[test]
@@ -181,27 +208,42 @@ mod tests {
             "input": "tell me a joke",
             "stream": false
         });
-        assert_eq!(detect_protocol("/v1/responses", Some(&body)), Protocol::Responses);
+        assert_eq!(
+            detect_protocol("/v1/responses", Some(&body)),
+            Protocol::Responses
+        );
         // input 数组形态
         let body2 = json!({
             "model": "gpt-4o",
             "input": [{"type": "message", "role": "user", "content": "hi"}]
         });
-        assert_eq!(detect_protocol("/weird/path", Some(&body2)), Protocol::Responses);
+        assert_eq!(
+            detect_protocol("/weird/path", Some(&body2)),
+            Protocol::Responses
+        );
     }
 
     #[test]
     fn responses_with_instructions() {
         let body = json!({"instructions": "be brief", "input": []});
-        assert_eq!(detect_protocol("/v1/responses", Some(&body)), Protocol::Responses);
+        assert_eq!(
+            detect_protocol("/v1/responses", Some(&body)),
+            Protocol::Responses
+        );
     }
 
     #[test]
     fn unknown_shapes() {
         // 无 body
-        assert_eq!(detect_protocol("/v1/chat/completions", None), Protocol::Unknown);
+        assert_eq!(
+            detect_protocol("/v1/chat/completions", None),
+            Protocol::Unknown
+        );
         // 非对象根
-        assert_eq!(detect_protocol("/", Some(&json!([1, 2, 3]))), Protocol::Unknown);
+        assert_eq!(
+            detect_protocol("/", Some(&json!([1, 2, 3]))),
+            Protocol::Unknown
+        );
         // 空对象
         assert_eq!(detect_protocol("/", Some(&json!({}))), Protocol::Unknown);
         // messages 为空数组（不认）
@@ -219,7 +261,10 @@ mod tests {
             "contents": [{"parts": [{"text": "hi"}]}],
             "generationConfig": {"maxOutputTokens": 100}
         });
-        assert_eq!(detect_protocol("/v1beta/models/gemini:generateContent", Some(&body)), Protocol::Unknown);
+        assert_eq!(
+            detect_protocol("/v1beta/models/gemini:generateContent", Some(&body)),
+            Protocol::Unknown
+        );
     }
 
     #[test]
@@ -233,7 +278,10 @@ mod tests {
                 {"role": "tool", "tool_call_id": "call_1", "content": "a.txt"}
             ]
         });
-        assert_eq!(detect_protocol("/v1/chat/completions", Some(&body)), Protocol::ChatCompletions);
+        assert_eq!(
+            detect_protocol("/v1/chat/completions", Some(&body)),
+            Protocol::ChatCompletions
+        );
     }
 
     #[test]
@@ -245,14 +293,20 @@ mod tests {
                 {"type": "function_call_output", "call_id": "call_1", "output": "a.txt"}
             ]
         });
-        assert_eq!(detect_protocol("/v1/responses", Some(&body)), Protocol::Responses);
+        assert_eq!(
+            detect_protocol("/v1/responses", Some(&body)),
+            Protocol::Responses
+        );
     }
 
     /// D6 关键断言：Unknown 不等于「透传」。此处只验证 detect 的输出；
     /// 「Unknown + fail_closed 仍整棵脱敏」的端到端断言在 M6 管线测试。
     #[test]
     fn unknown_is_just_a_channel_marker() {
-        assert_eq!(detect_protocol("/", Some(&json!({"text": "任意内容"}))), Protocol::Unknown);
+        assert_eq!(
+            detect_protocol("/", Some(&json!({"text": "任意内容"}))),
+            Protocol::Unknown
+        );
         assert_eq!(Protocol::Unknown.as_str(), "unknown");
     }
 }

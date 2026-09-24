@@ -89,9 +89,8 @@ pub fn suffix_indexable(suffix: &str) -> bool {
 
 /// 严格完整占位符正则（`_PLACEHOLDER_RX`）。
 pub fn placeholder_rx() -> &'static Regex {
-    static RX: Lazy<Regex> = Lazy::new(|| {
-        Regex::new(&format!(r"\{{\{{[A-Z0-9]{{1,12}}_{SUFFIX_PAT}\}}\}}")).unwrap()
-    });
+    static RX: Lazy<Regex> =
+        Lazy::new(|| Regex::new(&format!(r"\{{\{{[A-Z0-9]{{1,12}}_{SUFFIX_PAT}\}}\}}")).unwrap());
     &RX
 }
 
@@ -162,7 +161,11 @@ pub fn parse_canonical(token: &str) -> Option<(String, String)> {
 
 /// 归一化 token：`{{LABEL_suffix}}`（label 大写、suffix 小写）。
 pub fn canonicalize(label_raw: &str, suffix: &str) -> String {
-    format!("{{{{{}_{}}}}}", safe_label(label_raw), suffix.to_lowercase())
+    format!(
+        "{{{{{}_{}}}}}",
+        safe_label(label_raw),
+        suffix.to_lowercase()
+    )
 }
 
 #[cfg(test)]
@@ -247,7 +250,10 @@ mod tests {
         let b = placeholder_rx() as *const Regex;
         assert_eq!(a, b, "placeholder_rx 必须返回同一实例");
         assert_eq!(partial_rx() as *const Regex, partial_rx() as *const Regex);
-        assert_eq!(loose_placeholder_rx() as *const Regex, loose_placeholder_rx() as *const Regex);
+        assert_eq!(
+            loose_placeholder_rx() as *const Regex,
+            loose_placeholder_rx() as *const Regex
+        );
         // 1000 次调用应远快于 1000 次编译（编译约 10µs 级 → 10ms）
         let t0 = std::time::Instant::now();
         for _ in 0..10_000 {

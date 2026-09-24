@@ -138,7 +138,12 @@ impl Harness {
         let upstream = Arc::new(UpstreamClient::new_or_placeholder(&center.get().upstream));
         let bus = EventBus::new();
         let state = Arc::new(AppState::new(center, bus, upstream, None));
-        Harness { state, mock, _mock_handle: handle, _dir: dir }
+        Harness {
+            state,
+            mock,
+            _mock_handle: handle,
+            _dir: dir,
+        }
     }
 
     fn bus(&self) -> &EventBus {
@@ -146,13 +151,7 @@ impl Harness {
     }
 
     /// 发一个请求，返回 (状态码, 响应体)。
-    async fn send(
-        &self,
-        method: &str,
-        path: &str,
-        ct: &str,
-        body: &str,
-    ) -> (StatusCode, Vec<u8>) {
+    async fn send(&self, method: &str, path: &str, ct: &str, body: &str) -> (StatusCode, Vec<u8>) {
         let app = build_router(self.state.clone());
         let req = Request::builder()
             .method(method)
@@ -187,7 +186,9 @@ async fn matrix_no_upstream_configured() {
         .method("POST")
         .uri("/v1/chat/completions")
         .header("content-type", "application/json")
-        .body(Body::from(format!(r#"{{"messages":[{{"role":"user","content":"{SENTINEL_PHONE}"}}]}}"#)))
+        .body(Body::from(format!(
+            r#"{{"messages":[{{"role":"user","content":"{SENTINEL_PHONE}"}}]}}"#
+        )))
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
@@ -219,7 +220,9 @@ async fn matrix_readonly_methods_pass() {
 async fn matrix_delete_goes_through_pipeline() {
     let h = Harness::new(true, false, true).await;
     let body = format!(r#"{{"messages":[{{"role":"user","content":"{SENTINEL_PHONE}"}}]}}"#);
-    let (status, _) = h.send("DELETE", "/v1/chat/completions", "application/json", &body).await;
+    let (status, _) = h
+        .send("DELETE", "/v1/chat/completions", "application/json", &body)
+        .await;
     assert_eq!(status, StatusCode::OK);
     let upstream_body = String::from_utf8_lossy(&h.mock.last_body().unwrap()).to_string();
     assert!(!upstream_body.contains(SENTINEL_PHONE), "DELETE 也必须脱敏");
@@ -230,13 +233,18 @@ async fn matrix_delete_goes_through_pipeline() {
 async fn matrix_paused_passes_through() {
     let h = Harness::new(true, false, false).await; // mask.enabled=false
     let body = format!(r#"{{"messages":[{{"role":"user","content":"{SENTINEL_PHONE}"}}]}}"#);
-    let (status, _) = h.send("POST", "/v1/chat/completions", "application/json", &body).await;
+    let (status, _) = h
+        .send("POST", "/v1/chat/completions", "application/json", &body)
+        .await;
     assert_eq!(status, StatusCode::OK, "暂停时必须透传而非 503");
     let ev = h.bus().recent(1);
     assert_eq!(ev[0].reason, "filter_disabled");
     // 暂停语义：原文照常上行（这是「关闭脱敏」的明确语义）
     let upstream_body = String::from_utf8_lossy(&h.mock.last_body().unwrap()).to_string();
-    assert!(upstream_body.contains(SENTINEL_PHONE), "关闭脱敏后原文透传是预期行为");
+    assert!(
+        upstream_body.contains(SENTINEL_PHONE),
+        "关闭脱敏后原文透传是预期行为"
+    );
 }
 
 /// 行 5：body 超 32MiB → 413（不看 fail_closed）。
@@ -248,7 +256,9 @@ async fn matrix_body_too_large() {
         r#"{{"messages":[{{"role":"user","content":"{}"}}]}}"#,
         "x".repeat(33 * 1024 * 1024)
     );
-    let (status, _) = h.send("POST", "/v1/chat/completions", "application/json", &big).await;
+    let (status, _) = h
+        .send("POST", "/v1/chat/completions", "application/json", &big)
+        .await;
     assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
     let ev = h.bus().recent(1);
     assert_eq!(ev[0].reason, "request_too_large");
@@ -260,7 +270,14 @@ async fn matrix_body_too_large() {
 #[tokio::test]
 async fn matrix_non_json_fail_closed() {
     let h = Harness::new(true, false, true).await;
-    let (status, body) = h.send("POST", "/v1/chat/completions", "multipart/form-data", "binary data").await;
+    let (status, body) = h
+        .send(
+            "POST",
+            "/v1/chat/completions",
+            "multipart/form-data",
+            "binary data",
+        )
+        .await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     assert!(String::from_utf8_lossy(&body).contains("non_json_body"));
     assert!(h.mock.requests().is_empty(), "阻断时不得上行");
@@ -270,7 +287,14 @@ async fn matrix_non_json_fail_closed() {
 #[tokio::test]
 async fn matrix_non_json_fail_open() {
     let h = Harness::new(false, false, true).await;
-    let (status, _) = h.send("POST", "/v1/chat/completions", "multipart/form-data", "binary").await;
+    let (status, _) = h
+        .send(
+            "POST",
+            "/v1/chat/completions",
+            "multipart/form-data",
+            "binary",
+        )
+        .await;
     assert_eq!(status, StatusCode::OK);
     let ev = h.bus().recent(1);
     assert_eq!(ev[0].reason, "non_json_body");
@@ -281,7 +305,12 @@ async fn matrix_non_json_fail_open() {
 async fn matrix_invalid_json_fail_closed() {
     let h = Harness::new(true, false, true).await;
     let (status, body) = h
-        .send("POST", "/v1/chat/completions", "application/json", r#"{"messages": [bad json"#)
+        .send(
+            "POST",
+            "/v1/chat/completions",
+            "application/json",
+            r#"{"messages": [bad json"#,
+        )
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "invalid_json 必须是 400");
     assert!(String::from_utf8_lossy(&body).contains("invalid_json"));
@@ -293,7 +322,12 @@ async fn matrix_invalid_json_fail_closed() {
 async fn matrix_invalid_json_fail_open() {
     let h = Harness::new(false, false, true).await;
     let (status, _) = h
-        .send("POST", "/v1/chat/completions", "application/json", r#"{"messages": [bad"#)
+        .send(
+            "POST",
+            "/v1/chat/completions",
+            "application/json",
+            r#"{"messages": [bad"#,
+        )
         .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(h.bus().recent(1)[0].reason, "invalid_json");
@@ -304,7 +338,9 @@ async fn matrix_invalid_json_fail_open() {
 async fn matrix_non_object_root_masked() {
     let h = Harness::new(true, false, true).await;
     let body = format!(r#"[{{"role":"user","content":"phone {SENTINEL_PHONE}"}}]"#);
-    let (status, _) = h.send("POST", "/v1/chat/completions", "application/json", &body).await;
+    let (status, _) = h
+        .send("POST", "/v1/chat/completions", "application/json", &body)
+        .await;
     assert_eq!(status, StatusCode::OK);
     let up = String::from_utf8_lossy(&h.mock.last_body().unwrap()).to_string();
     assert!(!up.contains(SENTINEL_PHONE), "数组根也必须整棵脱敏");
@@ -317,7 +353,9 @@ async fn matrix_unknown_shape_masked_when_fail_closed() {
     let h = Harness::new(true, false, true).await;
     // 形态不认识（无 messages/prompt/input），但落在已配置上游
     let body = format!(r#"{{"text":"联系 {SENTINEL_PHONE}"}}"#);
-    let (status, _) = h.send("POST", "/v1/some-new-endpoint", "application/json", &body).await;
+    let (status, _) = h
+        .send("POST", "/v1/some-new-endpoint", "application/json", &body)
+        .await;
     assert_eq!(status, StatusCode::OK, "脱敏后照常转发，不阻断");
     let up = String::from_utf8_lossy(&h.mock.last_body().unwrap()).to_string();
     assert!(!up.contains(SENTINEL_PHONE), "未知形态原文绝不能上行");
@@ -343,16 +381,32 @@ async fn matrix_unknown_shape_passes_when_fail_open() {
 #[tokio::test]
 async fn matrix_three_protocols_always_masked() {
     let cases = [
-        ("/v1/chat/completions", format!(r#"{{"model":"gpt-4o","messages":[{{"role":"user","content":"{SENTINEL_PHONE}"}}]}}"#)),
-        ("/v1/responses", format!(r#"{{"model":"gpt-4o","input":"{SENTINEL_PHONE}"}}"#)),
-        ("/v1/messages", format!(r#"{{"model":"claude","system":"x","max_tokens":10,"messages":[{{"role":"user","content":"{SENTINEL_PHONE}"}}]}}"#)),
+        (
+            "/v1/chat/completions",
+            format!(
+                r#"{{"model":"gpt-4o","messages":[{{"role":"user","content":"{SENTINEL_PHONE}"}}]}}"#
+            ),
+        ),
+        (
+            "/v1/responses",
+            format!(r#"{{"model":"gpt-4o","input":"{SENTINEL_PHONE}"}}"#),
+        ),
+        (
+            "/v1/messages",
+            format!(
+                r#"{{"model":"claude","system":"x","max_tokens":10,"messages":[{{"role":"user","content":"{SENTINEL_PHONE}"}}]}}"#
+            ),
+        ),
     ];
     for (path, body) in cases {
         let h = Harness::new(false, false, true).await; // fail_closed=false 也必须脱敏
         let (status, _) = h.send("POST", path, "application/json", &body).await;
         assert_eq!(status, StatusCode::OK, "{path}");
         let up = String::from_utf8_lossy(&h.mock.last_body().unwrap()).to_string();
-        assert!(!up.contains(SENTINEL_PHONE), "{path} 必须脱敏（协议识别与 fail_closed 无关）");
+        assert!(
+            !up.contains(SENTINEL_PHONE),
+            "{path} 必须脱敏（协议识别与 fail_closed 无关）"
+        );
     }
 }
 
@@ -366,7 +420,9 @@ async fn matrix_mask_pipeline_failure_blocks() {
         node = serde_json::json!({"n": node});
     }
     let body = serde_json::json!({"messages": [{"role": "user", "content": node}]}).to_string();
-    let (status, resp) = h.send("POST", "/v1/chat/completions", "application/json", &body).await;
+    let (status, resp) = h
+        .send("POST", "/v1/chat/completions", "application/json", &body)
+        .await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     assert!(String::from_utf8_lossy(&resp).contains("shield_mask_failed"));
     assert!(h.mock.requests().is_empty(), "异常时绝不放行原文上行");
@@ -376,8 +432,12 @@ async fn matrix_mask_pipeline_failure_blocks() {
 #[tokio::test]
 async fn e2e_mask_and_restore_nonstream() {
     let h = Harness::new(true, false, true).await;
-    let body = format!(r#"{{"model":"gpt-4o","messages":[{{"role":"user","content":"客户张三电话{SENTINEL_PHONE}"}}]}}"#);
-    let (status, _) = h.send("POST", "/v1/chat/completions", "application/json", &body).await;
+    let body = format!(
+        r#"{{"model":"gpt-4o","messages":[{{"role":"user","content":"客户张三电话{SENTINEL_PHONE}"}}]}}"#
+    );
+    let (status, _) = h
+        .send("POST", "/v1/chat/completions", "application/json", &body)
+        .await;
     assert_eq!(status, StatusCode::OK);
     let up = String::from_utf8_lossy(&h.mock.last_body().unwrap()).to_string();
     assert!(!up.contains(SENTINEL_PHONE));
@@ -397,8 +457,11 @@ async fn e2e_mask_and_restore_nonstream() {
 async fn credential_items_never_store_plaintext() {
     let h = Harness::new(true, false, true).await;
     let secret = "sk-1234567890abcdefghijklmnopqrst";
-    let body = format!(r#"{{"model":"gpt-4o","messages":[{{"role":"user","content":"key {secret}"}}]}}"#);
-    let (status, _) = h.send("POST", "/v1/chat/completions", "application/json", &body).await;
+    let body =
+        format!(r#"{{"model":"gpt-4o","messages":[{{"role":"user","content":"key {secret}"}}]}}"#);
+    let (status, _) = h
+        .send("POST", "/v1/chat/completions", "application/json", &body)
+        .await;
     assert_eq!(status, StatusCode::OK);
     let up = String::from_utf8_lossy(&h.mock.last_body().unwrap()).to_string();
     assert!(!up.contains(secret));
@@ -427,7 +490,9 @@ async fn upstream_unreachable_reports_error() {
         .method("POST")
         .uri("/v1/chat/completions")
         .header("content-type", "application/json")
-        .body(Body::from(r#"{"messages":[{"role":"user","content":"hi"}]}"#))
+        .body(Body::from(
+            r#"{"messages":[{"role":"user","content":"hi"}]}"#,
+        ))
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
@@ -442,7 +507,9 @@ async fn stream_session_is_released() {
     let h = Harness::new(true, false, true).await;
     // mock 上游对 stream:true 会返回 SSE
     let body = r#"{"model":"gpt-4o","stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
-    let (status, _resp) = h.send("POST", "/v1/chat/completions", "application/json", body).await;
+    let (status, _resp) = h
+        .send("POST", "/v1/chat/completions", "application/json", body)
+        .await;
     assert_eq!(status, StatusCode::OK);
     // 等流被完整消费（oneshot 会把 body 读完）
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -476,13 +543,16 @@ async fn thinking_and_tool_content_roundtrip() {
     use maskit_rs::mask::placeholder::placeholder_rx;
     let h = Harness::new(true, false, true).await;
     // 让自定义词与内置规则都生效
-    h.state.config.patch(
-        "mask.custom_words.张三",
-        serde_json::json!("人名"),
-    ).unwrap();
+    h.state
+        .config
+        .patch("mask.custom_words.张三", serde_json::json!("人名"))
+        .unwrap();
     h.state.rebuild_runtime();
     // 额外开一条内置规则
-    h.state.config.patch("mask.builtin_rules.JWT", serde_json::json!(true)).unwrap();
+    h.state
+        .config
+        .patch("mask.builtin_rules.JWT", serde_json::json!(true))
+        .unwrap();
     h.state.rebuild_runtime();
 
     // 1) 请求侧：思考历史 + 工具参数必须脱敏
@@ -494,16 +564,23 @@ async fn thinking_and_tool_content_roundtrip() {
           {"id":"call_1","type":"function",
            "function":{"name":"lookup","arguments":"{\"phone\":\"13800138000\",\"name\":\"张三\"}"}}]}
       ]}"#;
-    let (status, _) = h.send("POST", "/v1/chat/completions", "application/json", req).await;
+    let (status, _) = h
+        .send("POST", "/v1/chat/completions", "application/json", req)
+        .await;
     assert_eq!(status, StatusCode::OK);
     let up = String::from_utf8_lossy(&h.mock.last_body().unwrap()).to_string();
     assert!(!up.contains("13800138000"), "工具参数里的手机号必须脱敏");
     assert!(!up.contains("张三"), "工具参数里的自定义词必须脱敏");
     assert!(up.contains("lookup"), "协议字段 function.name 不得被改");
     // 还原：mock 只回显 messages[0].content，客户端应收到还原后的明文
-    let (_, resp) = h.send("POST", "/v1/chat/completions", "application/json", req).await;
+    let (_, resp) = h
+        .send("POST", "/v1/chat/completions", "application/json", req)
+        .await;
     let text = String::from_utf8_lossy(&resp);
-    assert!(text.contains("客户张三"), "客户端应收到还原后的自定义词：{text}");
+    assert!(
+        text.contains("客户张三"),
+        "客户端应收到还原后的自定义词：{text}"
+    );
     assert!(!text.contains("{{"), "客户端不得收到裸占位符：{text}");
 
     // 2) 响应侧：思考流必须还原（跨 chunk 切分也要能拼合）
@@ -513,8 +590,7 @@ async fn thinking_and_tool_content_roundtrip() {
         let custom = h.state.custom_words();
         let cfg = h.state.config.get();
         let mut sess = store.get_mut("t1").unwrap();
-        let ctx = maskit_rs::mask::engine::MaskCtx::new(
-            &cfg, store, "t1".into(), &custom);
+        let ctx = maskit_rs::mask::engine::MaskCtx::new(&cfg, store, "t1".into(), &custom);
         sess.fwd.insert("客户张三".into(), "{{TERM_bcdfgh}}".into());
         sess.labels.insert("客户张三".into(), "人名".into());
         sess.rev.insert("{{TERM_bcdfgh}}".into(), "客户张三".into());
@@ -525,19 +601,28 @@ async fn thinking_and_tool_content_roundtrip() {
     let cmd = h.state.cmdblock();
     let bus = h.state.bus.clone();
     let meta = maskit_rs::server::response::StreamMeta {
-        host: "x".into(), method: "POST".into(), path: "/v1/responses".into(),
-        model: "gpt-4o".into(), protocol: "responses".into(), status: 200,
-        req_bytes: 0, req_dialog: String::new(),
+        host: "x".into(),
+        method: "POST".into(),
+        path: "/v1/responses".into(),
+        model: "gpt-4o".into(),
+        protocol: "responses".into(),
+        status: 200,
+        req_bytes: 0,
+        req_dialog: String::new(),
     };
     let mut st = StreamState::new(Framing::Sse);
     let tok = "{{TERM_bcdfgh}}";
     // OpenAI 官方推理摘要事件，token 被切成两块
-    let ev1 = format!("event: response.reasoning_summary_text.delta\ndata: {}\n\n",
+    let ev1 = format!(
+        "event: response.reasoning_summary_text.delta\ndata: {}\n\n",
         serde_json::json!({"type":"response.reasoning_summary_text.delta",
-                           "output_index":0,"delta":format!("思考中{tok}")}));
-    let ev2 = format!("event: response.reasoning_summary_text.delta\ndata: {}\n\n",
+                           "output_index":0,"delta":format!("思考中{tok}")})
+    );
+    let ev2 = format!(
+        "event: response.reasoning_summary_text.delta\ndata: {}\n\n",
         serde_json::json!({"type":"response.reasoning_summary_text.delta",
-                           "output_index":0,"delta":"完成"}));
+                           "output_index":0,"delta":"完成"})
+    );
     let mut acc = String::new();
     for chunk in [ev1.as_bytes(), ev2.as_bytes(), b"data: [DONE]\n\n", b""] {
         let (out, _) = st.push(chunk, "t1", store);
@@ -567,7 +652,9 @@ async fn stream_restore_works_end_to_end() {
     let h = Harness::new(true, false, true).await;
     let req = r#"{"model":"gpt-4o","stream":true,
         "messages":[{"role":"user","content":"客户张三电话13800138000"}]}"#;
-    let (status, resp) = h.send("POST", "/v1/chat/completions", "application/json", req).await;
+    let (status, resp) = h
+        .send("POST", "/v1/chat/completions", "application/json", req)
+        .await;
     assert_eq!(status, StatusCode::OK);
     let text = String::from_utf8_lossy(&resp);
     assert!(

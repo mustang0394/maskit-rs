@@ -23,7 +23,9 @@ pub async fn static_asset(axum::extract::Path(rest): axum::extract::Path<String>
     let path = rest.trim_start_matches('/').to_string();
     match Assets::get(&path) {
         Some(content) => {
-            let mime = mime_guess::from_path(&path).first_or_octet_stream().to_string();
+            let mime = mime_guess::from_path(&path)
+                .first_or_octet_stream()
+                .to_string();
             (
                 StatusCode::OK,
                 [(header::CONTENT_TYPE, mime)],

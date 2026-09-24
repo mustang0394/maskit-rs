@@ -14,7 +14,13 @@ use std::sync::RwLock;
 /// 这些标签的原文**永不落库**，只记 preview + sha256 摘要 + 长度。
 #[allow(dead_code)] // M3+ 使用
 pub const CREDENTIAL_LABELS: &[&str] = &[
-    "API_KEY", "TOKEN", "SECRET", "ACCESS_KEY", "JWT", "CONNSTR", "PRIVATE_KEY",
+    "API_KEY",
+    "TOKEN",
+    "SECRET",
+    "ACCESS_KEY",
+    "JWT",
+    "CONNSTR",
+    "PRIVATE_KEY",
 ];
 
 #[allow(dead_code)] // M3+ 使用
@@ -43,7 +49,10 @@ fn default_bind() -> String {
 
 impl Default for ServerConfig {
     fn default() -> Self {
-        Self { port: default_port(), bind: default_bind() }
+        Self {
+            port: default_port(),
+            bind: default_bind(),
+        }
     }
 }
 
@@ -83,10 +92,24 @@ impl Default for UpstreamConfig {
 /// 21 类内置规则开关，对齐 Python `shield_defaults.DEFAULT_BUILTIN_RULES`。
 /// 默认开启 7 类核心：API_KEY/CARD/CONNSTR/EMAIL/IDCARD/LANDLINE/PHONE。
 pub fn default_builtin_rules() -> std::collections::BTreeMap<String, bool> {
-    let on = ["API_KEY", "CARD", "CONNSTR", "EMAIL", "IDCARD", "LANDLINE", "PHONE"];
+    let on = [
+        "API_KEY", "CARD", "CONNSTR", "EMAIL", "IDCARD", "LANDLINE", "PHONE",
+    ];
     let off = [
-        "ACCESS_KEY", "HKID", "IBAN", "IP_INTERNAL", "IP_PRIVATE", "IP_PUBLIC",
-        "IPV6_PRIVATE", "JWT", "MAC", "PLATE", "PRIVATE_KEY", "SECRET", "TOKEN", "USCC",
+        "ACCESS_KEY",
+        "HKID",
+        "IBAN",
+        "IP_INTERNAL",
+        "IP_PRIVATE",
+        "IP_PUBLIC",
+        "IPV6_PRIVATE",
+        "JWT",
+        "MAC",
+        "PLATE",
+        "PRIVATE_KEY",
+        "SECRET",
+        "TOKEN",
+        "USCC",
     ];
     let mut m = std::collections::BTreeMap::new();
     for k in on {
@@ -100,9 +123,27 @@ pub fn default_builtin_rules() -> std::collections::BTreeMap<String, bool> {
 
 /// 内置规则全集合（21 类）。用于校验 `builtin_rules` 的键。
 pub const ALL_BUILTIN_RULES: &[&str] = &[
-    "ACCESS_KEY", "API_KEY", "CARD", "CONNSTR", "EMAIL", "HKID", "IBAN", "IDCARD",
-    "IP_INTERNAL", "IP_PRIVATE", "IP_PUBLIC", "IPV6_PRIVATE", "JWT", "LANDLINE", "MAC",
-    "PHONE", "PLATE", "PRIVATE_KEY", "SECRET", "TOKEN", "USCC",
+    "ACCESS_KEY",
+    "API_KEY",
+    "CARD",
+    "CONNSTR",
+    "EMAIL",
+    "HKID",
+    "IBAN",
+    "IDCARD",
+    "IP_INTERNAL",
+    "IP_PRIVATE",
+    "IP_PUBLIC",
+    "IPV6_PRIVATE",
+    "JWT",
+    "LANDLINE",
+    "MAC",
+    "PHONE",
+    "PLATE",
+    "PRIVATE_KEY",
+    "SECRET",
+    "TOKEN",
+    "USCC",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -382,7 +423,9 @@ impl Config {
         for (k, v) in defaults {
             c.mask.builtin_rules.entry(k).or_insert(v);
         }
-        c.mask.builtin_rules.retain(|k, _| ALL_BUILTIN_RULES.contains(&k.as_str()));
+        c.mask
+            .builtin_rules
+            .retain(|k, _| ALL_BUILTIN_RULES.contains(&k.as_str()));
         if c.mask.max_body_bytes > 128 * 1024 * 1024 {
             c.mask.max_body_bytes = 128 * 1024 * 1024;
         }
@@ -395,8 +438,14 @@ impl Config {
         }
         // 审计 signals：补默认（全部开启）
         let default_signals = [
-            "error_leak", "identity_swap", "tool_call_rewrite", "sse_anomaly",
-            "response_poison", "cross_request_pollution", "credential_echo", "dangerous_action",
+            "error_leak",
+            "identity_swap",
+            "tool_call_rewrite",
+            "sse_anomaly",
+            "response_poison",
+            "cross_request_pollution",
+            "credential_echo",
+            "dangerous_action",
         ];
         for s in default_signals {
             c.audit.signals.entry(s.to_string()).or_insert(true);
@@ -420,7 +469,9 @@ pub struct ConfigCenter {
 }
 
 impl ConfigCenter {
-    pub fn load_or_init(data_dir: &Path) -> std::io::Result<(std::sync::Arc<Self>, Vec<ConfigWarning>)> {
+    pub fn load_or_init(
+        data_dir: &Path,
+    ) -> std::io::Result<(std::sync::Arc<Self>, Vec<ConfigWarning>)> {
         fs::create_dir_all(data_dir)?;
         let path = data_dir.join("config.json");
         let (mut cfg, mut warnings) = if path.exists() {
@@ -429,7 +480,10 @@ impl ConfigCenter {
                 Ok(c) => (c, Vec::new()),
                 Err(e) => (
                     Config::default(),
-                    vec![ConfigWarning(format!("config.json 解析失败（{}），已回退默认配置", e))],
+                    vec![ConfigWarning(format!(
+                        "config.json 解析失败（{}），已回退默认配置",
+                        e
+                    ))],
                 ),
             }
         } else {
@@ -488,7 +542,11 @@ impl ConfigCenter {
     ///
     /// 用 serde_json 的 JSON Pointer 原语（`/mask/custom_words/张三`）——
     /// 手写逐层重建会丢掉同级字段（曾把 `mask` 下除 custom_words 外的全部字段抹掉）。
-    pub fn patch(&self, path: &str, value: serde_json::Value) -> Result<Vec<ConfigWarning>, String> {
+    pub fn patch(
+        &self,
+        path: &str,
+        value: serde_json::Value,
+    ) -> Result<Vec<ConfigWarning>, String> {
         let mut cfg_json = serde_json::to_value(self.get()).map_err(|e| e.to_string())?;
         let segs: Vec<String> = path
             .split('.')
@@ -556,7 +614,8 @@ impl ConfigCenter {
         let cfg = self.get();
         self.fail_closed.store(cfg.fail_closed, Ordering::Release);
         self.paused.store(cfg.paused, Ordering::Release);
-        self.max_body_bytes.store(cfg.mask.max_body_bytes as u64, Ordering::Release);
+        self.max_body_bytes
+            .store(cfg.mask.max_body_bytes as u64, Ordering::Release);
     }
 
     /// 热更新后需要重建的组件由订阅方通过 version 变化感知。
@@ -589,7 +648,9 @@ fn generate_token() -> String {
     use rand::Rng;
     const CHARS: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789";
     let mut rng = rand::thread_rng();
-    (0..24).map(|_| CHARS[rng.gen_range(0..CHARS.len())] as char).collect()
+    (0..24)
+        .map(|_| CHARS[rng.gen_range(0..CHARS.len())] as char)
+        .collect()
 }
 
 /// 按 '.' 分段路径从 JSON 值中取子值（保留给测试与诊断用）。
@@ -635,9 +696,14 @@ mod tests {
     fn patch_updates_nested_value() {
         let dir = tempfile::tempdir().unwrap();
         let (center, _) = ConfigCenter::load_or_init(dir.path()).unwrap();
-        center.patch("mask.custom_words.李四", serde_json::json!("人名")).unwrap();
+        center
+            .patch("mask.custom_words.李四", serde_json::json!("人名"))
+            .unwrap();
         let cfg = center.get();
-        assert_eq!(cfg.mask.custom_words.get("李四").map(String::as_str), Some("人名"));
+        assert_eq!(
+            cfg.mask.custom_words.get("李四").map(String::as_str),
+            Some("人名")
+        );
         // 持久化验证
         let raw = std::fs::read_to_string(dir.path().join("config.json")).unwrap();
         assert!(raw.contains("李四"));
@@ -654,9 +720,15 @@ mod tests {
             .patch("mask.custom_words.王五", serde_json::json!("人名"))
             .unwrap();
         let after = center.get();
-        assert_eq!(after.mask.custom_words.get("王五").map(String::as_str), Some("人名"));
+        assert_eq!(
+            after.mask.custom_words.get("王五").map(String::as_str),
+            Some("人名")
+        );
         // 同级字段必须原样保留
-        assert_eq!(after.mask.builtin_rules, before.mask.builtin_rules, "builtin_rules 被抹掉");
+        assert_eq!(
+            after.mask.builtin_rules, before.mask.builtin_rules,
+            "builtin_rules 被抹掉"
+        );
         assert_eq!(after.mask.secret_prefixes, before.mask.secret_prefixes);
         assert_eq!(after.mask.max_body_bytes, before.mask.max_body_bytes);
         assert_eq!(after.server.port, before.server.port);
@@ -667,10 +739,18 @@ mod tests {
             .unwrap();
         let after2 = center.get();
         assert!(after2.mask.builtin_rules["JWT"]);
-        assert_eq!(after2.mask.builtin_rules["PHONE"], before.mask.builtin_rules["PHONE"]);
-        assert_eq!(after2.mask.custom_words.get("王五").map(String::as_str), Some("人名"));
+        assert_eq!(
+            after2.mask.builtin_rules["PHONE"],
+            before.mask.builtin_rules["PHONE"]
+        );
+        assert_eq!(
+            after2.mask.custom_words.get("王五").map(String::as_str),
+            Some("人名")
+        );
         // 不存在的父级报错
-        assert!(center.patch("nonexistent.deep.key", serde_json::json!(1)).is_err());
+        assert!(center
+            .patch("nonexistent.deep.key", serde_json::json!(1))
+            .is_err());
     }
 
     #[test]

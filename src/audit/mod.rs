@@ -101,7 +101,11 @@ pub fn aggregate_passive(findings_lists: &[Vec<Finding>]) -> Aggregate {
             }
         }
     }
-    Aggregate { severity: top, counts, total }
+    Aggregate {
+        severity: top,
+        counts,
+        total,
+    }
 }
 
 /// 响应侧审计钩子：跑被动信号 + 落库（对齐 `_audit_response`）。
@@ -212,7 +216,10 @@ pub fn prior_canaries(exclude: &[String]) -> Vec<String> {
     static REGISTRY: Lazy<Mutex<std::collections::HashMap<String, f64>>> =
         Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
     let reg = REGISTRY.lock().unwrap();
-    reg.keys().filter(|k| !exclude.contains(k)).cloned().collect()
+    reg.keys()
+        .filter(|k| !exclude.contains(k))
+        .cloned()
+        .collect()
 }
 
 #[cfg(test)]

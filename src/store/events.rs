@@ -85,7 +85,12 @@ pub struct Event {
     #[serde(default)]
     pub model: String,
     /// 会话 ID（**Python 口径字段名是 `sid`**，双向兼容）
-    #[serde(rename = "sid", alias = "session_id", default, skip_serializing_if = "String::is_empty")]
+    #[serde(
+        rename = "sid",
+        alias = "session_id",
+        default,
+        skip_serializing_if = "String::is_empty"
+    )]
     pub session_id: String,
     /// 流式标记（stream / non_stream；Python 侧恒带此键）
     #[serde(default)]
@@ -295,7 +300,14 @@ impl EventBus {
     }
 
     /// 发审计事件（M8）。审计事件独立计数，不进主事件 ring 的 requests。
-    pub fn emit_audit(&self, f: &crate::audit::Finding, sid: &str, host: &str, method: &str, path: &str) {
+    pub fn emit_audit(
+        &self,
+        f: &crate::audit::Finding,
+        sid: &str,
+        host: &str,
+        method: &str,
+        path: &str,
+    ) {
         let floor = crate::audit::Severity::Medium; // 默认 severity_floor
         let always = crate::audit::ALWAYS_RECORD.contains(&f.signal.as_str());
         if f.severity < floor && !always {

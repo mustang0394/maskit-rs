@@ -74,7 +74,10 @@ pub async fn origin_middleware(
                 .next()
                 .unwrap_or("");
             let same = o_host == host
-                || o_host.ends_with(&format!("127.0.0.1:{}", host.rsplit(':').next().unwrap_or("")))
+                || o_host.ends_with(&format!(
+                    "127.0.0.1:{}",
+                    host.rsplit(':').next().unwrap_or("")
+                ))
                 || o_host.starts_with("http://localhost")
                 || o_host.starts_with("http://127.0.0.1");
             if !same {
@@ -243,7 +246,10 @@ pub struct DetailQuery {
     pub id: u64,
 }
 
-pub async fn get_log_detail(State(state): State<SharedState>, Query(q): Query<DetailQuery>) -> Response {
+pub async fn get_log_detail(
+    State(state): State<SharedState>,
+    Query(q): Query<DetailQuery>,
+) -> Response {
     match state.bus.by_id(q.id) {
         Some(ev) => json_response(StatusCode::OK, &ev),
         None => error_response(StatusCode::NOT_FOUND, "event_not_found"),
@@ -254,7 +260,10 @@ pub async fn clear_logs(State(state): State<SharedState>) -> Response {
     state.bus.clear();
     if let Some(es) = &state.event_store {
         if let Err(e) = es.clear_events() {
-            return error_response(StatusCode::INTERNAL_SERVER_ERROR, &format!("clear_failed: {e}"));
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("clear_failed: {e}"),
+            );
         }
     }
     json_response(StatusCode::OK, &json!({ "ok": true }))
@@ -264,11 +273,17 @@ pub async fn stats_today(State(state): State<SharedState>) -> Response {
     match &state.event_store {
         Some(es) => match es.today_stats() {
             Ok(v) => json_response(StatusCode::OK, &v),
-            Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &format!("stats_failed: {e}")),
+            Err(e) => error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("stats_failed: {e}"),
+            ),
         },
         None => {
             let c = state.bus.counters();
-            json_response(StatusCode::OK, &serde_json::to_value(&c).unwrap_or(Value::Null))
+            json_response(
+                StatusCode::OK,
+                &serde_json::to_value(&c).unwrap_or(Value::Null),
+            )
         }
     }
 }
@@ -283,11 +298,17 @@ fn default_days() -> i64 {
     7
 }
 
-pub async fn stats_history(State(state): State<SharedState>, Query(q): Query<HistoryQuery>) -> Response {
+pub async fn stats_history(
+    State(state): State<SharedState>,
+    Query(q): Query<HistoryQuery>,
+) -> Response {
     match &state.event_store {
         Some(es) => match es.stats_history(q.days.clamp(1, 90)) {
             Ok(v) => json_response(StatusCode::OK, &v),
-            Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &format!("history_failed: {e}")),
+            Err(e) => error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("history_failed: {e}"),
+            ),
         },
         None => json_response(StatusCode::OK, &json!({ "data": [] })),
     }
@@ -328,7 +349,10 @@ pub struct AuditQuery {
     pub limit: usize,
 }
 
-pub async fn get_audit_events(State(state): State<SharedState>, Query(q): Query<AuditQuery>) -> Response {
+pub async fn get_audit_events(
+    State(state): State<SharedState>,
+    Query(q): Query<AuditQuery>,
+) -> Response {
     let events = match &state.event_store {
         Some(es) => {
             let from_db = es.fetch_audits(q.limit.clamp(1, 2000));
@@ -347,7 +371,10 @@ pub async fn clear_audit_events(State(state): State<SharedState>) -> Response {
     state.bus.clear_audits();
     if let Some(es) = &state.event_store {
         if let Err(e) = es.clear_audits() {
-            return error_response(StatusCode::INTERNAL_SERVER_ERROR, &format!("clear_failed: {e}"));
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("clear_failed: {e}"),
+            );
         }
     }
     json_response(StatusCode::OK, &json!({ "ok": true }))
@@ -387,7 +414,10 @@ pub async fn export_logs(State(state): State<SharedState>) -> Response {
 pub async fn test_upstream(State(state): State<SharedState>) -> Response {
     let cfg = state.config.get();
     if cfg.upstream.target.is_empty() {
-        return json_response(StatusCode::OK, &json!({ "ok": false, "error": "upstream_not_configured" }));
+        return json_response(
+            StatusCode::OK,
+            &json!({ "ok": false, "error": "upstream_not_configured" }),
+        );
     }
     let t0 = std::time::Instant::now();
     let target = crate::upstream::http_client::parse_target(&cfg.upstream.target);
@@ -432,13 +462,8 @@ pub async fn demo_mask(State(state): State<SharedState>, body: String) -> Respon
     let ctx = crate::mask::engine::MaskCtx::new(&cfg, state.sessions, sid.into(), &custom);
     let masked = ctx.mask(text);
     let mut stats = crate::mask::engine::RestoreStats::default();
-    let restored = crate::mask::engine::restore_final(
-        &masked,
-        sid,
-        false,
-        state.sessions,
-        &mut stats,
-    );
+    let restored =
+        crate::mask::engine::restore_final(&masked, sid, false, state.sessions, &mut stats);
     state.sessions.drop_session(sid);
     json_response(
         StatusCode::OK,
@@ -469,7 +494,9 @@ fn new_token() -> String {
     use rand::Rng;
     const CHARS: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789";
     let mut rng = rand::thread_rng();
-    (0..24).map(|_| CHARS[rng.gen_range(0..CHARS.len())] as char).collect()
+    (0..24)
+        .map(|_| CHARS[rng.gen_range(0..CHARS.len())] as char)
+        .collect()
 }
 
 fn json_response<T: serde::Serialize>(status: StatusCode, value: &T) -> Response {

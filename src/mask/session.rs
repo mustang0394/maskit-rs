@@ -69,7 +69,10 @@ pub struct CmdHit {
 }
 
 fn now() -> f64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
 }
 
 impl Session {
@@ -139,7 +142,10 @@ impl SessionStore {
     }
 
     pub fn set_ttl(&self, session_ttl_secs: u64) {
-        self.ttl_secs.store(RECENT_TTL.max(session_ttl_secs), std::sync::atomic::Ordering::Release);
+        self.ttl_secs.store(
+            RECENT_TTL.max(session_ttl_secs),
+            std::sync::atomic::Ordering::Release,
+        );
     }
 
     pub fn recent_ttl(&self) -> u64 {
@@ -238,16 +244,22 @@ impl SessionStore {
                 self.suffix_index_del(&prev.token.clone());
             }
         }
-        self.recent_fwd.insert(orig.to_string(), RecentEntry {
-            token: token.clone(),
-            label: label.to_string(),
-            ts: now,
-        });
-        self.recent_rev.insert(token.clone(), RecentEntry {
-            token: orig.to_string(),
-            label: label.to_string(),
-            ts: now,
-        });
+        self.recent_fwd.insert(
+            orig.to_string(),
+            RecentEntry {
+                token: token.clone(),
+                label: label.to_string(),
+                ts: now,
+            },
+        );
+        self.recent_rev.insert(
+            token.clone(),
+            RecentEntry {
+                token: orig.to_string(),
+                label: label.to_string(),
+                ts: now,
+            },
+        );
         self.suffix_index_add(&token);
         self.prune_recent();
         (token, false)
@@ -289,7 +301,8 @@ impl SessionStore {
         }
         match self.recent_suffix.get(&sfx) {
             None => {
-                self.recent_suffix.insert(sfx, SuffixIndexValue::Token(token.to_string()));
+                self.recent_suffix
+                    .insert(sfx, SuffixIndexValue::Token(token.to_string()));
             }
             Some(cur) => {
                 let cur = cur.clone();
@@ -535,19 +548,27 @@ mod tests {
         let store = fresh_store();
         store.new_session("s");
         let taken = token_taken_static(&store);
-        store.custom_fwd.insert("张三".into(), "{{TERM_zzwkkk}}".into());
-        store.custom_rev.insert("{{TERM_zzwkkk}}".into(), RecentEntry {
-            token: "张三".into(),
-            label: "NAME".into(),
-            ts: 0.0, // 很旧也不淘汰
-        });
+        store
+            .custom_fwd
+            .insert("张三".into(), "{{TERM_zzwkkk}}".into());
+        store.custom_rev.insert(
+            "{{TERM_zzwkkk}}".into(),
+            RecentEntry {
+                token: "张三".into(),
+                label: "NAME".into(),
+                ts: 0.0, // 很旧也不淘汰
+            },
+        );
         {
             let mut s = store.get_mut("s").unwrap();
             store.remember(&mut s, "张三", "NAME", &taken);
         }
         assert_eq!(store.get("s").unwrap().fwd["张三"], "{{TERM_zzwkkk}}");
         // TTL 过期仍可还原（永久映射）
-        assert_eq!(store.lookup("{{TERM_zzwkkk}}", "s"), Some("张三".to_string()));
+        assert_eq!(
+            store.lookup("{{TERM_zzwkkk}}", "s"),
+            Some("张三".to_string())
+        );
     }
 
     #[test]
@@ -574,10 +595,17 @@ mod tests {
         let store = fresh_store();
         let taken = token_taken_static(&store);
         // 自定义词
-        store.custom_fwd.insert("永久词".into(), "{{TERM_pwwkkk}}".into());
-        store.custom_rev.insert("{{TERM_pwwkkk}}".into(), RecentEntry {
-            token: "永久词".into(), label: "T".into(), ts: 0.0,
-        });
+        store
+            .custom_fwd
+            .insert("永久词".into(), "{{TERM_pwwkkk}}".into());
+        store.custom_rev.insert(
+            "{{TERM_pwwkkk}}".into(),
+            RecentEntry {
+                token: "永久词".into(),
+                label: "T".into(),
+                ts: 0.0,
+            },
+        );
         // 灌满 2010 条普通条目
         for i in 0..2010 {
             let mut fake = Session::new();
@@ -590,7 +618,10 @@ mod tests {
             .iter()
             .filter(|kv| !store.is_custom_word_orig(kv.key()))
             .count();
-        assert!(normal_count <= RECENT_MAX, "普通条目数 {normal_count} 应 ≤ {RECENT_MAX}");
+        assert!(
+            normal_count <= RECENT_MAX,
+            "普通条目数 {normal_count} 应 ≤ {RECENT_MAX}"
+        );
         // 自定义词不被淘汰
         assert!(store.custom_fwd.contains_key("永久词"));
     }

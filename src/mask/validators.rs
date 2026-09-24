@@ -21,7 +21,11 @@ pub fn luhn_ok(num: &str) -> bool {
     let mut dbl = false;
     for &d in digits.iter().rev() {
         let d = if dbl {
-            if d > 4 { d * 2 - 9 } else { d * 2 }
+            if d > 4 {
+                d * 2 - 9
+            } else {
+                d * 2
+            }
         } else {
             d
         };
@@ -53,13 +57,39 @@ const IDCARD_CODES: &[u8] = b"10X98765432";
 fn is_valid_province(prefix: &str) -> bool {
     matches!(
         prefix,
-        "11" | "12" | "13" | "14" | "15"
-            | "21" | "22" | "23"
-            | "31" | "32" | "33" | "34" | "35" | "36" | "37"
-            | "41" | "42" | "43" | "44" | "45" | "46"
-            | "50" | "51" | "52" | "53" | "54"
-            | "61" | "62" | "63" | "64" | "65"
-            | "71" | "81" | "82"
+        "11" | "12"
+            | "13"
+            | "14"
+            | "15"
+            | "21"
+            | "22"
+            | "23"
+            | "31"
+            | "32"
+            | "33"
+            | "34"
+            | "35"
+            | "36"
+            | "37"
+            | "41"
+            | "42"
+            | "43"
+            | "44"
+            | "45"
+            | "46"
+            | "50"
+            | "51"
+            | "52"
+            | "53"
+            | "54"
+            | "61"
+            | "62"
+            | "63"
+            | "64"
+            | "65"
+            | "71"
+            | "81"
+            | "82"
     )
 }
 
@@ -210,7 +240,11 @@ pub fn email_ok(email_str: &str) -> bool {
     if local.is_empty() || domain.len() < 3 || !domain.contains('.') {
         return false;
     }
-    if local.starts_with('.') || local.ends_with('.') || local.contains("..") || domain.contains("..") {
+    if local.starts_with('.')
+        || local.ends_with('.')
+        || local.contains("..")
+        || domain.contains("..")
+    {
         return false;
     }
     let tld = domain.rsplit('.').next().unwrap_or("");
@@ -294,7 +328,9 @@ pub fn jwt_ok(token: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 const USCC_CHARS: &[u8] = b"0123456789ABCDEFGHJKLMNPQRTUWXY";
-const USCC_WEIGHTS: [usize; 17] = [1, 3, 9, 27, 19, 26, 16, 17, 20, 29, 25, 13, 8, 24, 10, 30, 28];
+const USCC_WEIGHTS: [usize; 17] = [
+    1, 3, 9, 27, 19, 26, 16, 17, 20, 29, 25, 13, 8, 24, 10, 30, 28,
+];
 
 /// USCC 校验位（GB 32100-2015 MOD31，对齐 `_uscc_ok`）。
 pub fn uscc_ok(orig: &str) -> bool {
@@ -320,9 +356,22 @@ pub fn uscc_ok(orig: &str) -> bool {
 
 /// 已知公共 DNS 白名单（对齐 `KNOWN_PUBLIC_DNS`）。
 const KNOWN_PUBLIC_DNS: &[&str] = &[
-    "8.8.8.8", "8.8.4.4", "1.1.1.1", "1.0.0.1", "4.2.2.1", "4.2.2.2", "4.2.2.3",
-    "114.114.114.114", "114.114.115.115", "223.5.5.5", "223.6.6.6",
-    "119.29.29.29", "180.76.76.76", "9.9.9.9", "208.67.222.222", "208.67.220.220",
+    "8.8.8.8",
+    "8.8.4.4",
+    "1.1.1.1",
+    "1.0.0.1",
+    "4.2.2.1",
+    "4.2.2.2",
+    "4.2.2.3",
+    "114.114.114.114",
+    "114.114.115.115",
+    "223.5.5.5",
+    "223.6.6.6",
+    "119.29.29.29",
+    "180.76.76.76",
+    "9.9.9.9",
+    "208.67.222.222",
+    "208.67.220.220",
 ];
 
 fn ipv4_parts(orig: &str) -> Option<[u32; 4]> {
@@ -411,7 +460,9 @@ fn parse_ipv6(s: &str) -> Option<[u16; 8]> {
     let head_groups: Vec<u16> = if head.is_empty() {
         vec![]
     } else {
-        head.split(':').map(parse_group).collect::<Option<Vec<_>>>()?
+        head.split(':')
+            .map(parse_group)
+            .collect::<Option<Vec<_>>>()?
     };
     match tail {
         None => {
@@ -450,14 +501,38 @@ fn parse_ipv6(s: &str) -> Option<[u16; 8]> {
 
 /// 文档占位主机（对齐 `_CONNSTR_DUMMY_HOSTS`）。
 const DUMMY_HOSTS: &[&str] = &[
-    "host", "hostname", "myhost", "server", "myserver",
-    "example.com", "example.org", "example.net",
-    "test.com", "sample.com", "your-host", "yourhost", "yourdomain.com",
+    "host",
+    "hostname",
+    "myhost",
+    "server",
+    "myserver",
+    "example.com",
+    "example.org",
+    "example.net",
+    "test.com",
+    "sample.com",
+    "your-host",
+    "yourhost",
+    "yourdomain.com",
 ];
 const DUMMY_HOST_SUFFIXES: &[&str] = &[".example", ".invalid"];
-const PLACEHOLDER_USERS: &[&str] = &["user", "username", "your_username", "yourusername", "usr", "guest"];
+const PLACEHOLDER_USERS: &[&str] = &[
+    "user",
+    "username",
+    "your_username",
+    "yourusername",
+    "usr",
+    "guest",
+];
 const PLACEHOLDER_PASSWORDS: &[&str] = &[
-    "pass", "password", "passwd", "your_password", "yourpassword", "changeme", "change_me", "guest",
+    "pass",
+    "password",
+    "passwd",
+    "your_password",
+    "yourpassword",
+    "changeme",
+    "change_me",
+    "guest",
 ];
 
 /// 连接串密码真伪校验（对齐 `_connstr_ok` 的文档/模板豁免判据）。
@@ -516,7 +591,11 @@ fn is_anchored_template(pw: &str) -> bool {
     }
     let ident_start = |c: u8| c.is_ascii_alphabetic() || c == b'_';
     let ident = |s: &[u8]| -> bool {
-        !s.is_empty() && ident_start(s[0]) && s[1..].iter().all(|c| c.is_ascii_alphanumeric() || *c == b'_')
+        !s.is_empty()
+            && ident_start(s[0])
+            && s[1..]
+                .iter()
+                .all(|c| c.is_ascii_alphanumeric() || *c == b'_')
     };
     match b[0] {
         b'{' => pw.ends_with('}') && ident(&b[1..b.len() - 1]),
@@ -550,7 +629,13 @@ fn extract_user(prefix: &str, password: &str) -> String {
 fn parse_authority(after: &str) -> (String, String) {
     let tail: String = after.chars().take(256).collect();
     let end = tail
-        .find(|c: char| c.is_whitespace() || matches!(c, '/' | '?' | '#' | '"' | '\'' | '`' | ')' | '>' | '}' | ',' | ';'))
+        .find(|c: char| {
+            c.is_whitespace()
+                || matches!(
+                    c,
+                    '/' | '?' | '#' | '"' | '\'' | '`' | ')' | '>' | '}' | ',' | ';'
+                )
+        })
         .unwrap_or(tail.len());
     let auth = &tail[..end];
     if auth.starts_with('[') {
@@ -665,7 +750,7 @@ mod tests {
         // 15 位（省份 11 + 1990-03-07 真实日期）
         assert!(idcard15_ok("110101900307451"));
         assert!(!idcard15_ok("065217391304348")); // 省份 06 非法
-        // 数值型身份证（校验位合法）
+                                                  // 数值型身份证（校验位合法）
         assert!(idcard_ok("110101199003077213"));
     }
 
@@ -737,7 +822,13 @@ mod tests {
     #[test]
     fn connstr() {
         // 真实口令：脱敏
-        assert!(connstr_ok("Zq9xLm2pTv8w", "postgres://usr:Zq9xLm2pTv8w@", ":5432/prod", 0, 26));
+        assert!(connstr_ok(
+            "Zq9xLm2pTv8w",
+            "postgres://usr:Zq9xLm2pTv8w@",
+            ":5432/prod",
+            0,
+            26
+        ));
         // 教学组合 user:pass → 豁免
         assert!(!connstr_ok("pass", "mysql://user:pass@", ":3306/db", 0, 18));
         // 通配占位 → 不脱敏也不豁免区间

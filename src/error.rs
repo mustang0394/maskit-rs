@@ -49,7 +49,10 @@ pub struct PipeError {
 #[allow(dead_code)] // M6 使用
 impl PipeError {
     pub fn new(kind: ErrorKind, message: impl Into<String>) -> Self {
-        Self { kind, message: message.into() }
+        Self {
+            kind,
+            message: message.into(),
+        }
     }
 }
 

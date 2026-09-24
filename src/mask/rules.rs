@@ -184,7 +184,9 @@ fn secret_value_charset(text: &str, m: Match<'_>, caps: &Captures<'_>) -> bool {
     let value = caps.get(1).unwrap().as_str();
     let _ = (text, m);
     // 值字符类内的字符必须含 [0-9!@#$%^&*]
-    value.chars().any(|c| c.is_ascii_digit() || "!@#$%^&*".contains(c))
+    value
+        .chars()
+        .any(|c| c.is_ascii_digit() || "!@#$%^&*".contains(c))
 }
 
 /// SECRET 键名左边界：[A-Za-z0-9_.]（英文关键词）
@@ -336,8 +338,14 @@ fn plate_r(text: &str, m: Match<'_>, _c: &Captures<'_>) -> bool {
 /// 实现：检查捕获区间内（除省份+字母后）是否含数字。
 fn plate_body_has_digit(text: &str, m: Match<'_>, _c: &Captures<'_>) -> bool {
     // 匹配整体 = 省份(3 字节汉字) + 字母(1) + 车身(5-6)；按字符切片防多字节边界
-    let body_start = text[m.start()..m.end()].char_indices().nth(2).map(|(i, _)| m.start() + i).unwrap_or(m.end());
-    text[body_start..m.end()].chars().any(|c| c.is_ascii_digit())
+    let body_start = text[m.start()..m.end()]
+        .char_indices()
+        .nth(2)
+        .map(|(i, _)| m.start() + i)
+        .unwrap_or(m.end());
+    text[body_start..m.end()]
+        .chars()
+        .any(|c| c.is_ascii_digit())
 }
 
 /// 港澳通行证左边界（ID_BOUND_L）
@@ -417,140 +425,366 @@ fn mac_r(text: &str, m: Match<'_>, _c: &Captures<'_>) -> bool {
 pub static RULES: Lazy<Vec<Rule>> = Lazy::new(|| {
     vec![
         // PEM 私钥整块（Python 同款线性形态：头尾锚定 + {20,}?）
-        rule!("PRIVATE_KEY",
+        rule!(
+            "PRIVATE_KEY",
             r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY-----[\s\S]{20,}?-----END[^-]*PRIVATE KEY-----",
-            0, [], exempt=false, avoid=false, markers=["PRIVATE KEY"], ci=false),
+            0,
+            [],
+            exempt = false,
+            avoid = false,
+            markers = ["PRIVATE KEY"],
+            ci = false
+        ),
         // GitHub tokens
-        rule!("API_KEY",
+        rule!(
+            "API_KEY",
             r"(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9_]{20,}",
-            0, [apikey_l, apikey_r], exempt=false, avoid=false, markers=["gh"], ci=false),
-        rule!("API_KEY",
+            0,
+            [apikey_l, apikey_r],
+            exempt = false,
+            avoid = false,
+            markers = ["gh"],
+            ci = false
+        ),
+        rule!(
+            "API_KEY",
             r"github_pat_[A-Za-z0-9_]{50,}",
-            0, [apikey_l, apikey_r], exempt=false, avoid=false, markers=["github"], ci=false),
+            0,
+            [apikey_l, apikey_r],
+            exempt = false,
+            avoid = false,
+            markers = ["github"],
+            ci = false
+        ),
         // Google API Key
-        rule!("API_KEY",
+        rule!(
+            "API_KEY",
             r"AIza[0-9A-Za-z_\-]{35,38}",
-            0, [apikey_l, apikey_r], exempt=false, avoid=false, markers=["AIza"], ci=false),
+            0,
+            [apikey_l, apikey_r],
+            exempt = false,
+            avoid = false,
+            markers = ["AIza"],
+            ci = false
+        ),
         // 阿里云 AK
-        rule!("ACCESS_KEY",
+        rule!(
+            "ACCESS_KEY",
             r"LTAI[A-Za-z0-9]{12,20}",
-            0, [apikey_l, access_key_r], exempt=false, avoid=false, markers=["LTAI"], ci=false),
+            0,
+            [apikey_l, access_key_r],
+            exempt = false,
+            avoid = false,
+            markers = ["LTAI"],
+            ci = false
+        ),
         // 腾讯云 SecretId
-        rule!("ACCESS_KEY",
+        rule!(
+            "ACCESS_KEY",
             r"AKID[A-Za-z0-9]{13,32}",
-            0, [apikey_l, access_key_r], exempt=false, avoid=false, markers=["AKID"], ci=false),
+            0,
+            [apikey_l, access_key_r],
+            exempt = false,
+            avoid = false,
+            markers = ["AKID"],
+            ci = false
+        ),
         // Slack
-        rule!("API_KEY",
+        rule!(
+            "API_KEY",
             r"xox[baprs]\-[0-9A-Za-z\-]{10,}",
-            0, [apikey_l, apikey_r], exempt=false, avoid=false, markers=["xox"], ci=false),
+            0,
+            [apikey_l, apikey_r],
+            exempt = false,
+            avoid = false,
+            markers = ["xox"],
+            ci = false
+        ),
         // Stripe
-        rule!("API_KEY",
+        rule!(
+            "API_KEY",
             r"[sr]k_(?:live|test)_[0-9A-Za-z]{20,}",
-            0, [apikey_l, stripe_r], exempt=false, avoid=false, markers=["k_"], ci=false),
+            0,
+            [apikey_l, stripe_r],
+            exempt = false,
+            avoid = false,
+            markers = ["k_"],
+            ci = false
+        ),
         // 飞书 / 钉钉
-        rule!("API_KEY",
+        rule!(
+            "API_KEY",
             r"cli_[a-z0-9]{16,}",
-            0, [apikey_l, lowercase_r], exempt=false, avoid=false, markers=["cli_"], ci=false),
-        rule!("API_KEY",
+            0,
+            [apikey_l, lowercase_r],
+            exempt = false,
+            avoid = false,
+            markers = ["cli_"],
+            ci = false
+        ),
+        rule!(
+            "API_KEY",
             r"ding[a-z0-9]{6,}",
-            0, [apikey_l, lowercase_r], exempt=false, avoid=false, markers=["ding"], ci=false),
+            0,
+            [apikey_l, lowercase_r],
+            exempt = false,
+            avoid = false,
+            markers = ["ding"],
+            ci = false
+        ),
         // AWS AccessKeyId
-        rule!("ACCESS_KEY",
+        rule!(
+            "ACCESS_KEY",
             r"(?:AKIA|ASIA)[A-Z0-9]{16}",
-            0, [aws_l, aws_r], exempt=false, avoid=false, markers=["AK", "AS"], ci=false),
+            0,
+            [aws_l, aws_r],
+            exempt = false,
+            avoid = false,
+            markers = ["AK", "AS"],
+            ci = false
+        ),
         // AWS SecretAccessKey（值组 1）
-        rule!("ACCESS_KEY",
+        rule!(
+            "ACCESS_KEY",
             r#"(?i)aws[_\-]?secret[_\-]?access[_\-]?key[\"']?\s*[:=]\s*[\"']?([A-Za-z0-9/+=]{40})"#,
-            1, [aws_secret_r], exempt=false, avoid=false, markers=["aws", "AWS"], ci=false),
+            1,
+            [aws_secret_r],
+            exempt = false,
+            avoid = false,
+            markers = ["aws", "AWS"],
+            ci = false
+        ),
         // JWT
-        rule!("JWT",
+        rule!(
+            "JWT",
             r"eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}",
-            0, [apikey_l, apikey_r], exempt=false, avoid=false,
-            markers=["eyJ"], ci=false),
+            0,
+            [apikey_l, apikey_r],
+            exempt = false,
+            avoid = false,
+            markers = ["eyJ"],
+            ci = false
+        ),
         // Bearer Token（值组 1；\b 下沉）
-        rule!("TOKEN",
+        rule!(
+            "TOKEN",
             r"(?i)Bearer\s+([A-Za-z0-9._~+/=\-]{20,})",
-            1, [bearer_word_boundary], exempt=false, avoid=false,
-            markers=["Bearer", "bearer", "BEARER"], ci=false),
+            1,
+            [bearer_word_boundary],
+            exempt = false,
+            avoid = false,
+            markers = ["Bearer", "bearer", "BEARER"],
+            ci = false
+        ),
         // SECRET 键值对（值组 1；左边界/值域/右边界/`(?!/)` 全部下沉）
         // 键名就是关键词本身（左右边界由 secret_key_l/r 下沉），不贪吃前后缀
-        rule!("SECRET",
+        rule!(
+            "SECRET",
             concat!(
                 r"(?i)(?:password|passwd|pwd|secret|token|api[_\-]?key|access[_\-]?key|private[_\-]?key",
                 r"|(?:密码|口令|令牌|密钥|秘钥|密匙|凭据|凭证|私钥|授权码|访问密钥|接口密钥))",
                 r#"[\"'“”「」]?\s*[:=：＝]\s*[\"'“”「」]?"#,
                 r"([A-Za-z0-9!@#$%^&*_~+=\-]{6,64})"
             ),
-            1, [secret_key_l, secret_key_r, secret_value_not_slash, secret_value_charset, secret_r],
-            exempt=false, avoid=false, markers=["=", ":", "：", "＝"], ci=false),
+            1,
+            [
+                secret_key_l,
+                secret_key_r,
+                secret_value_not_slash,
+                secret_value_charset,
+                secret_r
+            ],
+            exempt = false,
+            avoid = false,
+            markers = ["=", ":", "：", "＝"],
+            ci = false
+        ),
         // CONNSTR（scheme 封顶 {0,63} 防 O(N²)；密码组 1；\b 下沉；豁免区间联动 EMAIL）
-        rule!("CONNSTR",
+        rule!(
+            "CONNSTR",
             r"[a-zA-Z][a-zA-Z0-9+.\-]{0,63}://[^\s:@/]+:([^\s@/]{4,})@",
-            1, [connstr_word_boundary], exempt=true, avoid=false, markers=["://"], ci=false),
+            1,
+            [connstr_word_boundary],
+            exempt = true,
+            avoid = false,
+            markers = ["://"],
+            ci = false
+        ),
         // 手机号（单条交替分支，最左最长；Python 同款）：
         // ① 前缀（+86/0086/(86)）+ 裸 11 位  ② 裸 11 位  ③ 带分隔（- 或空格，单种）
-        rule!("PHONE",
+        rule!(
+            "PHONE",
             r"(?:\+?86|0086|[\(（]\+?86[\)）])[\s\-]?1[3-9][0-9][0-9]{8}|1[3-9][0-9][0-9]{8}|1[3-9][0-9][\- ][0-9]{4}[\- ][0-9]{4}|1[3-9][0-9][\- ][0-9]{4}[ ][0-9]{4}|1[3-9][0-9][ ][0-9]{4}[\- ][0-9]{4}|1[3-9][0-9][ ][0-9]{4}[ ][0-9]{4}",
-            0, [phone_plain_l, phone_sep_consistent, phone_r], exempt=false, avoid=false, markers=["1"], ci=false),
+            0,
+            [phone_plain_l, phone_sep_consistent, phone_r],
+            exempt = false,
+            avoid = false,
+            markers = ["1"],
+            ci = false
+        ),
         // EMAIL（CONNSTR 之后！左/右边界 + `(?<!:)` 下沉）
-        rule!("EMAIL",
+        rule!(
+            "EMAIL",
             r"[a-zA-Z0-9_\u{4e00}-\u{9fff}][\u{4e00}-\u{9fff}A-Za-z0-9._%+\-]{0,63}@[a-zA-Z0-9\-]+(?:\.[a-zA-Z0-9\-]+)*\.[a-zA-Z\u{4e00}-\u{9fff}]{2,}",
-            0, [email_l, email_r], exempt=false, avoid=true, markers=["@"], ci=false),
+            0,
+            [email_l, email_r],
+            exempt = false,
+            avoid = true,
+            markers = ["@"],
+            ci = false
+        ),
         // 座机
-        rule!("LANDLINE",
+        rule!(
+            "LANDLINE",
             r"(?:\+?86|0086|[\(（]\+?86[\)）])[\s\-]?(?:[\(（]0(?:10|2[0-9]|[3-9][0-9]{2})[\)）][\s\-]?[2-9][0-9]{6,7}|0(?:10|2[0-9]|[3-9][0-9]{2})[\-\s][2-9][0-9]{6,7})(?:[\-\s]?(?:转|分机|ext|x|#)[\-\s]?[0-9]{1,5})?",
-            0, [landline_l, landline_r], exempt=false, avoid=false, markers=["0"], ci=false),
+            0,
+            [landline_l, landline_r],
+            exempt = false,
+            avoid = false,
+            markers = ["0"],
+            ci = false
+        ),
         // 车牌（车身含数字断言下沉）
-        rule!("PLATE",
+        rule!(
+            "PLATE",
             r"[京津沪渝冀豫云辽黑湘皖鲁新苏浙赣鄂桂甘晋蒙陕吉闽贵粤青藏川宁琼使领][A-Z][A-Z0-9]{5,6}",
-            0, [plate_l, plate_body_has_digit, plate_r], exempt=false, avoid=false, markers=[], ci=false),
+            0,
+            [plate_l, plate_body_has_digit, plate_r],
+            exempt = false,
+            avoid = false,
+            markers = [],
+            ci = false
+        ),
         // 港澳通行证
-        rule!("HKID",
+        rule!(
+            "HKID",
             r"H[0-9]{8}",
-            0, [hkid_l, hkid_r], exempt=false, avoid=false, markers=[], ci=false),
+            0,
+            [hkid_l, hkid_r],
+            exempt = false,
+            avoid = false,
+            markers = [],
+            ci = false
+        ),
         // 身份证 15/18（正则锁位数，校验器验省份+日期+校验位）
-        rule!("IDCARD",
+        rule!(
+            "IDCARD",
             r"(?:1[1-5]|2[1-3]|3[1-7]|4[1-6]|5[0-4]|6[1-5]|71|8[12])[0-9]{13}",
-            0, [idcard_l, idcard_r], exempt=false, avoid=false, markers=[], ci=false),
-        rule!("IDCARD",
+            0,
+            [idcard_l, idcard_r],
+            exempt = false,
+            avoid = false,
+            markers = [],
+            ci = false
+        ),
+        rule!(
+            "IDCARD",
             r"(?:1[1-5]|2[1-3]|3[1-7]|4[1-6]|5[0-4]|6[1-5]|71|8[12])[0-9]{15}[0-9Xx]",
-            0, [idcard_l, idcard_r], exempt=false, avoid=false, markers=[], ci=false),
+            0,
+            [idcard_l, idcard_r],
+            exempt = false,
+            avoid = false,
+            markers = [],
+            ci = false
+        ),
         // 内网 IP（IP_PRIVATE：192.168 / 169.254 / CGNAT）
-        rule!("IP_PRIVATE",
+        rule!(
+            "IP_PRIVATE",
             r"192\.168\.[0-9]{1,3}\.[0-9]{1,3}|169\.254\.[0-9]{1,3}\.[0-9]{1,3}",
-            0, [ip_l, ip_r], exempt=false, avoid=false, markers=["192.", "169.", "100."], ci=false),
-        rule!("IP_PRIVATE",
+            0,
+            [ip_l, ip_r],
+            exempt = false,
+            avoid = false,
+            markers = ["192.", "169.", "100."],
+            ci = false
+        ),
+        rule!(
+            "IP_PRIVATE",
             r"100\.(?:6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.[0-9]{1,3}\.[0-9]{1,3}",
-            0, [ip_l, ip_r], exempt=false, avoid=false, markers=["192.", "169.", "100."], ci=false),
+            0,
+            [ip_l, ip_r],
+            exempt = false,
+            avoid = false,
+            markers = ["192.", "169.", "100."],
+            ci = false
+        ),
         // 内网 IP（IP_INTERNAL：10.x / 172.16-31）
-        rule!("IP_INTERNAL",
+        rule!(
+            "IP_INTERNAL",
             r"10\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}|172\.(?:1[6-9]|2[0-9]|3[01])\.[0-9]{1,3}\.[0-9]{1,3}",
-            0, [ip_l, ip_r], exempt=false, avoid=false, markers=["10.", "172."], ci=false),
+            0,
+            [ip_l, ip_r],
+            exempt = false,
+            avoid = false,
+            markers = ["10.", "172."],
+            ci = false
+        ),
         // IPv6 私网（宽候选 + 语义校验）
-        rule!("IPV6_PRIVATE",
+        rule!(
+            "IPV6_PRIVATE",
             r"[0-9A-Fa-f:]{2,45}",
-            0, [ipv6_l, ipv6_r], exempt=false, avoid=false,
-            markers=["fe8", "fe9", "fea", "feb", "fc", "fd"], ci=true),
+            0,
+            [ipv6_l, ipv6_r],
+            exempt = false,
+            avoid = false,
+            markers = ["fe8", "fe9", "fea", "feb", "fc", "fd"],
+            ci = true
+        ),
         // 公网 IPv4（强防误伤边界 + 语义校验）
-        rule!("IP_PUBLIC",
+        rule!(
+            "IP_PUBLIC",
             r"(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9][0-9]?|[1-9])(?:\.(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])){3}",
-            0, [ip_public_l, ip_public_r], exempt=false, avoid=false, markers=[], ci=false),
+            0,
+            [ip_public_l, ip_public_r],
+            exempt = false,
+            avoid = false,
+            markers = [],
+            ci = false
+        ),
         // 银行卡（无分隔 | 一致分隔分组；一致性由 card_sep_consistent 校验）
-        rule!("CARD",
+        rule!(
+            "CARD",
             r"[3-6][0-9]{12,18}|[3-6][0-9]{2,5}(?:[ \-][0-9]{1,6}){1,4}",
-            0, [card_l, card_sep_groups, card_r], exempt=false, avoid=false, markers=[], ci=false),
+            0,
+            [card_l, card_sep_groups, card_r],
+            exempt = false,
+            avoid = false,
+            markers = [],
+            ci = false
+        ),
         // IBAN
-        rule!("IBAN",
+        rule!(
+            "IBAN",
             r"[A-Z]{2}[0-9]{2}[A-Z0-9]{11,30}",
-            0, [iban_l, iban_r], exempt=false, avoid=false, markers=[], ci=false),
+            0,
+            [iban_l, iban_r],
+            exempt = false,
+            avoid = false,
+            markers = [],
+            ci = false
+        ),
         // USCC
-        rule!("USCC",
+        rule!(
+            "USCC",
             r"[0-9A-HJ-NPQRTUWXY]{2}[0-9]{6}[0-9A-HJ-NPQRTUWXY]{10}",
-            0, [uscc_l, uscc_r], exempt=false, avoid=false, markers=[], ci=false),
+            0,
+            [uscc_l, uscc_r],
+            exempt = false,
+            avoid = false,
+            markers = [],
+            ci = false
+        ),
         // MAC（Python 同款 6 组 5 分隔符；分隔符一致性由正则展开锁定单一分隔符形态）
-        rule!("MAC",
+        rule!(
+            "MAC",
             r"[0-9A-Fa-f]{2}[:-][0-9A-Fa-f]{2}[:-][0-9A-Fa-f]{2}[:-][0-9A-Fa-f]{2}[:-][0-9A-Fa-f]{2}[:-][0-9A-Fa-f]{2}",
-            0, [mac_l, mac_r], exempt=false, avoid=false, markers=[], ci=false),
+            0,
+            [mac_l, mac_r],
+            exempt = false,
+            avoid = false,
+            markers = [],
+            ci = false
+        ),
     ]
 });
 
@@ -618,7 +852,11 @@ static MARKER_INDEX: Lazy<MarkerIndex> = Lazy::new(|| {
             continue;
         }
         for m in r.markers {
-            let key = if r.markers_ci { m.to_lowercase() } else { (*m).to_string() };
+            let key = if r.markers_ci {
+                m.to_lowercase()
+            } else {
+                (*m).to_string()
+            };
             let pid = match patterns.iter().position(|p| *p == key) {
                 Some(i) => i,
                 None => {
@@ -645,10 +883,18 @@ static MARKER_INDEX: Lazy<MarkerIndex> = Lazy::new(|| {
             .ok()
     };
     let always_set = regex::RegexSet::new(
-        always.iter().map(|&i| RULES[i].rx.as_str()).collect::<Vec<_>>(),
+        always
+            .iter()
+            .map(|&i| RULES[i].rx.as_str())
+            .collect::<Vec<_>>(),
     )
     .expect("恒候选规则合并正则构建失败");
-    MarkerIndex { ac, marker_to_rules: remap, always, always_set }
+    MarkerIndex {
+        ac,
+        marker_to_rules: remap,
+        always,
+        always_set,
+    }
 });
 
 /// 返回可能命中的规则下标（升序去重，调用方按序执行以保持
@@ -756,19 +1002,32 @@ mod tests {
     #[test]
     fn phone_matches() {
         assert_eq!(mask_hits("PHONE", "电话13812345678"), vec!["13812345678"]);
-        assert_eq!(mask_hits("PHONE", "电话138-1234-5678"), vec!["138-1234-5678"]);
-        assert_eq!(mask_hits("PHONE", "+86 13812345678"), vec!["+86 13812345678"]);
+        assert_eq!(
+            mask_hits("PHONE", "电话138-1234-5678"),
+            vec!["138-1234-5678"]
+        );
+        assert_eq!(
+            mask_hits("PHONE", "+86 13812345678"),
+            vec!["+86 13812345678"]
+        );
         assert_eq!(mask_hits("PHONE", "8613812345678"), vec!["8613812345678"]);
         assert!(mask_hits("PHONE", "commit 8613812345678abcdef").is_empty());
     }
 
     #[test]
     fn email_matches() {
-        assert_eq!(mask_hits("EMAIL", "test@example.com"), vec!["test@example.com"]);
+        assert_eq!(
+            mask_hits("EMAIL", "test@example.com"),
+            vec!["test@example.com"]
+        );
         assert_eq!(mask_hits("EMAIL", "张三@qq.com"), vec!["张三@qq.com"]);
         // 首字符类排除 +-：+ 不会吃进本地部分，但 u 起点的 user@example.com 照常命中（与 Python 一致）
         let h1 = mask_hits("EMAIL", "+user@example.com");
-        assert_eq!(h1, vec!["user@example.com"], "首字符类排除 + 是指 + 不进本地部分");
+        assert_eq!(
+            h1,
+            vec!["user@example.com"],
+            "首字符类排除 + 是指 + 不进本地部分"
+        );
     }
 
     #[test]
@@ -807,12 +1066,24 @@ mod tests {
 
     #[test]
     fn ip_rules() {
-        assert_eq!(mask_hits("IP_PRIVATE", "内网192.168.1.1"), vec!["192.168.1.1"]);
-        assert_eq!(mask_hits("IP_PRIVATE", "链路169.254.1.2"), vec!["169.254.1.2"]);
-        assert_eq!(mask_hits("IP_PRIVATE", "ts 100.118.224.56"), vec!["100.118.224.56"]);
+        assert_eq!(
+            mask_hits("IP_PRIVATE", "内网192.168.1.1"),
+            vec!["192.168.1.1"]
+        );
+        assert_eq!(
+            mask_hits("IP_PRIVATE", "链路169.254.1.2"),
+            vec!["169.254.1.2"]
+        );
+        assert_eq!(
+            mask_hits("IP_PRIVATE", "ts 100.118.224.56"),
+            vec!["100.118.224.56"]
+        );
         assert!(mask_hits("IP_PRIVATE", "版本 192.168.1.1.1").is_empty()); // 5 段不算
         assert!(!mask_hits("IP_INTERNAL", "内网 10.1.2.3").is_empty());
-        assert_eq!(mask_hits("IP_PUBLIC", "访问 123.57.89.10"), vec!["123.57.89.10"]);
+        assert_eq!(
+            mask_hits("IP_PUBLIC", "访问 123.57.89.10"),
+            vec!["123.57.89.10"]
+        );
         assert!(mask_hits("IP_PUBLIC", "DNS 8.8.8.8").is_empty());
         assert!(mask_hits("IP_PUBLIC", "版本 1.2.3.4").is_empty());
         assert!(!mask_hits("IP_PUBLIC", "lib-1.2.3.4").is_empty() || true);

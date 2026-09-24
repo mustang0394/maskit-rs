@@ -108,7 +108,11 @@ fn bench_body(size: usize, iters: usize) -> (f64, f64, f64) {
         store.drop_session(&sid);
     }
     samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    (pct(&samples, 0.5), pct(&samples, 0.99), samples[samples.len() - 1])
+    (
+        pct(&samples, 0.5),
+        pct(&samples, 0.99),
+        samples[samples.len() - 1],
+    )
 }
 
 // ===========================================================================
@@ -153,7 +157,10 @@ fn perf_256kb_and_8kb_scale_linearly() {
 #[test]
 fn perf_1mb_body_still_bounded() {
     let (p50, p99, _) = bench_body(1024 * 1024, 25);
-    println!("1MB 脱敏: p50={p50:.2}ms p99={p99:.2}ms（CPU 配额 {:.2} 核）", cpu_quota());
+    println!(
+        "1MB 脱敏: p50={p50:.2}ms p99={p99:.2}ms（CPU 配额 {:.2} 核）",
+        cpu_quota()
+    );
     assert!(p99 < 500.0, "1MB P99 = {p99:.1}ms（护栏）");
 }
 
@@ -280,7 +287,10 @@ fn perf_adversarial_prefixes_linear() {
             times.push(t0.elapsed().as_secs_f64() * 1000.0);
         }
         let ratio = times[1] / times[0].max(0.001);
-        println!("{name}: 1x={:.2}ms 8x={:.2}ms 倍率={ratio:.1}", times[0], times[1]);
+        println!(
+            "{name}: 1x={:.2}ms 8x={:.2}ms 倍率={ratio:.1}",
+            times[0], times[1]
+        );
         assert!(
             ratio < 30.0,
             "{name} 体量 ×8 耗时 ×{ratio:.1}（线性≈8、二次≈64）→ 疑似回溯退化"
@@ -316,7 +326,10 @@ fn perf_restore_many_placeholders_linear() {
         times.push(best);
     }
     let ratio = times[1] / times[0].max(0.001);
-    println!("还原: 1x={:.2}ms 8x={:.2}ms 倍率={ratio:.1}", times[0], times[1]);
+    println!(
+        "还原: 1x={:.2}ms 8x={:.2}ms 倍率={ratio:.1}",
+        times[0], times[1]
+    );
     assert!(ratio < 30.0, "还原体量 ×8 耗时 ×{ratio:.1}（疑似超线性）");
 }
 
@@ -356,8 +369,7 @@ fn perf_concurrent_sessions_no_lock_contention() {
                     for i in 0..per_thread {
                         let sid = format!("par-{t}-{i}");
                         store.new_session(&sid);
-                        let ctx =
-                            MaskCtx::new(&cfg, &store, sid.clone(), &custom);
+                        let ctx = MaskCtx::new(&cfg, &store, sid.clone(), &custom);
                         let _ = mask_body(&raw, &ctx);
                         store.drop_session(&sid);
                     }
@@ -371,7 +383,9 @@ fn perf_concurrent_sessions_no_lock_contention() {
         t0.elapsed().as_secs_f64() * 1000.0
     };
     let speedup = t_serial / t_parallel.max(0.001);
-    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
     println!(
         "串行 {t_serial:.1}ms 并发({threads}线程) {t_parallel:.1}ms 加速比 {speedup:.2}x（{cores} 核）"
     );
@@ -399,7 +413,8 @@ fn perf_clean_body_fast_path() {
             serde_json::json!({"role": "user", "content": format!("请解释这段 Rust 代码的作用 #{i}: let v: Vec<u8> = b\"abc\".to_vec();")})
         })
         .collect();
-    let raw = serde_json::to_vec(&serde_json::json!({"model": "gpt-4o", "messages": msgs})).unwrap();
+    let raw =
+        serde_json::to_vec(&serde_json::json!({"model": "gpt-4o", "messages": msgs})).unwrap();
     store.new_session("clean");
     let ctx = MaskCtx::new(&cfg, &store, "clean".into(), &custom);
     // 预热

@@ -12,8 +12,14 @@ use std::collections::HashSet;
 pub fn skip_scalar_keys() -> &'static HashSet<&'static str> {
     static S: once_cell::sync::Lazy<HashSet<&'static str>> = once_cell::sync::Lazy::new(|| {
         [
-            "model", "object", "finish_reason", "stop_reason",
-            "citations", "detail", "encoding_format", "media_type",
+            "model",
+            "object",
+            "finish_reason",
+            "stop_reason",
+            "citations",
+            "detail",
+            "encoding_format",
+            "media_type",
         ]
         .into_iter()
         .collect()
@@ -32,9 +38,21 @@ pub fn skip_subtree_keys() -> &'static HashSet<&'static str> {
 pub fn role_type_parents() -> &'static HashSet<&'static str> {
     static S: once_cell::sync::Lazy<HashSet<&'static str>> = once_cell::sync::Lazy::new(|| {
         [
-            "message", "messages", "content", "contents", "parts", "block", "blocks",
-            "tools", "tool", "tool_calls", "function", "response_format",
-            "candidates", "choices", "output",
+            "message",
+            "messages",
+            "content",
+            "contents",
+            "parts",
+            "block",
+            "blocks",
+            "tools",
+            "tool",
+            "tool_calls",
+            "function",
+            "response_format",
+            "candidates",
+            "choices",
+            "output",
         ]
         .into_iter()
         .collect()
@@ -46,9 +64,22 @@ pub fn role_type_parents() -> &'static HashSet<&'static str> {
 pub fn protocol_id_parents() -> &'static HashSet<&'static str> {
     static S: once_cell::sync::Lazy<HashSet<&'static str>> = once_cell::sync::Lazy::new(|| {
         [
-            "message", "messages", "content", "contents", "parts", "block", "blocks",
-            "tool_calls", "tool_use", "response", "output", "data", "object",
-            "candidates", "choices", "function_call",
+            "message",
+            "messages",
+            "content",
+            "contents",
+            "parts",
+            "block",
+            "blocks",
+            "tool_calls",
+            "tool_use",
+            "response",
+            "output",
+            "data",
+            "object",
+            "candidates",
+            "choices",
+            "function_call",
         ]
         .into_iter()
         .collect()
@@ -60,8 +91,19 @@ pub fn protocol_id_parents() -> &'static HashSet<&'static str> {
 pub fn protocol_parents() -> &'static HashSet<&'static str> {
     static S: once_cell::sync::Lazy<HashSet<&'static str>> = once_cell::sync::Lazy::new(|| {
         [
-            "function", "functions", "function_call", "functionCall", "tool_use", "tools",
-            "tool", "image_url", "inline_data", "thumbnail", "input_image", "source", "file",
+            "function",
+            "functions",
+            "function_call",
+            "functionCall",
+            "tool_use",
+            "tools",
+            "tool",
+            "image_url",
+            "inline_data",
+            "thumbnail",
+            "input_image",
+            "source",
+            "file",
         ]
         .into_iter()
         .collect()
@@ -72,9 +114,17 @@ pub fn protocol_parents() -> &'static HashSet<&'static str> {
 /// 需按位置判定的跳过键。
 pub fn skip_keys() -> &'static HashSet<&'static str> {
     static S: once_cell::sync::Lazy<HashSet<&'static str>> = once_cell::sync::Lazy::new(|| {
-        ["id", "tool_call_id", "tool_use_id", "name", "url", "data", "b64_json"]
-            .into_iter()
-            .collect()
+        [
+            "id",
+            "tool_call_id",
+            "tool_use_id",
+            "name",
+            "url",
+            "data",
+            "b64_json",
+        ]
+        .into_iter()
+        .collect()
     });
     &S
 }
@@ -82,7 +132,9 @@ pub fn skip_keys() -> &'static HashSet<&'static str> {
 /// 工具调用关联 ID：不分业务区一律豁免。
 pub fn correlation_id_keys() -> &'static HashSet<&'static str> {
     static S: once_cell::sync::Lazy<HashSet<&'static str>> = once_cell::sync::Lazy::new(|| {
-        ["tool_call_id", "tool_use_id", "call_id"].into_iter().collect()
+        ["tool_call_id", "tool_use_id", "call_id"]
+            .into_iter()
+            .collect()
     });
     &S
 }
@@ -90,9 +142,15 @@ pub fn correlation_id_keys() -> &'static HashSet<&'static str> {
 /// 业务区容器键：进入后任何字段都照常扫描。
 pub fn business_keys() -> &'static HashSet<&'static str> {
     static S: once_cell::sync::Lazy<HashSet<&'static str>> = once_cell::sync::Lazy::new(|| {
-        ["input", "arguments", "parameters", "partial_json", "documents"]
-            .into_iter()
-            .collect()
+        [
+            "input",
+            "arguments",
+            "parameters",
+            "partial_json",
+            "documents",
+        ]
+        .into_iter()
+        .collect()
     });
     &S
 }
@@ -105,12 +163,37 @@ pub const RESTORE_MAX_DEPTH: usize = 24;
 pub fn skip_numeric_keys() -> &'static HashSet<&'static str> {
     static S: once_cell::sync::Lazy<HashSet<&'static str>> = once_cell::sync::Lazy::new(|| {
         [
-            "max_tokens", "max_completion_tokens", "max_tokens_to_sample", "budget_tokens",
-            "temperature", "top_p", "top_k", "n", "seed", "index", "created", "logprobs",
-            "top_logprobs", "presence_penalty", "frequency_penalty", "best_of", "timeout",
-            "prompt_tokens", "completion_tokens", "total_tokens", "input_tokens", "output_tokens",
-            "cache_creation_input_tokens", "cache_read_input_tokens", "reasoning_tokens",
-            "status_code", "http_status", "retry", "attempt", "weight", "priority",
+            "max_tokens",
+            "max_completion_tokens",
+            "max_tokens_to_sample",
+            "budget_tokens",
+            "temperature",
+            "top_p",
+            "top_k",
+            "n",
+            "seed",
+            "index",
+            "created",
+            "logprobs",
+            "top_logprobs",
+            "presence_penalty",
+            "frequency_penalty",
+            "best_of",
+            "timeout",
+            "prompt_tokens",
+            "completion_tokens",
+            "total_tokens",
+            "input_tokens",
+            "output_tokens",
+            "cache_creation_input_tokens",
+            "cache_read_input_tokens",
+            "reasoning_tokens",
+            "status_code",
+            "http_status",
+            "retry",
+            "attempt",
+            "weight",
+            "priority",
         ]
         .into_iter()
         .collect()
@@ -130,39 +213,140 @@ pub fn protected_key_names() -> &'static HashSet<&'static str> {
         s.extend(protocol_parents().iter().copied());
         s.extend(protocol_id_parents().iter().copied());
         s.extend(business_keys().iter().copied());
-        s.extend(
-            [
-                // 对话协议骨架
-                "role", "type", "content", "contents", "parts", "messages", "message",
-                "system", "user", "assistant", "tool", "tools", "function", "functions",
-                "prompt", "input", "output", "text", "delta", "choices", "candidates",
-                "usage", "error", "code", "status", "version", "headers", "request",
-                "response", "metadata", "stream", "stop", "stop_sequences", "logit_bias",
-                "response_format", "stream_options", "parallel_tool_calls", "tool_choice",
-                "system_instruction", "generationConfig", "safetySettings", "toolConfig",
-                "functionDeclarations", "functionCall", "inline_data", "image_url", "source",
-                "anthropic_version", "thinking", "signature",
-                // JSON Schema 词汇
-                "schema", "json_schema", "format", "definitions", "$defs", "$ref", "$schema",
-                "properties", "required", "items", "enum", "const", "description", "title",
-                "additionalProperties", "anyOf", "oneOf", "allOf", "not", "if", "then", "else",
-                "minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum",
-                "minLength", "maxLength", "minItems", "maxItems", "pattern", "default",
-                "examples", "nullable", "strict", "name", "strict_mode",
-                // 缓存 / 计费 / 诊断
-                "cache_control", "ttl", "ephemeral",
-                // 对话协议顶级控制参数
-                "temperature", "top_p", "top_k", "n", "max_tokens", "max_completion_tokens",
-                "max_output_tokens", "presence_penalty", "frequency_penalty", "seed",
-                "logprobs", "top_logprobs", "modalities", "audio", "prediction", "store",
-                "service_tier", "reasoning", "reasoning_effort", "thinking_budget",
-                "betas", "anthropic_beta", "context_management", "mcp_servers", "container",
-                "generation_config", "safety_settings", "candidate_count", "systemInstruction",
-                "session_id", "request_id", "keep_alive", "options", "api_key", "x_api_key",
-                "authorization", "instructions", "tool_config",
-            ]
-            ,
-        );
+        s.extend([
+            // 对话协议骨架
+            "role",
+            "type",
+            "content",
+            "contents",
+            "parts",
+            "messages",
+            "message",
+            "system",
+            "user",
+            "assistant",
+            "tool",
+            "tools",
+            "function",
+            "functions",
+            "prompt",
+            "input",
+            "output",
+            "text",
+            "delta",
+            "choices",
+            "candidates",
+            "usage",
+            "error",
+            "code",
+            "status",
+            "version",
+            "headers",
+            "request",
+            "response",
+            "metadata",
+            "stream",
+            "stop",
+            "stop_sequences",
+            "logit_bias",
+            "response_format",
+            "stream_options",
+            "parallel_tool_calls",
+            "tool_choice",
+            "system_instruction",
+            "generationConfig",
+            "safetySettings",
+            "toolConfig",
+            "functionDeclarations",
+            "functionCall",
+            "inline_data",
+            "image_url",
+            "source",
+            "anthropic_version",
+            "thinking",
+            "signature",
+            // JSON Schema 词汇
+            "schema",
+            "json_schema",
+            "format",
+            "definitions",
+            "$defs",
+            "$ref",
+            "$schema",
+            "properties",
+            "required",
+            "items",
+            "enum",
+            "const",
+            "description",
+            "title",
+            "additionalProperties",
+            "anyOf",
+            "oneOf",
+            "allOf",
+            "not",
+            "if",
+            "then",
+            "else",
+            "minimum",
+            "maximum",
+            "exclusiveMinimum",
+            "exclusiveMaximum",
+            "minLength",
+            "maxLength",
+            "minItems",
+            "maxItems",
+            "pattern",
+            "default",
+            "examples",
+            "nullable",
+            "strict",
+            "name",
+            "strict_mode",
+            // 缓存 / 计费 / 诊断
+            "cache_control",
+            "ttl",
+            "ephemeral",
+            // 对话协议顶级控制参数
+            "temperature",
+            "top_p",
+            "top_k",
+            "n",
+            "max_tokens",
+            "max_completion_tokens",
+            "max_output_tokens",
+            "presence_penalty",
+            "frequency_penalty",
+            "seed",
+            "logprobs",
+            "top_logprobs",
+            "modalities",
+            "audio",
+            "prediction",
+            "store",
+            "service_tier",
+            "reasoning",
+            "reasoning_effort",
+            "thinking_budget",
+            "betas",
+            "anthropic_beta",
+            "context_management",
+            "mcp_servers",
+            "container",
+            "generation_config",
+            "safety_settings",
+            "candidate_count",
+            "systemInstruction",
+            "session_id",
+            "request_id",
+            "keep_alive",
+            "options",
+            "api_key",
+            "x_api_key",
+            "authorization",
+            "instructions",
+            "tool_config",
+        ]);
         s
     });
     &S
@@ -196,21 +380,34 @@ pub fn leaf_exempt(key: Option<&str>, parent: Option<&str>, in_business: bool) -
         return true;
     }
     if (key == "role" || key == "type")
-        && (parent.is_none() || parent.map(|p| role_type_parents().contains(p)).unwrap_or(false))
+        && (parent.is_none()
+            || parent
+                .map(|p| role_type_parents().contains(p))
+                .unwrap_or(false))
     {
         return true;
     }
     if skip_keys().contains(key) {
         // 协议位置判定
-        if key == "name" && !parent.map(|p| protocol_parents().contains(p)).unwrap_or(false) {
-            return false;
-        }
-        if (key == "url" || key == "data" || key == "b64_json" || key == "image_url")
-            && !parent.map(|p| protocol_parents().contains(p)).unwrap_or(false)
+        if key == "name"
+            && !parent
+                .map(|p| protocol_parents().contains(p))
+                .unwrap_or(false)
         {
             return false;
         }
-        if key == "id" && !parent.map(|p| protocol_id_parents().contains(p)).unwrap_or(false) {
+        if (key == "url" || key == "data" || key == "b64_json" || key == "image_url")
+            && !parent
+                .map(|p| protocol_parents().contains(p))
+                .unwrap_or(false)
+        {
+            return false;
+        }
+        if key == "id"
+            && !parent
+                .map(|p| protocol_id_parents().contains(p))
+                .unwrap_or(false)
+        {
             return false;
         }
         return true;
@@ -264,24 +461,75 @@ mod tests {
     fn protected_key_names_cover_protocol_top_keys() {
         // 广谱护栏：协议顶层键必须全在白名单里（否则上游 400）
         let keys = [
-            "model", "messages", "system", "prompt", "input", "instructions",
-            "tools", "tool_choice", "tool_config", "functions", "function_call",
-            "temperature", "top_p", "top_k", "max_tokens", "max_completion_tokens",
-            "max_output_tokens", "stream", "stream_options", "stop", "n", "seed",
-            "logprobs", "top_logprobs", "logit_bias", "presence_penalty",
-            "frequency_penalty", "user", "metadata", "response_format",
-            "modalities", "audio", "prediction", "store", "service_tier",
-            "reasoning", "reasoning_effort", "thinking", "thinking_budget",
-            "cache_control", "betas", "anthropic_version", "anthropic_beta",
-            "context_management", "mcp_servers", "container", "parallel_tool_calls",
-            "contents", "generation_config", "safety_settings", "candidate_count",
-            "safetySettings", "generationConfig", "systemInstruction",
-            "session_id", "request_id", "keep_alive", "options", "format",
-            "api_key", "x_api_key", "authorization",
+            "model",
+            "messages",
+            "system",
+            "prompt",
+            "input",
+            "instructions",
+            "tools",
+            "tool_choice",
+            "tool_config",
+            "functions",
+            "function_call",
+            "temperature",
+            "top_p",
+            "top_k",
+            "max_tokens",
+            "max_completion_tokens",
+            "max_output_tokens",
+            "stream",
+            "stream_options",
+            "stop",
+            "n",
+            "seed",
+            "logprobs",
+            "top_logprobs",
+            "logit_bias",
+            "presence_penalty",
+            "frequency_penalty",
+            "user",
+            "metadata",
+            "response_format",
+            "modalities",
+            "audio",
+            "prediction",
+            "store",
+            "service_tier",
+            "reasoning",
+            "reasoning_effort",
+            "thinking",
+            "thinking_budget",
+            "cache_control",
+            "betas",
+            "anthropic_version",
+            "anthropic_beta",
+            "context_management",
+            "mcp_servers",
+            "container",
+            "parallel_tool_calls",
+            "contents",
+            "generation_config",
+            "safety_settings",
+            "candidate_count",
+            "safetySettings",
+            "generationConfig",
+            "systemInstruction",
+            "session_id",
+            "request_id",
+            "keep_alive",
+            "options",
+            "format",
+            "api_key",
+            "x_api_key",
+            "authorization",
         ];
         let prot = protected_key_names();
         for k in keys {
-            assert!(prot.contains(k), "协议顶层键 {k} 不在白名单（会被键名脱敏改名 → 上游 400）");
+            assert!(
+                prot.contains(k),
+                "协议顶层键 {k} 不在白名单（会被键名脱敏改名 → 上游 400）"
+            );
         }
     }
 

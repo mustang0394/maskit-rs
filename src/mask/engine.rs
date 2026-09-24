@@ -111,7 +111,12 @@ impl CustomWords {
             .filter(|(w, _)| !w.is_empty() && w.chars().count() <= 200)
             .collect();
         // 长词优先
-        words.sort_by(|a, b| b.0.chars().count().cmp(&a.0.chars().count()).then(a.0.cmp(&b.0)));
+        words.sort_by(|a, b| {
+            b.0.chars()
+                .count()
+                .cmp(&a.0.chars().count())
+                .then(a.0.cmp(&b.0))
+        });
         let patterns: Vec<String> = words.iter().map(|(w, _)| w.clone()).collect();
         let ac = if patterns.is_empty() {
             None
@@ -225,7 +230,13 @@ impl<'a> MaskCtx<'a> {
         custom: &'a CustomWords,
     ) -> Self {
         let prefix_rx = prefix_regex(&cfg.mask.secret_prefixes);
-        Self { cfg, store, sid, custom, prefix_rx }
+        Self {
+            cfg,
+            store,
+            sid,
+            custom,
+            prefix_rx,
+        }
     }
 
     /// 已在构造期编译好的前缀正则（clone 成本 = Arc 原子加）。
@@ -338,7 +349,9 @@ impl<'a> MaskCtx<'a> {
                 }
                 // EMAIL 与豁免区间重叠 → 跳过
                 if rule.avoid_exempt
-                    && exempt_conn.iter().any(|(s, e)| m0.start() < *e && m0.end() > *s)
+                    && exempt_conn
+                        .iter()
+                        .any(|(s, e)| m0.start() < *e && m0.end() > *s)
                 {
                     continue;
                 }
@@ -566,7 +579,8 @@ impl<'a> MaskCtx<'a> {
         for (_pat, label, compiled) in &self.custom.regex_words {
             match compiled {
                 CompiledUserRegex::Linear(rx) => {
-                    let origs: Vec<String> = rx.find_iter(&out).map(|m| m.as_str().to_string()).collect();
+                    let origs: Vec<String> =
+                        rx.find_iter(&out).map(|m| m.as_str().to_string()).collect();
                     if !origs.is_empty() {
                         out = self.replace_unique(&out, rx, 0, &origs, label, taken);
                         hits.extend(origs.iter().cloned());
@@ -837,8 +851,7 @@ fn restore_pass_loose(
             }
             None => {
                 // 前一字符是反斜杠 → 转义块内部片段，不重复计数
-                let prev_backslash =
-                    m0.start() > 0 && text[..m0.start()].ends_with('\\');
+                let prev_backslash = m0.start() > 0 && text[..m0.start()].ends_with('\\');
                 if !prev_backslash {
                     stats.unresolved += 1;
                     if stats.samples.len() < 5 && !stats.samples.contains(&whole.to_string()) {
@@ -940,7 +953,11 @@ mod tests {
         let parts = test_ctx(&[]);
         let masked = mask_with(&parts, r#"config api_key="sk-abcdefghijklmnop123456""#);
         assert!(!masked.contains("sk-abcdefghijklmnop123456"));
-        assert_eq!(masked.matches("{{").count(), 1, "只能有一个占位符，不得嵌套");
+        assert_eq!(
+            masked.matches("{{").count(),
+            1,
+            "只能有一个占位符，不得嵌套"
+        );
         let restored = restore_with(&parts, &masked);
         assert!(!restored.contains("{{"));
         assert!(restored.contains("sk-abcdefghijklmnop123456"));
@@ -957,13 +974,21 @@ mod tests {
     fn multi_turn_reuses_token() {
         let parts = test_ctx(&[("张三", "PERSON")]);
         let m1 = mask_with(&parts, "客户张三");
-        let t1 = placeholder::placeholder_rx().find(&m1).unwrap().as_str().to_string();
+        let t1 = placeholder::placeholder_rx()
+            .find(&m1)
+            .unwrap()
+            .as_str()
+            .to_string();
         // 第二轮同原文
         let store = &parts.1;
         store.new_session("t2");
         let ctx2 = MaskCtx::new(&parts.0, store, "t2".into(), &parts.2);
         let m2 = ctx2.mask("客户张三");
-        let t2 = placeholder::placeholder_rx().find(&m2).unwrap().as_str().to_string();
+        let t2 = placeholder::placeholder_rx()
+            .find(&m2)
+            .unwrap()
+            .as_str()
+            .to_string();
         assert_eq!(t1, t2, "多轮对话同一实体同占位符");
     }
 
@@ -1044,7 +1069,13 @@ mod tests {
     fn unknown_placeholder_left_alone() {
         let parts = test_ctx(&[]);
         let mut stats = RestoreStats::default();
-        let out = restore_final("value {{EMAIL_bcdfgh}} end", "t", false, &parts.1, &mut stats);
+        let out = restore_final(
+            "value {{EMAIL_bcdfgh}} end",
+            "t",
+            false,
+            &parts.1,
+            &mut stats,
+        );
         assert!(out.contains("{{EMAIL_bcdfgh}}"), "查不到原文原样放行");
         assert_eq!(stats.unresolved, 1);
     }

@@ -57,7 +57,10 @@ pub fn parse_target(target: &str) -> Result<TargetParts, String> {
         match authority.rsplit_once(':') {
             Some((h, p)) => match p.parse::<u16>() {
                 Ok(p) => (h.to_string(), p),
-                Err(_) => (authority.to_string(), if scheme == "https" { 443 } else { 80 }),
+                Err(_) => (
+                    authority.to_string(),
+                    if scheme == "https" { 443 } else { 80 },
+                ),
             },
             None => (
                 authority.to_string(),
@@ -73,7 +76,12 @@ pub fn parse_target(target: &str) -> Result<TargetParts, String> {
     } else {
         path.trim_end_matches('/').to_string()
     };
-    Ok(TargetParts { scheme: scheme.into(), host, port, path_prefix })
+    Ok(TargetParts {
+        scheme: scheme.into(),
+        host,
+        port,
+        path_prefix,
+    })
 }
 
 /// 上游客户端。整个进程一个实例（连接池内建）。
@@ -101,13 +109,13 @@ impl UpstreamClient {
     pub fn new(cfg: &crate::config::UpstreamConfig) -> Result<Self, String> {
         let target = parse_target(&cfg.target)?;
         let mut http_connector = HttpConnector::new();
-        http_connector.set_connect_timeout(Some(Duration::from_secs(cfg.connect_timeout_secs.max(1))));
+        http_connector
+            .set_connect_timeout(Some(Duration::from_secs(cfg.connect_timeout_secs.max(1))));
         http_connector.set_nodelay(true);
-        let client: Client<_, http_body_util::Full<Bytes>> =
-            Client::builder(TokioExecutor::new())
-                .pool_idle_timeout(Duration::from_secs(90))
-                .pool_timer(TokioTimer::new())
-                .build(http_connector);
+        let client: Client<_, http_body_util::Full<Bytes>> = Client::builder(TokioExecutor::new())
+            .pool_idle_timeout(Duration::from_secs(90))
+            .pool_timer(TokioTimer::new())
+            .build(http_connector);
         let extra = {
             let mut v = Vec::new();
             for (k, val) in &cfg.extra_headers {
@@ -119,7 +127,12 @@ impl UpstreamClient {
             }
             v
         };
-        Ok(Self { http: client, target, extra_headers: extra, connect_timeout: Duration::from_secs(cfg.connect_timeout_secs.max(1)) })
+        Ok(Self {
+            http: client,
+            target,
+            extra_headers: extra,
+            connect_timeout: Duration::from_secs(cfg.connect_timeout_secs.max(1)),
+        })
     }
 
     /// 构造发往上游的请求。
@@ -164,7 +177,8 @@ impl UpstreamClient {
         }
         // Full body：声明 content-length
         if body_len > 0 {
-            req.headers_mut().insert(hyper::header::CONTENT_LENGTH, HeaderValue::from(body_len));
+            req.headers_mut()
+                .insert(hyper::header::CONTENT_LENGTH, HeaderValue::from(body_len));
         }
         for (k, v) in &self.extra_headers {
             req.headers_mut().insert(k, v.clone());
@@ -241,10 +255,7 @@ pub fn empty_body() -> http_body_util::Full<Bytes> {
 }
 
 /// Incoming body 聚合为 Bytes（带上限）。
-pub async fn read_body_limited(
-    mut body: Incoming,
-    limit: usize,
-) -> Result<Bytes, String> {
+pub async fn read_body_limited(mut body: Incoming, limit: usize) -> Result<Bytes, String> {
     let mut buf = bytes::BytesMut::with_capacity(8 * 1024);
     while let Some(frame) = body.frame().await {
         let data = frame.map_err(|e| format!("读取 body 失败: {e}"))?;
@@ -269,7 +280,6 @@ pub fn forward_headers(headers: &HeaderMap) -> HeaderMap {
     }
     out
 }
-
 
 #[cfg(test)]
 mod tests {

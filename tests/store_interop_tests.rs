@@ -3,9 +3,9 @@
 //! 验证方式：用 rusqlite 直接按 Python schema 写入一条「Python 版形态」的事件行，
 //! 再由 Rust 侧 `EventStore` 读回并校验字段；反向亦然。
 
-use rusqlite::{params, Connection};
 use maskit_rs::store::db::{init_schema, EventStore};
 use maskit_rs::store::events::{AuditEvent, Event, EventItem, EventType};
+use rusqlite::{params, Connection};
 
 /// Python 版事件 payload 的真实形态（字段名与 event_store.py 一致）。
 fn python_style_payload() -> String {
@@ -49,8 +49,15 @@ fn schema_is_compatible_with_python() {
         .filter_map(|r| r.ok())
         .collect();
     for t in [
-        "audit_events", "daily_models", "daily_prefix", "daily_stats", "daily_status",
-        "daily_tokens", "daily_words", "events", "meta",
+        "audit_events",
+        "daily_models",
+        "daily_prefix",
+        "daily_stats",
+        "daily_status",
+        "daily_tokens",
+        "daily_words",
+        "events",
+        "meta",
     ] {
         assert!(tables.contains(&t.to_string()), "缺表 {t}");
     }
@@ -103,7 +110,11 @@ fn rust_reads_python_written_events() {
     assert_eq!(raw.len(), 1);
     // payload 能被 Rust 的 Event 结构解析（字段兼容性验证）
     let parsed: Result<Event, _> = serde_json::from_str(&raw[0]);
-    assert!(parsed.is_ok(), "Rust 必须能解析 Python 写的 payload: {:?}", parsed.err());
+    assert!(
+        parsed.is_ok(),
+        "Rust 必须能解析 Python 写的 payload: {:?}",
+        parsed.err()
+    );
     let ev = parsed.unwrap();
     assert_eq!(ev.method, "POST");
     assert_eq!(ev.path, "/v1/chat/completions");
@@ -165,9 +176,11 @@ fn python_can_read_rust_written_events() {
     // 模拟 Python 读取：按 Python 的 SQL 与字段访问方式
     let conn = Connection::open(store.path()).unwrap();
     let (ts, etype, payload): (f64, String, String) = conn
-        .query_row("SELECT ts, type, payload FROM events ORDER BY id DESC LIMIT 1", [], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-        })
+        .query_row(
+            "SELECT ts, type, payload FROM events ORDER BY id DESC LIMIT 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
         .unwrap();
     assert_eq!(etype, "MASK", "type 用大写（Python 版口径）");
     assert!((ts - 1758600001.0).abs() < 0.01);
@@ -179,7 +192,9 @@ fn python_can_read_rust_written_events() {
     assert_eq!(v["items"][0]["original"], "a@example.com");
     assert_eq!(v["stream_mode"], "");
     // Python 的 today_stats 查询口径（daily_stats + daily_words）
-    let day: String = conn.query_row("SELECT date('now')", [], |r| r.get(0)).unwrap();
+    let day: String = conn
+        .query_row("SELECT date('now')", [], |r| r.get(0))
+        .unwrap();
     let mask_events: i64 = conn
         .query_row(
             "SELECT cnt FROM daily_stats WHERE day = ?1 AND key = 'mask_events'",

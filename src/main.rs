@@ -97,15 +97,25 @@ fn main() {
         .build()
         .expect("tokio runtime");
 
-    tracing::info!("Maskit-RS 启动: http://{}:{}  数据目录: {:?}", bind, port, data_dir);
-    tracing::info!("控制台: http://{}:{}/console  （令牌见 config.json panel_token）", bind, port);
+    tracing::info!(
+        "Maskit-RS 启动: http://{}:{}  数据目录: {:?}",
+        bind,
+        port,
+        data_dir
+    );
+    tracing::info!(
+        "控制台: http://{}:{}/console  （令牌见 config.json panel_token）",
+        bind,
+        port
+    );
     tracing::info!("客户端 base_url: http://127.0.0.1:{}/<原路径>", port);
     tracing::debug!(token = %token, "panel token");
 
     // 后台维护任务：会话 sweep + 事件保留期清理
     if let Some(es) = event_store.clone() {
         let cfg2 = cfg.clone();
-        let store_static: &'static maskit_rs::mask::session::SessionStore = &maskit_rs::mask::session::STORE;
+        let store_static: &'static maskit_rs::mask::session::SessionStore =
+            &maskit_rs::mask::session::STORE;
         std::thread::spawn(move || loop {
             std::thread::sleep(std::time::Duration::from_secs(30));
             store_static.sweep(cfg2.mask.session_ttl as f64);
@@ -128,7 +138,6 @@ fn main() {
             .expect("服务器运行失败");
     });
 }
-
 
 /// 容器健康检查：请求本机 `/console/api/health`（免鉴权端点）。
 ///

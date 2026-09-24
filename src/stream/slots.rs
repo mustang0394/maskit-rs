@@ -19,8 +19,14 @@ fn choice_index(choice: &Value, position: usize) -> usize {
 
 /// Responses API 的通道键（同一 output item 的多 content part 分开）。
 fn response_channel(data: &Value, kind: &str) -> String {
-    let ci = data.get("content_index").and_then(Value::as_u64).unwrap_or(0);
-    let oi = data.get("output_index").and_then(Value::as_u64).unwrap_or(0);
+    let ci = data
+        .get("content_index")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let oi = data
+        .get("output_index")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
     if ci > 0 {
         format!("r{oi}.{ci}.{kind}")
     } else {
@@ -31,7 +37,9 @@ fn response_channel(data: &Value, kind: &str) -> String {
 /// 列出 SSE 事件里的增量文本槽位。
 pub fn text_slots(data: &Value) -> Vec<Slot> {
     let mut slots = Vec::new();
-    let Some(obj) = data.as_object() else { return slots };
+    let Some(obj) = data.as_object() else {
+        return slots;
+    };
     // OpenAI Chat Completions / Completions 流
     if let Some(choices) = obj.get("choices").and_then(Value::as_array) {
         for (position, c) in choices.iter().enumerate() {
@@ -127,10 +135,15 @@ pub fn text_slots(data: &Value) -> Vec<Slot> {
 
 /// 本事件后应结束（flush）的通道前缀。None = 全部，空 = 无。
 pub fn terminal_prefixes(data: &Value) -> Option<Vec<String>> {
-    let Some(obj) = data.as_object() else { return Some(vec![]) };
+    let Some(obj) = data.as_object() else {
+        return Some(vec![]);
+    };
     let t = obj.get("type").and_then(Value::as_str).unwrap_or("");
     match t {
-        "message_stop" | "message_delta" | "response.completed" | "response.incomplete"
+        "message_stop"
+        | "message_delta"
+        | "response.completed"
+        | "response.incomplete"
         | "response.failed" => return None,
         "content_block_stop" => {
             let blk = obj.get("index").and_then(Value::as_u64).unwrap_or(0);
@@ -140,14 +153,19 @@ pub fn terminal_prefixes(data: &Value) -> Option<Vec<String>> {
         "response.reasoning_text.done" | "response.reasoning_summary_text.done" => {
             return Some(vec![response_channel(data, "reason")]);
         }
-        "response.function_call_arguments.done" => return Some(vec![response_channel(data, "args")]),
+        "response.function_call_arguments.done" => {
+            return Some(vec![response_channel(data, "args")])
+        }
         _ => {}
     }
     // choices[].finish_reason 存在 → 该 choice 的全部通道结束
     let mut prefixes = Vec::new();
     if let Some(choices) = obj.get("choices").and_then(Value::as_array) {
         for (position, c) in choices.iter().enumerate() {
-            if c.get("finish_reason").map(|f| !f.is_null()).unwrap_or(false) {
+            if c.get("finish_reason")
+                .map(|f| !f.is_null())
+                .unwrap_or(false)
+            {
                 prefixes.push(format!("c{}.", choice_index(c, position)));
             }
         }
@@ -160,10 +178,18 @@ pub fn set_slot(data: &mut Value, channel: &str, text: &str) {
     // c{idx}.content / reason / reason2 / tool{n} / fcall / text
     if let Some(rest) = channel.strip_prefix('c') {
         if let Some((idx_s, field)) = rest.split_once('.') {
-            let Ok(idx) = idx_s.parse::<usize>() else { return };
-            let Some(choices) = data.get_mut("choices").and_then(Value::as_array_mut) else { return };
+            let Ok(idx) = idx_s.parse::<usize>() else {
+                return;
+            };
+            let Some(choices) = data.get_mut("choices").and_then(Value::as_array_mut) else {
+                return;
+            };
             for (position, c) in choices.iter_mut().enumerate() {
-                let ci = c.get("index").and_then(Value::as_u64).map(|v| v as usize).unwrap_or(position);
+                let ci = c
+                    .get("index")
+                    .and_then(Value::as_u64)
+                    .map(|v| v as usize)
+                    .unwrap_or(position);
                 if ci != idx {
                     continue;
                 }
@@ -193,7 +219,9 @@ pub fn set_slot(data: &mut Value, channel: &str, text: &str) {
                         }
                     }
                     f if f.starts_with("tool") => {
-                        let Ok(n) = f[4..].parse::<usize>() else { return };
+                        let Ok(n) = f[4..].parse::<usize>() else {
+                            return;
+                        };
                         if let Some(tcs) = c
                             .get_mut("delta")
                             .and_then(|d| d.get_mut("tool_calls"))
@@ -274,7 +302,10 @@ mod tests {
         let chans: Vec<&str> = slots.iter().map(|(c, _, _)| c.as_str()).collect();
         assert!(chans.contains(&"c0.content"));
         assert!(chans.contains(&"c0.reason"));
-        assert!(chans.contains(&"c0.tool1"), "槽位用 tool_calls[].index 而非数组下标");
+        assert!(
+            chans.contains(&"c0.tool1"),
+            "槽位用 tool_calls[].index 而非数组下标"
+        );
         // 工具参数需转义
         let tool = slots.iter().find(|(c, _, _)| c == "c0.tool1").unwrap();
         assert!(tool.2, "tool arguments 必须走 JSON 转义还原");
@@ -320,7 +351,10 @@ mod tests {
     #[test]
     fn thinking_and_tool_slots_complete_coverage() {
         // Chat：reasoning_content / reasoning / tool_calls.arguments
-        for (field, want) in [("reasoning_content", "c0.reason"), ("reasoning", "c0.reason2")] {
+        for (field, want) in [
+            ("reasoning_content", "c0.reason"),
+            ("reasoning", "c0.reason2"),
+        ] {
             let d = json!({"choices": [{"delta": {field: "张三"}}]});
             assert_eq!(text_slots(&d)[0].0, want, "Chat {field} 未识别");
         }
@@ -378,7 +412,10 @@ mod tests {
             terminal_prefixes(&json!({"choices": [{"index": 0, "finish_reason": "stop"}]})),
             Some(vec!["c0.".to_string()])
         );
-        assert_eq!(terminal_prefixes(&json!({"choices": [{"delta": {}}]})), Some(vec![]));
+        assert_eq!(
+            terminal_prefixes(&json!({"choices": [{"delta": {}}]})),
+            Some(vec![])
+        );
     }
 
     #[test]
@@ -386,7 +423,8 @@ mod tests {
         let mut d = json!({"choices": [{"index": 0, "delta": {"content": "old"}}]});
         set_slot(&mut d, "c0.content", "new");
         assert_eq!(d["choices"][0]["delta"]["content"], "new");
-        let mut d2 = json!({"type": "content_block_delta", "index": 0, "delta": {"partial_json": "x"}});
+        let mut d2 =
+            json!({"type": "content_block_delta", "index": 0, "delta": {"partial_json": "x"}});
         set_slot(&mut d2, "a0.pj", "y");
         assert_eq!(d2["delta"]["partial_json"], "y");
         let mut d3 = json!({"type": "response.output_text.delta", "delta": "a"});

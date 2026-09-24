@@ -4,7 +4,7 @@
 //! 生成的负样本（每处边界 ±1 字符的 类成员/类外成员/文本首尾 组合）。
 
 use maskit_rs::config::Config;
-use maskit_rs::mask::engine::{MaskCtx, CustomWords};
+use maskit_rs::mask::engine::{CustomWords, MaskCtx};
 use maskit_rs::mask::session::SessionStore;
 
 fn full_rules() -> Config {
@@ -36,8 +36,10 @@ fn mask(parts: &(Config, SessionStore, CustomWords), text: &str) -> String {
 fn boundary_id_bound_r_phone() {
     let parts = fresh();
     // 类外成员后缀：字母 → 不命中
-    assert!(mask(&parts, "commit 8613812345678abcdef").contains("8613812345678abcdef")
-        || !mask(&parts, "commit 8613812345678abcdef").contains("{{"));
+    assert!(
+        mask(&parts, "commit 8613812345678abcdef").contains("8613812345678abcdef")
+            || !mask(&parts, "commit 8613812345678abcdef").contains("{{")
+    );
     // 类内成员后缀：空格 → 命中
     let m = mask(&parts, "号码 13812345678 后续");
     assert!(!m.contains("13812345678"));
@@ -121,7 +123,10 @@ fn boundary_email_word_prefix() {
     assert!(!m.contains("abcuser@example.com") || m.contains("{{"));
     // 下划线前缀仍命中（_ 在首字符类）
     let m2 = mask(&parts, "_svc@corp.com");
-    assert!(!m2.contains("_svc@corp.com") || m2.contains("{{"), "下划线开头是合法本地部分");
+    assert!(
+        !m2.contains("_svc@corp.com") || m2.contains("{{"),
+        "下划线开头是合法本地部分"
+    );
 }
 
 // ===========================================================================
@@ -136,7 +141,10 @@ fn boundary_apikey_underscores() {
     assert!(!mask(&parts, &format!("key {tok}")).contains(tok));
     // 左粘连：xghp_… 不命中
     let m = mask(&parts, &format!("x{tok}"));
-    assert!(m.contains(&format!("x{tok}")) || !m.contains("{{"), "左粘连不命中");
+    assert!(
+        m.contains(&format!("x{tok}")) || !m.contains("{{"),
+        "左粘连不命中"
+    );
     // 右粘连：ghp_…xyz 多一位字母 → 正则 {20,} 贪婪仍会命中（与 Python 一致）
     // Python: (?!...) 右边界也是贪婪内含，延长不拒绝
 }
@@ -146,7 +154,10 @@ fn boundary_slack_token_dash_end() {
     let parts = fresh();
     // 尾部 dash 被贪婪值字符类（含 -）吃掉：Python 同款命中
     let m = mask(&parts, "token xoxb-abcdefghijk-");
-    assert!(!m.contains("xoxb-abcdefghijk-"), "值类含 - 贪婪吃掉尾部 dash");
+    assert!(
+        !m.contains("xoxb-abcdefghijk-"),
+        "值类含 - 贪婪吃掉尾部 dash"
+    );
 }
 
 // ===========================================================================
@@ -159,7 +170,10 @@ fn boundary_aws_ak() {
     assert!(!mask(&parts, "AKIAIOSFODNN7EXAMPLE").contains("AKIAIOSFODNN7EXAMPLE"));
     // 左边界 [A-Z0-9]：小写 x 不在类内 → Python 照样命中（贪婪内含验证）
     let m = mask(&parts, "xAKIAIOSFODNN7EXAMPLE");
-    assert!(!m.contains("AKIAIOSFODNN7EXAMPLE"), "小写前缀不挡 [A-Z0-9] 断言");
+    assert!(
+        !m.contains("AKIAIOSFODNN7EXAMPLE"),
+        "小写前缀不挡 [A-Z0-9] 断言"
+    );
 }
 
 // ===========================================================================
@@ -171,8 +185,10 @@ fn boundary_secret_key_word_prefix() {
     let parts = fresh();
     // mypassword=… 前缀粘连：Python (?<![A-Za-z0-9_.]) → mypassword 整体不命中
     let m = mask(&parts, "mypassword=ServerPass123!");
-    assert!(m.contains("mypassword=ServerPass123") || m.contains("ServerPass123"),
-        "键名前缀粘连不该命中：{m}");
+    assert!(
+        m.contains("mypassword=ServerPass123") || m.contains("ServerPass123"),
+        "键名前缀粘连不该命中：{m}"
+    );
     // 纯键名命中
     let m2 = mask(&parts, "password=ServerPass123!");
     assert!(!m2.contains("ServerPass123!"));
@@ -225,7 +241,10 @@ fn boundary_connstr_word_boundary() {
     assert!(!m.contains("Zq9xLm2pTv8w"));
     // xhttps:// 是合法 scheme（x/h/t/s 都在 [a-z0-9+.-]）-> Python 命中，Rust 同
     let m2 = mask(&parts, "xhttps://usr:Zq9xLm2pTv8w@db.internal");
-    assert!(!m2.contains("Zq9xLm2pTv8w"), "xhttps 是合法 scheme，照常命中");
+    assert!(
+        !m2.contains("Zq9xLm2pTv8w"),
+        "xhttps 是合法 scheme，照常命中"
+    );
     // 数字前缀：3 是词字符 -> \b 在 3|h 之间不成立 -> 不命中
     let m3 = mask(&parts, "3https://usr:Zq9xLm2pTv8w@db.internal");
     assert!(m3.contains("Zq9xLm2pTv8w"), "数字前缀挡住词边界");
@@ -256,7 +275,10 @@ fn boundary_ipv6_hex_adjacency() {
     let parts = fresh();
     // 前缀 hex 粘连：aabbfe80::1 → 左边界拒绝
     let m = mask(&parts, "hex aabbfe80::1 here");
-    assert!(m.contains("aabbfe80::1") || !m.contains("{{"), "hex 前缀粘连不命中");
+    assert!(
+        m.contains("aabbfe80::1") || !m.contains("{{"),
+        "hex 前缀粘连不命中"
+    );
     // 混合大小写命中（markers_ci）
     let m2 = mask(&parts, "link Fe80::1 here");
     assert!(!m2.contains("Fe80::1"));
@@ -301,7 +323,10 @@ fn boundary_card_group_separator() {
     assert!(!mask(&parts, "卡 4111 1111 1111 1111").contains("4111 1111 1111 1111"));
     // 混合分隔符 → 拒绝
     let m = mask(&parts, "卡 4111-1111 1111 1111");
-    assert!(m.contains("4111-1111 1111") || m.contains("4111") , "混合分隔不命中");
+    assert!(
+        m.contains("4111-1111 1111") || m.contains("4111"),
+        "混合分隔不命中"
+    );
 }
 
 // ===========================================================================
@@ -344,12 +369,17 @@ fn boundary_uscc_iban() {
 fn boundary_bearer_word_boundary() {
     let parts = fresh();
     // Bearer 前是空格 → \b 成立
-    assert!(!mask(&parts, "Authorization: Bearer abcdefghijklmnopqrstuvwxyz123456")
-        .contains("abcdefghijklmnopqrstuvwxyz123456"));
+    assert!(!mask(
+        &parts,
+        "Authorization: Bearer abcdefghijklmnopqrstuvwxyz123456"
+    )
+    .contains("abcdefghijklmnopqrstuvwxyz123456"));
     // 前面是词字符 → \b 不成立（Python (?i)\bBearer）
     let m = mask(&parts, "xBearer abcdefghijklmnopqrstuvwxyz123456");
-    assert!(m.contains("xBearer") || m.contains("abcdefghijklmnopqrstuvwxyz"),
-        "xBearer 不该命中");
+    assert!(
+        m.contains("xBearer") || m.contains("abcdefghijklmnopqrstuvwxyz"),
+        "xBearer 不该命中"
+    );
     // 大小写变体（(?i)）
     assert!(!mask(&parts, "bearer abcdefghijklmnopqrstuvwxyz123456")
         .contains("abcdefghijklmnopqrstuvwxyz123456"));
@@ -369,7 +399,10 @@ fn pem_block_matches() {
     let m = mask(&parts, &pem);
     assert!(!m.contains("MIIEpA"), "PEM 应整块脱敏");
     // 类型变体（中间内容必须 ≥20 字符，Python {20,} 同款）
-    let pem2 = format!("{head}OPENSSH{tail}\n{}\n{end}OPENSSH{tail}", "x".repeat(24));
+    let pem2 = format!(
+        "{head}OPENSSH{tail}\n{}\n{end}OPENSSH{tail}",
+        "x".repeat(24)
+    );
     let m2 = mask(&parts, &pem2);
     assert!(!m2.contains(&"x".repeat(24)), "OPENSSH 变体整块脱敏");
 }
@@ -393,7 +426,11 @@ fn numeric_string_phone_masked() {
 fn placeholders_not_re_masked() {
     let parts = fresh();
     let first = mask(&parts, "电话13812345678");
-    let token = maskit_rs::mask::placeholder::placeholder_rx().find(&first).unwrap().as_str().to_string();
+    let token = maskit_rs::mask::placeholder::placeholder_rx()
+        .find(&first)
+        .unwrap()
+        .as_str()
+        .to_string();
     // 含占位符的文本再过一遍 mask：占位符不被劈开
     let second = mask(&parts, &format!("历史 {token} 电话13900001111"));
     assert!(second.contains(&token), "旧占位符必须原样保留");

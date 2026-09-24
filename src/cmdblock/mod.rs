@@ -42,11 +42,7 @@ impl CmdRegex {
     pub fn find_str(&self, text: &str) -> Option<String> {
         match self {
             CmdRegex::Linear(r) => r.find(text).map(|m| m.as_str().to_string()),
-            CmdRegex::Fancy(r) => r
-                .find(text)
-                .ok()
-                .flatten()
-                .map(|m| m.as_str().to_string()),
+            CmdRegex::Fancy(r) => r.find(text).ok().flatten().map(|m| m.as_str().to_string()),
         }
     }
     pub fn find_iter_strings(&self, text: &str) -> Vec<String> {
@@ -88,20 +84,41 @@ pub fn default_builtin_patterns() -> Vec<crate::config::CmdPattern> {
 /// 内置规则的 (id, label, regex) 规格（唯一定义源）。
 fn specs() -> Vec<(&'static str, &'static str, &'static str)> {
     vec![
-        ("builtin-rm-root", "递归删除根目录",
-         r"(?i)\brm\s+(?:-[a-z]*[rf][a-z]*\s+)+(?:/|/\*)(?:\s|$|;|&|\|)"),
-        ("builtin-rm-home", "递归删除家目录",
-         r"(?i)\brm\s+(?:-[a-z]*[rf][a-z]*\s+)+~(?:/\*?)?(?=\s|$|;|&|\|)"),
-        ("builtin-del-win", "Windows 全盘删除",
-         r#"(?i)(?:^|[\s;&|])(?:del|erase)\s+/[sq]\b[^\n]{0,40}[A-Za-z]:[\\/]?(?:\s|$)|\bRemove-Item\b[^\n]{0,60}-Recurse\b[^\n]{0,40}-Force\b[^\n]{0,20}[A-Za-z]:\\(?:\s|$|")"#),
-        ("builtin-format", "格式化磁盘/块设备",
-         r"(?i)(?:\bformat\s+[A-Za-z]:|\bmkfs(?:\.\w+)?\s+/dev/)"),
-        ("builtin-drop-db", "删除数据库/表",
-         r"(?i)(?:\bdrop\s+(?:database|schema)\b|\bdrop\s+table\b|\btruncate\s+table\b)"),
-        ("builtin-dd", "dd 直写块设备",
-         r"(?i)\bdd\s+[^\n]{0,60}\bof=/dev/(?:sd[a-z]|nvme\d|disk\d)"),
-        ("builtin-forkbomb", "fork 炸弹",
-         r":\(\)\s*\{\s*:\|\s*:&\s*\}\s*;\s*:"),
+        (
+            "builtin-rm-root",
+            "递归删除根目录",
+            r"(?i)\brm\s+(?:-[a-z]*[rf][a-z]*\s+)+(?:/|/\*)(?:\s|$|;|&|\|)",
+        ),
+        (
+            "builtin-rm-home",
+            "递归删除家目录",
+            r"(?i)\brm\s+(?:-[a-z]*[rf][a-z]*\s+)+~(?:/\*?)?(?=\s|$|;|&|\|)",
+        ),
+        (
+            "builtin-del-win",
+            "Windows 全盘删除",
+            r#"(?i)(?:^|[\s;&|])(?:del|erase)\s+/[sq]\b[^\n]{0,40}[A-Za-z]:[\\/]?(?:\s|$)|\bRemove-Item\b[^\n]{0,60}-Recurse\b[^\n]{0,40}-Force\b[^\n]{0,20}[A-Za-z]:\\(?:\s|$|")"#,
+        ),
+        (
+            "builtin-format",
+            "格式化磁盘/块设备",
+            r"(?i)(?:\bformat\s+[A-Za-z]:|\bmkfs(?:\.\w+)?\s+/dev/)",
+        ),
+        (
+            "builtin-drop-db",
+            "删除数据库/表",
+            r"(?i)(?:\bdrop\s+(?:database|schema)\b|\bdrop\s+table\b|\btruncate\s+table\b)",
+        ),
+        (
+            "builtin-dd",
+            "dd 直写块设备",
+            r"(?i)\bdd\s+[^\n]{0,60}\bof=/dev/(?:sd[a-z]|nvme\d|disk\d)",
+        ),
+        (
+            "builtin-forkbomb",
+            "fork 炸弹",
+            r":\(\)\s*\{\s*:\|\s*:&\s*\}\s*;\s*:",
+        ),
     ]
 }
 
@@ -178,7 +195,14 @@ impl CmdBlockEngine {
     pub fn channel_kind(channel: &str) -> &'static str {
         let ch = channel.to_ascii_lowercase();
         const REASON: &[&str] = &[".reason", ".reason2", ".think", "thinking", "reasoning"];
-        const TOOL: &[&str] = &[".tool", ".fcall", ".pj", ".args", "arguments", "partial_json"];
+        const TOOL: &[&str] = &[
+            ".tool",
+            ".fcall",
+            ".pj",
+            ".args",
+            "arguments",
+            "partial_json",
+        ];
         if REASON.iter().any(|m| ch.contains(m)) {
             return "reason";
         }
@@ -193,7 +217,11 @@ impl CmdBlockEngine {
         if self.patterns.is_empty() || text.is_empty() {
             return None;
         }
-        let window: &str = if text.len() > CMD_SCAN_MAX { &text[..CMD_SCAN_MAX] } else { text };
+        let window: &str = if text.len() > CMD_SCAN_MAX {
+            &text[..CMD_SCAN_MAX]
+        } else {
+            text
+        };
         let disabled = self.disabled.lock().unwrap();
         for (id, label, rx) in &self.patterns {
             if disabled.contains(id) {
@@ -215,7 +243,9 @@ impl CmdBlockEngine {
 
     /// 该片段是否已在请求体里出现（回声抑制）。
     pub fn is_echo(&self, sid: &str, snippet: &str, store: &SessionStore) -> bool {
-        let Some(s) = store.get(sid) else { return false };
+        let Some(s) = store.get(sid) else {
+            return false;
+        };
         if let Some(set) = &s.cmd_req_snippets {
             return set.contains(snippet);
         }
@@ -266,7 +296,15 @@ impl CmdBlockEngine {
             .chars()
             .take(120)
             .collect();
-        let kind = format!("{}{}", pid, if label.is_empty() { String::new() } else { format!(" {label}") });
+        let kind = format!(
+            "{}{}",
+            pid,
+            if label.is_empty() {
+                String::new()
+            } else {
+                format!(" {label}")
+            }
+        );
         if let Some(mut s) = store.get_mut(sid) {
             for it in s.cmd_hits.iter_mut() {
                 if it.kind == kind && it.snippet == clean && it.channel == channel_kind {
@@ -433,7 +471,12 @@ impl CmdBlockEngine {
     }
 
     /// 流末补发前瞻缓冲（对齐 `_cmd_flush_frames`）。
-    pub fn flush(&self, sid: &str, store: &SessionStore, framing: crate::stream::sse::Framing) -> String {
+    pub fn flush(
+        &self,
+        sid: &str,
+        store: &SessionStore,
+        framing: crate::stream::sse::Framing,
+    ) -> String {
         if self.patterns.is_empty() {
             return String::new();
         }
@@ -445,7 +488,12 @@ impl CmdBlockEngine {
         }
         let pend: Vec<(String, String)> = store
             .get(sid)
-            .map(|s| s.cmd_pend.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+            .map(|s| {
+                s.cmd_pend
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect()
+            })
             .unwrap_or_default();
         if pend.is_empty() {
             return String::new();
@@ -463,8 +511,12 @@ impl CmdBlockEngine {
                 continue;
             }
             out.push_str(&match framing {
-                crate::stream::sse::Framing::Ndjson => format!("{}\n", serde_json::json!({"text": restored})),
-                crate::stream::sse::Framing::Sse => format!("data: {}\n\n", serde_json::json!({"text": restored})),
+                crate::stream::sse::Framing::Ndjson => {
+                    format!("{}\n", serde_json::json!({"text": restored}))
+                }
+                crate::stream::sse::Framing::Sse => {
+                    format!("data: {}\n\n", serde_json::json!({"text": restored}))
+                }
             });
         }
         out
@@ -570,7 +622,12 @@ mod tests {
         assert!(seeded.iter().all(|p| p.enabled && p.builtin));
         for p in &seeded {
             let rx = compile_cmd(&p.regex);
-            assert!(rx.is_some(), "内置规则 regex 编译失败：{} {}", p.id, p.regex);
+            assert!(
+                rx.is_some(),
+                "内置规则 regex 编译失败：{} {}",
+                p.id,
+                p.regex
+            );
         }
     }
 
@@ -612,7 +669,13 @@ mod tests {
         let store = SessionStore::new();
         store.new_session("t");
         for _ in 0..5 {
-            e.process("执行 rm -rf / --no-preserve-root", "c0.tool0", "t", &store, false);
+            e.process(
+                "执行 rm -rf / --no-preserve-root",
+                "c0.tool0",
+                "t",
+                &store,
+                false,
+            );
         }
         let s = store.get("t").unwrap();
         assert_eq!(s.cmd_hits.len(), 1, "同一命令去重");
@@ -684,7 +747,11 @@ mod tests {
     fn rewrite_uses_fixed_notice() {
         assert!(CMD_BLOCK_NOTICE.starts_with("echo '"));
         assert!(!CMD_BLOCK_NOTICE.contains('{'));
-        assert_eq!(CMD_BLOCK_NOTICE.matches('\'').count(), 2, "固定 no-op，引号闭合");
+        assert_eq!(
+            CMD_BLOCK_NOTICE.matches('\'').count(),
+            2,
+            "固定 no-op，引号闭合"
+        );
     }
 
     #[test]

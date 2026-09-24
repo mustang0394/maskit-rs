@@ -10,8 +10,8 @@ use hyper::body::Incoming;
 
 use crate::mask::engine::RestoreStats;
 use crate::mask::session::SessionStore;
-use crate::stream::sse::{is_ndjson_ct, StreamState, Framing};
 use crate::store::events::{Event, EventBus, EventItem, EventType};
+use crate::stream::sse::{is_ndjson_ct, Framing, StreamState};
 
 /// 响应处理结果。
 pub struct ResponseOutcome {
@@ -90,13 +90,8 @@ pub fn process_whole(
         let all: Vec<&str> = text.split('\n').collect();
         let last = all.len().saturating_sub(1);
         for (i, line) in all.iter().enumerate() {
-            let r = crate::stream::sse::restore_ndjson_line(
-                line,
-                sid,
-                store,
-                &mut stats,
-                i == last,
-            );
+            let r =
+                crate::stream::sse::restore_ndjson_line(line, sid, store, &mut stats, i == last);
             lines.push(r);
         }
         lines.join("\n")
@@ -279,12 +274,16 @@ pub fn emit_restore(
 }
 
 fn build_restore_items(store: &SessionStore, sid: &str, stats: &RestoreStats) -> Vec<EventItem> {
-    let Some(s) = store.get(sid) else { return vec![] };
+    let Some(s) = store.get(sid) else {
+        return vec![];
+    };
     let mut items = Vec::new();
     let mut origs: Vec<&String> = s.fwd.keys().collect();
     origs.sort();
     for orig in origs.into_iter().take(30) {
-        let Some(token) = s.fwd.get(orig) else { continue };
+        let Some(token) = s.fwd.get(orig) else {
+            continue;
+        };
         let label = s.labels.get(orig).cloned().unwrap_or_default();
         let restored = s.restored_tokens.contains(token);
         let cred = crate::config::is_credential_label(&label);
@@ -399,7 +398,9 @@ pub fn scan_response_pii(
                 continue;
             }
             if rule.avoid_exempt
-                && exempt_conn.iter().any(|(s2, e2)| m0.start() < *e2 && m0.end() > *s2)
+                && exempt_conn
+                    .iter()
+                    .any(|(s2, e2)| m0.start() < *e2 && m0.end() > *s2)
             {
                 continue;
             }
@@ -483,7 +484,8 @@ mod tests {
     fn whole_json_restores() {
         let parts = setup();
         let masked = mask_and_register(&parts, "电话13800138000");
-        let body = serde_json::json!({"choices": [{"message": {"content": format!("好的：{masked}")}}]});
+        let body =
+            serde_json::json!({"choices": [{"message": {"content": format!("好的：{masked}")}}]});
         let cmd = crate::cmdblock::CmdBlockEngine::new(&parts.0);
         let out = process_whole(
             body.to_string().as_bytes(),
@@ -493,7 +495,10 @@ mod tests {
             &cmd,
         );
         let v: serde_json::Value = serde_json::from_slice(&out.body).unwrap();
-        assert_eq!(v["choices"][0]["message"]["content"], "好的：电话13800138000");
+        assert_eq!(
+            v["choices"][0]["message"]["content"],
+            "好的：电话13800138000"
+        );
         assert_eq!(out.restored, 1);
     }
 
@@ -543,7 +548,9 @@ mod tests {
             &parts.1,
             &parts.0.mask.builtin_rules,
         );
-        assert!(found.iter().any(|i| i.label == "PHONE" && i.original == "13911112222"));
+        assert!(found
+            .iter()
+            .any(|i| i.label == "PHONE" && i.original == "13911112222"));
     }
 
     #[test]
@@ -569,7 +576,9 @@ mod tests {
 
     #[test]
     fn credential_redaction_in_logs() {
-        let out = redact_credentials("token sk-abcdefghijklmnopqrstuvwxyz012345 and password=ServerPass123!");
+        let out = redact_credentials(
+            "token sk-abcdefghijklmnopqrstuvwxyz012345 and password=ServerPass123!",
+        );
         assert!(!out.contains("sk-abcdefghijklmnopqrstuvwxyz012345"));
         assert!(out.contains("[REDACTED]"));
     }
@@ -578,7 +587,10 @@ mod tests {
     fn content_type_gates() {
         assert!(restorable("application/json", ""));
         assert!(restorable("text/event-stream", "identity"));
-        assert!(!restorable("text/event-stream", "gzip"), "压缩体在解码前不可按事件切分");
+        assert!(
+            !restorable("text/event-stream", "gzip"),
+            "压缩体在解码前不可按事件切分"
+        );
         assert!(!restorable("text/plain", ""));
         assert!(is_streaming_response("text/event-stream"));
         assert!(is_streaming_response("application/x-ndjson"));

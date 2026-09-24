@@ -132,7 +132,10 @@ pub async fn handler(State(state): State<SharedState>, req: Request) -> Response
                 Protocol::Unknown,
                 "",
                 "",
-                &RequestMeta { req_bytes: max_body, ..Default::default() },
+                &RequestMeta {
+                    req_bytes: max_body,
+                    ..Default::default()
+                },
             );
             return error_response(StatusCode::PAYLOAD_TOO_LARGE, "request_too_large");
         }
@@ -152,7 +155,10 @@ pub async fn handler(State(state): State<SharedState>, req: Request) -> Response
             Protocol::Unknown,
             "",
             "",
-            &RequestMeta { req_bytes, ..Default::default() },
+            &RequestMeta {
+                req_bytes,
+                ..Default::default()
+            },
         );
         return forward_raw(&state, &method_str, &parts.uri, &parts.headers, body_bytes).await;
     }
@@ -170,7 +176,10 @@ pub async fn handler(State(state): State<SharedState>, req: Request) -> Response
             Protocol::Unknown,
             "",
             "",
-            &RequestMeta { req_bytes, ..Default::default() },
+            &RequestMeta {
+                req_bytes,
+                ..Default::default()
+            },
         );
         // 流式请求声明 identity（对齐 Python：避免压缩导致流式退化）
         let mut headers = parts.headers.clone();
@@ -199,7 +208,11 @@ pub async fn handler(State(state): State<SharedState>, req: Request) -> Response
                 Protocol::Unknown,
                 "",
                 "",
-                &RequestMeta { req_bytes, message: ct.chars().take(80).collect(), ..Default::default() },
+                &RequestMeta {
+                    req_bytes,
+                    message: ct.chars().take(80).collect(),
+                    ..Default::default()
+                },
             );
             return error_response(StatusCode::SERVICE_UNAVAILABLE, "non_json_body");
         }
@@ -213,7 +226,10 @@ pub async fn handler(State(state): State<SharedState>, req: Request) -> Response
             Protocol::Unknown,
             "",
             "",
-            &RequestMeta { req_bytes, ..Default::default() },
+            &RequestMeta {
+                req_bytes,
+                ..Default::default()
+            },
         );
         return forward_raw(&state, &method_str, &parts.uri, &parts.headers, body_bytes).await;
     }
@@ -233,7 +249,10 @@ pub async fn handler(State(state): State<SharedState>, req: Request) -> Response
                 Protocol::Unknown,
                 "",
                 "",
-                &RequestMeta { req_bytes, ..Default::default() },
+                &RequestMeta {
+                    req_bytes,
+                    ..Default::default()
+                },
             );
             return error_response(StatusCode::BAD_REQUEST, "invalid_json");
         }
@@ -247,7 +266,10 @@ pub async fn handler(State(state): State<SharedState>, req: Request) -> Response
             Protocol::Unknown,
             "",
             "",
-            &RequestMeta { req_bytes, ..Default::default() },
+            &RequestMeta {
+                req_bytes,
+                ..Default::default()
+            },
         );
         return forward_raw(&state, &method_str, &parts.uri, &parts.headers, body_bytes).await;
     };
@@ -269,7 +291,10 @@ pub async fn handler(State(state): State<SharedState>, req: Request) -> Response
             protocol,
             &model,
             "",
-            &RequestMeta { req_bytes, ..Default::default() },
+            &RequestMeta {
+                req_bytes,
+                ..Default::default()
+            },
         );
         return forward_raw(&state, &method_str, &parts.uri, &parts.headers, body_bytes).await;
     }
@@ -317,7 +342,11 @@ pub async fn handler(State(state): State<SharedState>, req: Request) -> Response
                 protocol,
                 &model,
                 &sid,
-                &RequestMeta { req_bytes, message: e.chars().take(200).collect(), ..Default::default() },
+                &RequestMeta {
+                    req_bytes,
+                    message: e.chars().take(200).collect(),
+                    ..Default::default()
+                },
             );
             return error_response(StatusCode::SERVICE_UNAVAILABLE, "shield_mask_failed");
         }
@@ -333,7 +362,11 @@ pub async fn handler(State(state): State<SharedState>, req: Request) -> Response
                 protocol,
                 &model,
                 &sid,
-                &RequestMeta { req_bytes, message: e.to_string(), ..Default::default() },
+                &RequestMeta {
+                    req_bytes,
+                    message: e.to_string(),
+                    ..Default::default()
+                },
             );
             return error_response(StatusCode::SERVICE_UNAVAILABLE, "shield_mask_failed");
         }
@@ -343,7 +376,11 @@ pub async fn handler(State(state): State<SharedState>, req: Request) -> Response
     // MASK 事件（含命中明细；凭据类不落原文）
     let items = build_event_items(store, &sid);
     let new_count = store.get(&sid).map(|s| s.new_orig.len()).unwrap_or(0);
-    let mut ev_meta = RequestMeta { req_bytes, unknown_shape, ..Default::default() };
+    let mut ev_meta = RequestMeta {
+        req_bytes,
+        unknown_shape,
+        ..Default::default()
+    };
     ev_meta.body_shape = masked.body_shape.map(str::to_string);
     let ev = Event {
         id: 0,
@@ -396,14 +433,20 @@ pub async fn handler(State(state): State<SharedState>, req: Request) -> Response
 
 /// 流式请求声明 identity（对齐 Python：压缩会让流式接管退化）。
 fn inject_identity_for_stream(headers: &mut HeaderMap, body: &[u8]) {
-    let ct = headers.get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("");
+    let ct = headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
     if !is_json_ct(ct) {
         return;
     }
     // 请求体含 "stream":true → 声明 identity
     let text = String::from_utf8_lossy(body);
     if text.contains("\"stream\"") && text.contains("true") {
-        headers.insert("accept-encoding", axum::http::HeaderValue::from_static("identity"));
+        headers.insert(
+            "accept-encoding",
+            axum::http::HeaderValue::from_static("identity"),
+        );
     }
 }
 
@@ -443,7 +486,9 @@ fn first_user_content(body: &serde_json::Value) -> Option<String> {
 
 /// 构建 MASK 事件明细（凭据类只留 digest/preview）。
 fn build_event_items(store: &SessionStore, sid: &str) -> Vec<EventItem> {
-    let Some(s) = store.get(sid) else { return vec![] };
+    let Some(s) = store.get(sid) else {
+        return vec![];
+    };
     let mut items = Vec::new();
     let mut ordered: Vec<&String> = s
         .last_hits
@@ -455,7 +500,9 @@ fn build_event_items(store: &SessionStore, sid: &str) -> Vec<EventItem> {
     rest.sort();
     ordered.extend(rest);
     for orig in ordered.into_iter().take(30) {
-        let Some(token) = s.fwd.get(orig) else { continue };
+        let Some(token) = s.fwd.get(orig) else {
+            continue;
+        };
         let label = s.labels.get(orig).cloned().unwrap_or_default();
         let cred = crate::config::is_credential_label(&label);
         let mut item = EventItem {
@@ -526,7 +573,12 @@ async fn forward_inner(
     let upstream = state.upstream();
     let req = match upstream.build_request(method, path_and_query, &fwd, body) {
         Ok(r) => r,
-        Err(e) => return error_response(StatusCode::BAD_GATEWAY, &format!("upstream_build_failed: {e}")),
+        Err(e) => {
+            return error_response(
+                StatusCode::BAD_GATEWAY,
+                &format!("upstream_build_failed: {e}"),
+            )
+        }
     };
     match upstream.send(req).await {
         Ok(resp) => {
@@ -593,13 +645,7 @@ async fn forward_inner(
                     match crate::stream::sse::aggregate_stream(resp.into_body()).await {
                         Ok(bytes) => {
                             let outcome = crate::server::response::process_and_emit(
-                                &bytes,
-                                &ct,
-                                &sess.sid,
-                                store,
-                                &cmdblock,
-                                &state.bus,
-                                &meta,
+                                &bytes, &ct, &sess.sid, store, &cmdblock, &state.bus, &meta,
                             );
                             if let Some(es) = &state.event_store {
                                 // RESTORE 事件已在 bus 中，落库
@@ -615,13 +661,11 @@ async fn forward_inner(
                                 }
                             }
                             store.drop_session(&sess.sid);
-                            let mut out = Response::builder().status(
-                                if outcome.blocked {
-                                    StatusCode::SERVICE_UNAVAILABLE
-                                } else {
-                                    status
-                                },
-                            );
+                            let mut out = Response::builder().status(if outcome.blocked {
+                                StatusCode::SERVICE_UNAVAILABLE
+                            } else {
+                                status
+                            });
                             if outcome.blocked {
                                 let body = serde_json::json!({
                                     "error": {"code": "shield_command_blocked",
@@ -672,7 +716,10 @@ async fn forward_inner(
                     }
                     out.body(Body::from(bytes)).unwrap()
                 }
-                Err(e) => error_response(StatusCode::BAD_GATEWAY, &format!("upstream_read_failed: {e}")),
+                Err(e) => error_response(
+                    StatusCode::BAD_GATEWAY,
+                    &format!("upstream_read_failed: {e}"),
+                ),
             }
         }
         Err(e) => error_response(StatusCode::BAD_GATEWAY, &format!("upstream_failed: {e}")),
@@ -694,7 +741,10 @@ mod tests {
         assert!(is_readonly(&Method::GET));
         assert!(is_readonly(&Method::HEAD));
         assert!(is_readonly(&Method::OPTIONS));
-        assert!(!is_readonly(&Method::DELETE), "DELETE 可带 body，必须走管线");
+        assert!(
+            !is_readonly(&Method::DELETE),
+            "DELETE 可带 body，必须走管线"
+        );
     }
 
     #[test]

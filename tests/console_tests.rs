@@ -28,10 +28,20 @@ impl Harness {
         let bus = EventBus::new();
         let store = EventStore::open(dir.path()).ok();
         let state = Arc::new(AppState::new(center, bus, upstream, store));
-        Harness { state, token, _dir: dir }
+        Harness {
+            state,
+            token,
+            _dir: dir,
+        }
     }
 
-    async fn req(&self, method: &str, path: &str, auth: bool, body: Option<&str>) -> (StatusCode, Vec<u8>) {
+    async fn req(
+        &self,
+        method: &str,
+        path: &str,
+        auth: bool,
+        body: Option<&str>,
+    ) -> (StatusCode, Vec<u8>) {
         let app = build_router(self.state.clone());
         let mut b = Request::builder().method(method).uri(path);
         if auth {
@@ -53,9 +63,17 @@ impl Harness {
         (status, bytes)
     }
 
-    async fn json(&self, method: &str, path: &str, body: Option<&str>) -> (StatusCode, serde_json::Value) {
+    async fn json(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&str>,
+    ) -> (StatusCode, serde_json::Value) {
         let (s, b) = self.req(method, path, true, body).await;
-        (s, serde_json::from_slice(&b).unwrap_or(serde_json::Value::Null))
+        (
+            s,
+            serde_json::from_slice(&b).unwrap_or(serde_json::Value::Null),
+        )
     }
 }
 
@@ -178,7 +196,10 @@ async fn all_console_endpoints_respond() {
         ("/console/api/logs/clear", None),
         ("/console/api/audit/clear", None),
         ("/console/api/upstream/test", None),
-        ("/console/api/config/patch", Some(r#"{"path":"mask.session_ttl","value":900}"#)),
+        (
+            "/console/api/config/patch",
+            Some(r#"{"path":"mask.session_ttl","value":900}"#),
+        ),
     ];
     for (p, b) in posts {
         let (s, _) = h.req("POST", p, true, b).await;
@@ -186,7 +207,11 @@ async fn all_console_endpoints_respond() {
     }
     // 演示脱敏
     let (s, v) = h
-        .json("POST", "/console/api/demo/mask", Some(r#"{"text":"电话13800138000"}"#))
+        .json(
+            "POST",
+            "/console/api/demo/mask",
+            Some(r#"{"text":"电话13800138000"}"#),
+        )
         .await;
     assert_eq!(s, StatusCode::OK);
     assert!(!v["masked"].as_str().unwrap().contains("13800138000"));
@@ -197,13 +222,21 @@ async fn all_console_endpoints_respond() {
 async fn config_patch_and_toggle_persist() {
     let h = Harness::new();
     let (s, v) = h
-        .json("POST", "/console/api/config/patch", Some(r#"{"path":"mask.custom_words.张三","value":"人名"}"#))
+        .json(
+            "POST",
+            "/console/api/config/patch",
+            Some(r#"{"path":"mask.custom_words.张三","value":"人名"}"#),
+        )
         .await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(v["config"]["mask"]["custom_words"]["张三"], "人名");
     // 规则开关
     let (s2, v2) = h
-        .json("POST", "/console/api/config/patch", Some(r#"{"path":"mask.builtin_rules.JWT","value":true}"#))
+        .json(
+            "POST",
+            "/console/api/config/patch",
+            Some(r#"{"path":"mask.builtin_rules.JWT","value":true}"#),
+        )
         .await;
     assert_eq!(s2, StatusCode::OK);
     assert_eq!(v2["config"]["mask"]["builtin_rules"]["JWT"], true);
@@ -286,28 +319,28 @@ async fn exported_logs_never_contain_plaintext() {
         path: "/v1/chat/completions".into(),
         dialog: "【用户】\n电话13800138000 key sk-abcdefghijklmnopqrstuvwxyz012345".into(),
         items: vec![
-        maskit_rs::store::events::EventItem {
-            label: "PHONE".into(),
-            token: "{{PHONE_bcdfgh}}".into(),
-            original: "13800138000".into(),
-            cred: false,
-            digest: String::new(),
-            preview: "13****".into(),
-            length: 11,
-            hash: "bcdfgh".into(),
-            restored: false,
-        },
-        maskit_rs::store::events::EventItem {
-            label: "API_KEY".into(),
-            token: "{{APIKEY_kkmmnp}}".into(),
-            original: String::new(),
-            cred: true,
-            digest: "abcdef1234567890".into(),
-            preview: "sk-1…2345".into(),
-            length: 38,
-            hash: "kkmmnp".into(),
-            restored: false,
-        },
+            maskit_rs::store::events::EventItem {
+                label: "PHONE".into(),
+                token: "{{PHONE_bcdfgh}}".into(),
+                original: "13800138000".into(),
+                cred: false,
+                digest: String::new(),
+                preview: "13****".into(),
+                length: 11,
+                hash: "bcdfgh".into(),
+                restored: false,
+            },
+            maskit_rs::store::events::EventItem {
+                label: "API_KEY".into(),
+                token: "{{APIKEY_kkmmnp}}".into(),
+                original: String::new(),
+                cred: true,
+                digest: "abcdef1234567890".into(),
+                preview: "sk-1…2345".into(),
+                length: 38,
+                hash: "kkmmnp".into(),
+                restored: false,
+            },
         ],
         ..Default::default()
     };
@@ -320,10 +353,16 @@ async fn exported_logs_never_contain_plaintext() {
     assert_eq!(s, StatusCode::OK);
     let blob = String::from_utf8_lossy(&body);
     assert!(!blob.contains("13800138000"), "导出不得含 PII 原文");
-    assert!(!blob.contains("sk-abcdefghijklmnopqrstuvwxyz012345"), "导出不得含凭据原文");
+    assert!(
+        !blob.contains("sk-abcdefghijklmnopqrstuvwxyz012345"),
+        "导出不得含凭据原文"
+    );
     assert!(!blob.contains("\"original\""));
     assert!(!blob.contains("\"dialog\""));
-    assert!(blob.contains("abcdef1234567890"), "摘要保留（可对照同一性）");
+    assert!(
+        blob.contains("abcdef1234567890"),
+        "摘要保留（可对照同一性）"
+    );
     assert!(blob.contains("\"masked_export\":true"));
 }
 
@@ -349,10 +388,18 @@ async fn upstream_target_hot_reloads() {
     assert_eq!(h.state.upstream().target.port, 18977);
     // 清空 target → 退化为占位客户端（请求 502，不崩溃）
     let (s2, _) = h
-        .json("POST", "/console/api/config/patch", Some(r#"{"path":"upstream.target","value":""}"#))
+        .json(
+            "POST",
+            "/console/api/config/patch",
+            Some(r#"{"path":"upstream.target","value":""}"#),
+        )
         .await;
     assert_eq!(s2, StatusCode::OK);
-    assert_eq!(h.state.upstream().target.port, 9, "空 target 退化为占位（不可达）");
+    assert_eq!(
+        h.state.upstream().target.port,
+        9,
+        "空 target 退化为占位（不可达）"
+    );
 }
 
 #[tokio::test]
@@ -360,12 +407,23 @@ async fn security_headers_present() {
     let h = Harness::new();
     let app = build_router(h.state.clone());
     let resp = app
-        .oneshot(Request::builder().uri("/console").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/console")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
-    assert_eq!(resp.headers().get("x-content-type-options").unwrap(), "nosniff");
+    assert_eq!(
+        resp.headers().get("x-content-type-options").unwrap(),
+        "nosniff"
+    );
     assert_eq!(resp.headers().get("x-frame-options").unwrap(), "DENY");
-    assert_eq!(resp.headers().get("referrer-policy").unwrap(), "no-referrer");
+    assert_eq!(
+        resp.headers().get("referrer-policy").unwrap(),
+        "no-referrer"
+    );
 }
 
 // ===========================================================================
@@ -377,9 +435,27 @@ async fn token_usage_lands_in_daily_tokens() {
     let h = Harness::new();
     // 直接走 store 层：响应管线在 M7 接的是同一个 EventStore
     let es = h.state.event_store.clone().expect("event_store");
-    es.add_tokens("gpt-4o", maskit_rs::store::usage::Usage { prompt_tokens: 100, completion_tokens: 40 });
-    es.add_tokens("gpt-4o", maskit_rs::store::usage::Usage { prompt_tokens: 20, completion_tokens: 5 });
-    es.add_tokens("claude-sonnet-4", maskit_rs::store::usage::Usage { prompt_tokens: 7, completion_tokens: 3 });
+    es.add_tokens(
+        "gpt-4o",
+        maskit_rs::store::usage::Usage {
+            prompt_tokens: 100,
+            completion_tokens: 40,
+        },
+    );
+    es.add_tokens(
+        "gpt-4o",
+        maskit_rs::store::usage::Usage {
+            prompt_tokens: 20,
+            completion_tokens: 5,
+        },
+    );
+    es.add_tokens(
+        "claude-sonnet-4",
+        maskit_rs::store::usage::Usage {
+            prompt_tokens: 7,
+            completion_tokens: 3,
+        },
+    );
     // 空的 usage 不应写库
     es.add_tokens("gpt-4o", maskit_rs::store::usage::Usage::default());
 
@@ -388,11 +464,17 @@ async fn token_usage_lands_in_daily_tokens() {
     assert_eq!(s, StatusCode::OK);
     let models = v["models"].as_array().expect("models 数组");
     assert_eq!(models.len(), 2, "空 usage 不应产生行");
-    let gpt = models.iter().find(|m| m["model"] == "gpt-4o").expect("gpt-4o");
+    let gpt = models
+        .iter()
+        .find(|m| m["model"] == "gpt-4o")
+        .expect("gpt-4o");
     assert_eq!(gpt["prompt_tokens"], 120, "同模型多次请求应累加");
     assert_eq!(gpt["completion_tokens"], 45);
     assert_eq!(gpt["total_tokens"], 165);
-    let claude = models.iter().find(|m| m["model"] == "claude-sonnet-4").unwrap();
+    let claude = models
+        .iter()
+        .find(|m| m["model"] == "claude-sonnet-4")
+        .unwrap();
     assert_eq!(claude["total_tokens"], 10);
 
     // /api/stats/today 应带 token 汇总
@@ -416,7 +498,13 @@ async fn no_price_fields_anywhere_in_config() {
     }
     let (_, st) = h.json("GET", "/console/api/stats/today", None).await;
     let blob = serde_json::to_string(&st).unwrap().to_lowercase();
-    assert!(!blob.contains("price") && !blob.contains("cost"), "统计接口不应含价格字段");
+    assert!(
+        !blob.contains("price") && !blob.contains("cost"),
+        "统计接口不应含价格字段"
+    );
     // 审计配置也不再有主动探针位
-    assert!(cfg["audit"].get("active_probes").is_none(), "主动探针配置位应已移除");
+    assert!(
+        cfg["audit"].get("active_probes").is_none(),
+        "主动探针配置位应已移除"
+    );
 }

@@ -30,7 +30,12 @@ impl Ctx {
         let store = SessionStore::new();
         store.new_session("p");
         let custom = CustomWords::build(&cfg);
-        Ctx { cfg, store, custom, sid: "p".into() }
+        Ctx {
+            cfg,
+            store,
+            custom,
+            sid: "p".into(),
+        }
     }
 
     fn mask(&self, text: &str) -> String {
@@ -85,7 +90,10 @@ fn prefix_configurable() {
     // 清前缀缓存（不同前缀集）
     let masked = c.mask("ak-abcdefghijklmnopqrstuvwxyz123456 sk-abcdefghijklmnopqrstuvwxyz123456");
     assert!(!masked.contains("ak-abcdefghijklmnopqrstuvwxyz123456"));
-    assert!(masked.contains("sk-abcdefghijklmnopqrstuvwxyz123456"), "未配置的前缀不命中");
+    assert!(
+        masked.contains("sk-abcdefghijklmnopqrstuvwxyz123456"),
+        "未配置的前缀不命中"
+    );
 }
 
 #[test]
@@ -142,7 +150,11 @@ fn custom_words_prefer_longest_match() {
     let c = Ctx::new(&[("张三", "PERSON"), ("张三公司", "COMPANY")]);
     let masked = c.mask("张三公司");
     assert!(!masked.contains("公司"));
-    assert_eq!(masked.matches("{{").count(), 1, "长词优先，只产生一个占位符");
+    assert_eq!(
+        masked.matches("{{").count(),
+        1,
+        "长词优先，只产生一个占位符"
+    );
 }
 
 // ===========================================================================
@@ -181,10 +193,17 @@ fn placeholder_suffix_not_derived_from_secret() {
     // 后缀必须来自 CSPRNG，不得由原文推导（安全性质）
     let c1 = Ctx::new(&[]);
     let m1 = c1.mask("电话13812345678");
-    let t1 = maskit_rs::mask::placeholder::placeholder_rx().find(&m1).unwrap().as_str().to_string();
+    let t1 = maskit_rs::mask::placeholder::placeholder_rx()
+        .find(&m1)
+        .unwrap()
+        .as_str()
+        .to_string();
     let suffix = maskit_rs::mask::placeholder::token_suffix(&t1);
     for i in 0..("13812345678".len() - 2) {
-        assert!(!suffix.contains(&"13812345678"[i..i + 3]), "后缀不得含原文片段");
+        assert!(
+            !suffix.contains(&"13812345678"[i..i + 3]),
+            "后缀不得含原文片段"
+        );
     }
 }
 
@@ -296,7 +315,9 @@ fn three_chunk_split_multibyte_safe() {
     let chars: Vec<char> = full.chars().collect();
     let (a, b, d) = (
         chars[..chars.len() / 3].iter().collect::<String>(),
-        chars[chars.len() / 3..2 * chars.len() / 3].iter().collect::<String>(),
+        chars[chars.len() / 3..2 * chars.len() / 3]
+            .iter()
+            .collect::<String>(),
         chars[2 * chars.len() / 3..].iter().collect::<String>(),
     );
     let mut stats = RestoreStats::default();
@@ -322,7 +343,8 @@ fn channels_do_not_cross_contaminate() {
     let half = token.len() / 2;
     {
         let mut s = c.store.get_mut(&c.sid).unwrap();
-        s.pending.insert("c0.content".into(), token[..half].to_string());
+        s.pending
+            .insert("c0.content".into(), token[..half].to_string());
     }
     // 另一通道不受影响
     let s = c.store.get(&c.sid).unwrap();
@@ -333,7 +355,13 @@ fn channels_do_not_cross_contaminate() {
     let buffered = s.pending.remove("c0.content").unwrap();
     drop(s);
     let mut stats = RestoreStats::default();
-    let out = restore_final(&format!("{buffered}{}", &token[half..]), &c.sid, false, &c.store, &mut stats);
+    let out = restore_final(
+        &format!("{buffered}{}", &token[half..]),
+        &c.sid,
+        false,
+        &c.store,
+        &mut stats,
+    );
     assert_eq!(out, "张三");
 }
 
@@ -365,9 +393,15 @@ fn unique_original_replaced_once_per_rule() {
 #[test]
 fn dedup_output_unchanged_across_unique_origs() {
     let c = Ctx::new(&[]);
-    let text = "张三 13800138000 邮箱 alice@example.com；李四 13900139000 邮箱 bob@example.com；".repeat(10);
+    let text = "张三 13800138000 邮箱 alice@example.com；李四 13900139000 邮箱 bob@example.com；"
+        .repeat(10);
     let masked = c.mask(&text);
-    for leaked in ["13800138000", "13900139000", "alice@example.com", "bob@example.com"] {
+    for leaked in [
+        "13800138000",
+        "13900139000",
+        "alice@example.com",
+        "bob@example.com",
+    ] {
         assert!(!masked.contains(leaked));
     }
     let tokens = maskit_rs::mask::placeholder::placeholder_rx()
@@ -436,10 +470,7 @@ fn cfg_with_custom(words: &[(&str, &str)]) -> (Config, SessionStore, CustomWords
     (cfg, store, custom)
 }
 
-fn mask_cfg(
-    parts: &(Config, SessionStore, CustomWords),
-    text: &str,
-) -> String {
+fn mask_cfg(parts: &(Config, SessionStore, CustomWords), text: &str) -> String {
     let ctx = MaskCtx::new(&parts.0, &parts.1, "t".into(), &parts.2);
     ctx.mask(text)
 }
@@ -452,7 +483,10 @@ fn custom_label_group_can_be_disabled() {
     parts.2 = CustomWords::build(&parts.0);
     let masked = mask_cfg(&parts, "重庆的张三和李四");
     assert!(masked.contains("重庆"), "被禁用的分组应原样保留");
-    assert!(!masked.contains("张三") && !masked.contains("李四"), "其余分组照常脱敏");
+    assert!(
+        !masked.contains("张三") && !masked.contains("李四"),
+        "其余分组照常脱敏"
+    );
 }
 
 #[test]
@@ -473,7 +507,10 @@ fn custom_word_whole_match_opt_in() {
     // sensitive_word_whole: 开启后子串形态不再命中（Acme 不应命中 AcmeCorp）
     let mut parts = cfg_with_custom(&[("Acme", "公司"), ("密", "密级")]);
     let before = mask_cfg(&parts, "AcmeCorp 与 机密");
-    assert!(!before.contains("AcmeCorp"), "默认子串匹配：Acme 应命中 AcmeCorp");
+    assert!(
+        !before.contains("AcmeCorp"),
+        "默认子串匹配：Acme 应命中 AcmeCorp"
+    );
     assert!(
         before.contains("机密"),
         "单字词「密」带 CJK 边界：不应吃掉「机密」（这正是边界存在的意义）"

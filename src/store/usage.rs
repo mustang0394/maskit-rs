@@ -92,7 +92,9 @@ pub fn extract_usage(body: &str) -> Usage {
 
 /// 从 `usage` 对象里读字段（认 4 个别名：input/output 与 prompt/completion）。
 fn collect(u: Option<&serde_json::Value>, out: &mut Usage) {
-    let Some(u) = u.and_then(|v| v.as_object()) else { return };
+    let Some(u) = u.and_then(|v| v.as_object()) else {
+        return;
+    };
     let get = |keys: &[&str]| -> Option<u64> {
         for k in keys {
             if let Some(v) = u.get(*k).and_then(|x| x.as_i64()) {
@@ -126,7 +128,10 @@ mod tests {
         let body = r#"{"usage":{"prompt_tokens":11,"completion_tokens":22},"choices":[]}"#;
         assert_eq!(
             extract_usage(body),
-            Usage { prompt_tokens: 11, completion_tokens: 22 }
+            Usage {
+                prompt_tokens: 11,
+                completion_tokens: 22
+            }
         );
     }
 
@@ -135,14 +140,23 @@ mod tests {
         let body = r#"{"usage":{"input_tokens":10,"output_tokens":8}}"#;
         assert_eq!(
             extract_usage(body),
-            Usage { prompt_tokens: 10, completion_tokens: 8 }
+            Usage {
+                prompt_tokens: 10,
+                completion_tokens: 8
+            }
         );
     }
 
     #[test]
     fn responses_api_usage() {
         let body = r#"{"type":"response.completed","response":{"usage":{"input_tokens":7,"output_tokens":3}}}"#;
-        assert_eq!(extract_usage(body), Usage { prompt_tokens: 7, completion_tokens: 3 });
+        assert_eq!(
+            extract_usage(body),
+            Usage {
+                prompt_tokens: 7,
+                completion_tokens: 3
+            }
+        );
     }
 
     #[test]
@@ -156,7 +170,10 @@ mod tests {
         );
         assert_eq!(
             extract_usage(sse),
-            Usage { prompt_tokens: 10, completion_tokens: 8 },
+            Usage {
+                prompt_tokens: 10,
+                completion_tokens: 8
+            },
             "后出现的非零值应覆盖（累计计数语义）"
         );
     }
@@ -170,20 +187,35 @@ mod tests {
         );
         assert_eq!(
             extract_usage(sse),
-            Usage { prompt_tokens: 30, completion_tokens: 12 }
+            Usage {
+                prompt_tokens: 30,
+                completion_tokens: 12
+            }
         );
     }
 
     #[test]
     fn total_tokens_only() {
         let body = r#"{"usage":{"total_tokens":128}}"#;
-        assert_eq!(extract_usage(body), Usage { prompt_tokens: 128, completion_tokens: 0 });
+        assert_eq!(
+            extract_usage(body),
+            Usage {
+                prompt_tokens: 128,
+                completion_tokens: 0
+            }
+        );
     }
 
     #[test]
     fn cohere_meta_tokens() {
         let body = r#"{"meta":{"tokens":{"input_tokens":42}}}"#;
-        assert_eq!(extract_usage(body), Usage { prompt_tokens: 42, completion_tokens: 0 });
+        assert_eq!(
+            extract_usage(body),
+            Usage {
+                prompt_tokens: 42,
+                completion_tokens: 0
+            }
+        );
     }
 
     #[test]
@@ -195,9 +227,21 @@ mod tests {
 
     #[test]
     fn merge_semantics() {
-        let mut a = Usage { prompt_tokens: 10, completion_tokens: 5 };
+        let mut a = Usage {
+            prompt_tokens: 10,
+            completion_tokens: 5,
+        };
         // 缺失字段不应把已有计数清零
-        a.merge(&Usage { prompt_tokens: 0, completion_tokens: 8 });
-        assert_eq!(a, Usage { prompt_tokens: 10, completion_tokens: 8 });
+        a.merge(&Usage {
+            prompt_tokens: 0,
+            completion_tokens: 8,
+        });
+        assert_eq!(
+            a,
+            Usage {
+                prompt_tokens: 10,
+                completion_tokens: 8
+            }
+        );
     }
 }

@@ -100,7 +100,10 @@ pub fn build_router(state: SharedState) -> Router {
         .route("/console/style.css", get(static_ui::static_asset_named))
         .route("/console/app.js", get(static_ui::static_asset_named))
         // 配置
-        .route("/console/api/config", get(console_api::get_config).post(console_api::put_config))
+        .route(
+            "/console/api/config",
+            get(console_api::get_config).post(console_api::put_config),
+        )
         .route("/console/api/config/patch", post(console_api::patch_config))
         // 状态与启停
         .route("/console/api/status", get(console_api::get_status))
@@ -114,13 +117,25 @@ pub fn build_router(state: SharedState) -> Router {
         .route("/console/api/logs/export", get(console_api::export_logs))
         // 统计
         .route("/console/api/stats/today", get(console_api::stats_today))
-        .route("/console/api/stats/history", get(console_api::stats_history))
+        .route(
+            "/console/api/stats/history",
+            get(console_api::stats_history),
+        )
         .route("/console/api/stats/models", get(console_api::stats_models))
         // 审计
-        .route("/console/api/audit/events", get(console_api::get_audit_events))
-        .route("/console/api/audit/clear", post(console_api::clear_audit_events))
+        .route(
+            "/console/api/audit/events",
+            get(console_api::get_audit_events),
+        )
+        .route(
+            "/console/api/audit/clear",
+            post(console_api::clear_audit_events),
+        )
         // 运维
-        .route("/console/api/upstream/test", post(console_api::test_upstream))
+        .route(
+            "/console/api/upstream/test",
+            post(console_api::test_upstream),
+        )
         .route("/console/api/demo/mask", post(console_api::demo_mask))
         .route("/console/api/rotate-token", post(console_api::rotate_token))
         .route("/console/api/data-dir", get(console_api::data_dir))
@@ -141,10 +156,7 @@ pub fn build_router(state: SharedState) -> Router {
 }
 
 /// 安全响应头（对齐 Python `security_headers` 的核心语义）。
-async fn security_headers_middleware(
-    req: Request,
-    next: axum::middleware::Next,
-) -> Response {
+async fn security_headers_middleware(req: Request, next: axum::middleware::Next) -> Response {
     let mut resp = next.run(req).await;
     let h = resp.headers_mut();
     if let Ok(v) = axum::http::HeaderValue::from_str("nosniff") {
@@ -182,19 +194,37 @@ pub async fn passthrough(
         );
     }
     let upstream = state.upstream();
-    let req = match upstream.build_request(method, uri.path_and_query().map(|p| p.as_str()).unwrap_or("/"), &fwd, body) {
+    let req = match upstream.build_request(
+        method,
+        uri.path_and_query().map(|p| p.as_str()).unwrap_or("/"),
+        &fwd,
+        body,
+    ) {
         Ok(r) => r,
         Err(e) => {
-            return error_response(StatusCode::BAD_GATEWAY, &format!("upstream_build_failed: {e}"));
+            return error_response(
+                StatusCode::BAD_GATEWAY,
+                &format!("upstream_build_failed: {e}"),
+            );
         }
     };
     match upstream.send(req).await {
         Ok(resp) => {
             let status = resp.status();
             let resp_headers = crate::upstream::http_client::forward_headers(resp.headers());
-            let body_bytes = match crate::upstream::http_client::read_body_limited(resp.into_body(), 64 * 1024 * 1024).await {
+            let body_bytes = match crate::upstream::http_client::read_body_limited(
+                resp.into_body(),
+                64 * 1024 * 1024,
+            )
+            .await
+            {
                 Ok(b) => b,
-                Err(e) => return error_response(StatusCode::BAD_GATEWAY, &format!("upstream_read_failed: {e}")),
+                Err(e) => {
+                    return error_response(
+                        StatusCode::BAD_GATEWAY,
+                        &format!("upstream_read_failed: {e}"),
+                    )
+                }
             };
             let mut out = Response::builder().status(status);
             {
@@ -229,7 +259,9 @@ pub async fn forward_all(state: SharedState, req: Request) -> Response {
     let (parts, body) = req.into_parts();
     let body_bytes = match axum::body::to_bytes(body, state.config.max_body_bytes()).await {
         Ok(b) => b,
-        Err(e) => return error_response(StatusCode::BAD_REQUEST, &format!("body_read_failed: {e}")),
+        Err(e) => {
+            return error_response(StatusCode::BAD_REQUEST, &format!("body_read_failed: {e}"))
+        }
     };
     let method = parts.method.as_str().to_string();
     passthrough(&state, &method, &parts.uri, &parts.headers, body_bytes).await

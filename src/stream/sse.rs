@@ -37,7 +37,12 @@ pub enum Framing {
 
 impl StreamState {
     pub fn new(framing: Framing) -> Self {
-        Self { framing, buf: String::new(), kept: String::new(), keep_max: 256 * 1024 }
+        Self {
+            framing,
+            buf: String::new(),
+            kept: String::new(),
+            keep_max: 256 * 1024,
+        }
     }
 
     /// 处理一块数据，返回应当下发的字节（可能为空）。
@@ -145,7 +150,10 @@ pub fn restore_sse_event(
             }
             let Ok(data) = serde_json::from_str::<serde_json::Value>(payload) else {
                 // 非 JSON 载荷：整段走 restore（channel=raw）
-                out_lines.push(format!("data: {}", restore_final(payload, sid, false, store, stats)));
+                out_lines.push(format!(
+                    "data: {}",
+                    restore_final(payload, sid, false, store, stats)
+                ));
                 continue;
             };
             if !data.is_object() {
@@ -165,7 +173,8 @@ pub fn restore_sse_event(
                             .as_ref()
                             .map(|p| p.iter().any(|prefix| channel.starts_with(prefix.as_str())))
                             .unwrap_or(false);
-                    let r = restore_channel(text, sid, store, stats, channel, *escape, channel_final);
+                    let r =
+                        restore_channel(text, sid, store, stats, channel, *escape, channel_final);
                     slots::set_slot(&mut restored, channel, &r);
                 }
                 if let Some(obj) = restored.as_object() {
@@ -177,8 +186,10 @@ pub fn restore_sse_event(
                             .unwrap_or(false);
                         if has_pending {
                             if let Some(mut s) = store.get_mut(sid) {
-                                s.flush_tmpl
-                                    .insert(channel.clone(), serde_json::to_string(obj).unwrap_or_default());
+                                s.flush_tmpl.insert(
+                                    channel.clone(),
+                                    serde_json::to_string(obj).unwrap_or_default(),
+                                );
                             }
                         }
                     }
@@ -230,8 +241,10 @@ pub fn restore_ndjson_line(
         if let Some(mut s) = store.get_mut(sid) {
             for (channel, _, _) in &slot_list {
                 if s.pending.contains_key(channel) {
-                    s.flush_tmpl
-                        .insert(channel.clone(), serde_json::to_string(&restored).unwrap_or_default());
+                    s.flush_tmpl.insert(
+                        channel.clone(),
+                        serde_json::to_string(&restored).unwrap_or_default(),
+                    );
                 }
             }
         }
@@ -260,7 +273,11 @@ fn restore_channel(
     let Some(mut s) = store.get_mut(sid) else {
         return text.to_string();
     };
-    let buf = format!("{}{}", s.pending.get(channel).cloned().unwrap_or_default(), text);
+    let buf = format!(
+        "{}{}",
+        s.pending.get(channel).cloned().unwrap_or_default(),
+        text
+    );
     let confirmed: String = if final_channel {
         s.pending.remove(channel);
         buf
@@ -294,14 +311,22 @@ pub fn flush_pending(
     framing: Framing,
     stats: &mut RestoreStats,
 ) -> String {
-    let Some(s) = store.get(sid) else { return String::new() };
+    let Some(s) = store.get(sid) else {
+        return String::new();
+    };
     if s.pending.is_empty() {
         return String::new();
     }
-    let pending: Vec<(String, String)> =
-        s.pending.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-    let tmpl: std::collections::HashMap<String, String> =
-        s.flush_tmpl.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    let pending: Vec<(String, String)> = s
+        .pending
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    let tmpl: std::collections::HashMap<String, String> = s
+        .flush_tmpl
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
     drop(s);
     // block 模式已命中的会话不再补发
     if store.get(sid).map(|s| s.cmd_blocked).unwrap_or(false) {
@@ -348,7 +373,12 @@ pub fn flush_pending(
 }
 
 /// 用最后一个同通道事件做模板补发（对齐 `_build_flush_event` / `_build_flush_line`）。
-fn build_flush_frame(tmpl_json: &str, channel: &str, leftover: &str, framing: Framing) -> Option<String> {
+fn build_flush_frame(
+    tmpl_json: &str,
+    channel: &str,
+    leftover: &str,
+    framing: Framing,
+) -> Option<String> {
     let mut data: serde_json::Value = serde_json::from_str(tmpl_json).ok()?;
     let slot_list = slots::text_slots(&data);
     let mut hit = false;
@@ -400,7 +430,10 @@ fn wrap_bare_flush(text: &str, framing: Framing) -> String {
 /// 内容类型判定（对齐 `_is_ndjson_ct`）。
 pub fn is_ndjson_ct(ct: &str) -> bool {
     let c = ct.to_ascii_lowercase();
-    c.contains("x-ndjson") || c.contains("ndjson") || c.contains("jsonl") || c.contains("x-jsonlines")
+    c.contains("x-ndjson")
+        || c.contains("ndjson")
+        || c.contains("jsonl")
+        || c.contains("x-jsonlines")
 }
 
 /// 聚合上游 body 为完整字节（非流式路径 + M6 转发用）。
@@ -446,7 +479,11 @@ mod tests {
     fn sse_event_restores_and_keeps_framing() {
         let parts = setup();
         let masked = mask_text(&parts, "客户张三");
-        let token = placeholder::placeholder_rx().find(&masked).unwrap().as_str().to_string();
+        let token = placeholder::placeholder_rx()
+            .find(&masked)
+            .unwrap()
+            .as_str()
+            .to_string();
         let event = format!(
             "data: {}",
             serde_json::json!({"choices": [{"delta": {"content": format!("你好{token}")}}]})
@@ -464,7 +501,11 @@ mod tests {
     fn sse_partial_token_held_then_flushed() {
         let parts = setup();
         let masked = mask_text(&parts, "客户张三");
-        let token = placeholder::placeholder_rx().find(&masked).unwrap().as_str().to_string();
+        let token = placeholder::placeholder_rx()
+            .find(&masked)
+            .unwrap()
+            .as_str()
+            .to_string();
         let half = token.len() / 2;
 
         let mut st = StreamState::new(Framing::Sse);
@@ -500,7 +541,10 @@ mod tests {
             serde_json::json!({"choices": [{"delta": {"content": "hello"}}]})
         );
         let (a, _) = st.push(&ev.as_bytes()[..15], "s", &parts.1);
-        assert!(a.is_empty(), "半个事件不得产出字节（否则会成为 chunked 终止块）");
+        assert!(
+            a.is_empty(),
+            "半个事件不得产出字节（否则会成为 chunked 终止块）"
+        );
         let (b, _) = st.push(&ev.as_bytes()[15..], "s", &parts.1);
         assert!(!b.is_empty());
     }
@@ -522,8 +566,14 @@ mod tests {
     fn ndjson_line_restore() {
         let parts = setup();
         let masked = mask_text(&parts, "客户张三");
-        let token = placeholder::placeholder_rx().find(&masked).unwrap().as_str().to_string();
-        let line = serde_json::json!({"message": {"content": format!("你好{token}")}, "done": false}).to_string();
+        let token = placeholder::placeholder_rx()
+            .find(&masked)
+            .unwrap()
+            .as_str()
+            .to_string();
+        let line =
+            serde_json::json!({"message": {"content": format!("你好{token}")}, "done": false})
+                .to_string();
         let mut stats = RestoreStats::default();
         let out = restore_ndjson_line(&line, "s", &parts.1, &mut stats, false);
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -551,7 +601,8 @@ mod tests {
             s.pending.insert("c0.content".into(), "{{NAME_ab".into());
             s.flush_tmpl.insert(
                 "c0.content".into(),
-                serde_json::json!({"id": "c1", "choices": [{"delta": {"content": ""}}]}).to_string(),
+                serde_json::json!({"id": "c1", "choices": [{"delta": {"content": ""}}]})
+                    .to_string(),
             );
         }
         let mut stats = RestoreStats::default();

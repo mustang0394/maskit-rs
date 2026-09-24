@@ -52,14 +52,22 @@ impl EventStore {
         let path = data_dir.join("shield-events.sqlite3");
         init_schema(&path)?;
         let (tx, rx) = sync_channel::<StoreMsg>(EVENT_QUEUE_MAX);
-        let stats = Arc::new(Mutex::new(WriterStats { alive: true, ..Default::default() }));
+        let stats = Arc::new(Mutex::new(WriterStats {
+            alive: true,
+            ..Default::default()
+        }));
         let stats2 = stats.clone();
         let path2 = path.clone();
         let handle = std::thread::Builder::new()
             .name("maskit-event-writer".into())
             .spawn(move || writer_loop(&path2, rx, stats2))
             .ok();
-        Ok(Arc::new(Self { tx, path, stats, handle }))
+        Ok(Arc::new(Self {
+            tx,
+            path,
+            stats,
+            handle,
+        }))
     }
 
     pub fn path(&self) -> &Path {
@@ -94,13 +102,14 @@ impl EventStore {
 
     /// 读事件（新→旧，供 API）。
     pub fn fetch_events(&self, limit: usize, offset: usize) -> Vec<Event> {
-        let Ok(conn) = open_read(&self.path) else { return vec![] };
-        let mut stmt = match conn.prepare(
-            "SELECT payload FROM events ORDER BY id DESC LIMIT ?1 OFFSET ?2",
-        ) {
-            Ok(s) => s,
-            Err(_) => return vec![],
+        let Ok(conn) = open_read(&self.path) else {
+            return vec![];
         };
+        let mut stmt =
+            match conn.prepare("SELECT payload FROM events ORDER BY id DESC LIMIT ?1 OFFSET ?2") {
+                Ok(s) => s,
+                Err(_) => return vec![],
+            };
         let rows = stmt.query_map(params![limit as i64, offset as i64], |r| {
             r.get::<_, String>(0)
         });
@@ -112,13 +121,14 @@ impl EventStore {
 
     /// 读审计事件。
     pub fn fetch_audits(&self, limit: usize) -> Vec<AuditEvent> {
-        let Ok(conn) = open_read(&self.path) else { return vec![] };
-        let mut stmt = match conn.prepare(
-            "SELECT payload FROM audit_events ORDER BY id DESC LIMIT ?1",
-        ) {
-            Ok(s) => s,
-            Err(_) => return vec![],
+        let Ok(conn) = open_read(&self.path) else {
+            return vec![];
         };
+        let mut stmt =
+            match conn.prepare("SELECT payload FROM audit_events ORDER BY id DESC LIMIT ?1") {
+                Ok(s) => s,
+                Err(_) => return vec![],
+            };
         let rows = stmt.query_map(params![limit as i64], |r| r.get::<_, String>(0));
         let Ok(rows) = rows else { return vec![] };
         rows.filter_map(|r| r.ok())
@@ -151,7 +161,11 @@ impl EventStore {
             return;
         }
         let day = today_str();
-        let model = if model.trim().is_empty() { "(unknown)" } else { model };
+        let model = if model.trim().is_empty() {
+            "(unknown)"
+        } else {
+            model
+        };
         // 同步写：用量是低频操作（每请求 1~2 次），不必挤事件批处理队列
         if let Ok(conn) = open_read(&self.path) {
             let _ = conn.execute(
@@ -160,7 +174,12 @@ impl EventStore {
                  ON CONFLICT(day, model) DO UPDATE SET \
                    prompt_tokens = prompt_tokens + excluded.prompt_tokens, \
                    completion_tokens = completion_tokens + excluded.completion_tokens",
-                params![day, model, u.prompt_tokens as i64, u.completion_tokens as i64],
+                params![
+                    day,
+                    model,
+                    u.prompt_tokens as i64,
+                    u.completion_tokens as i64
+                ],
             );
             // 总计也进 daily_stats，便于「今日 token」一行读出
             let _ = conn.execute(
@@ -185,14 +204,20 @@ impl EventStore {
              WHERE day = ?1 ORDER BY (prompt_tokens + completion_tokens) DESC LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![day, limit as i64], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
         })?;
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
     /// 今日 token 统计（输入 / 输出 / 合计）。
     pub fn today_tokens(&self) -> (i64, i64) {
-        let Ok(conn) = open_read(&self.path) else { return (0, 0) };
+        let Ok(conn) = open_read(&self.path) else {
+            return (0, 0);
+        };
         let day = today_str();
         let get = |key: &str| -> i64 {
             conn.query_row(
@@ -262,10 +287,16 @@ impl EventStore {
                 "SELECT day, key, cnt FROM daily_stats WHERE day >= date('now', ?1) ORDER BY day",
             )?;
             let rows = stmt.query_map(params![format!("-{days} days")], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
             })?;
-            let mut by_day: std::collections::BTreeMap<String, serde_json::Map<String, serde_json::Value>> =
-                std::collections::BTreeMap::new();
+            let mut by_day: std::collections::BTreeMap<
+                String,
+                serde_json::Map<String, serde_json::Value>,
+            > = std::collections::BTreeMap::new();
             for row in rows.flatten() {
                 by_day
                     .entry(row.0)
@@ -461,11 +492,9 @@ fn flush_batch(
     }
     // DB 不可用时尝试重连（故障恢复）
     if conn.is_none() {
-        *conn = Connection::open(path)
-            .ok()
-            .inspect(|c| {
-                let _ = c.pragma_update(None, "journal_mode", "WAL");
-            });
+        *conn = Connection::open(path).ok().inspect(|c| {
+            let _ = c.pragma_update(None, "journal_mode", "WAL");
+        });
         if conn.is_none() {
             if let Ok(mut s) = stats.lock() {
                 s.dead_letters += batch.len() as u64;
@@ -540,7 +569,11 @@ fn write_event(conn: &Connection, ev: &Event) -> rusqlite::Result<()> {
     let day = today_str();
     conn.execute(
         "INSERT INTO events (ts, type, payload) VALUES (?1, ?2, ?3)",
-        params![ev.ts, format!("{:?}", ev.event_type).to_uppercase(), payload],
+        params![
+            ev.ts,
+            format!("{:?}", ev.event_type).to_uppercase(),
+            payload
+        ],
     )?;
     // 每日聚合
     let bump = |key: &str, n: i64| -> rusqlite::Result<()> {
@@ -557,7 +590,11 @@ fn write_event(conn: &Connection, ev: &Event) -> rusqlite::Result<()> {
             bump("mask_events", 1)?;
             // 与 Python 口径一致：masked_items 用事件自报的 count（唯一原文命中数），
             // 缺失时退回 items 条数（老事件兼容）。
-            let cnt = if ev.count > 0 { ev.count } else { safe.items.len() };
+            let cnt = if ev.count > 0 {
+                ev.count
+            } else {
+                safe.items.len()
+            };
             bump("masked_items", cnt as i64)?;
             for item in &safe.items {
                 // Python 口径：非凭据类存原文（UI 需要看是哪个词），凭据类只能存 preview
@@ -578,7 +615,11 @@ fn write_event(conn: &Connection, ev: &Event) -> rusqlite::Result<()> {
         }
         crate::store::events::EventType::Restore => {
             bump("restore_events", 1)?;
-            let n = if ev.restored > 0 { ev.restored } else { safe.items.len() };
+            let n = if ev.restored > 0 {
+                ev.restored
+            } else {
+                safe.items.len()
+            };
             bump("restored_items", n as i64)?;
         }
         crate::store::events::EventType::Block => bump("alerts", 1)?,
@@ -694,10 +735,20 @@ mod tests {
             .filter_map(|r| r.ok())
             .collect();
         for t in [
-            "audit_events", "daily_models", "daily_prefix", "daily_stats", "daily_status",
-            "daily_tokens", "daily_words", "events", "meta",
+            "audit_events",
+            "daily_models",
+            "daily_prefix",
+            "daily_stats",
+            "daily_status",
+            "daily_tokens",
+            "daily_words",
+            "events",
+            "meta",
         ] {
-            assert!(names.contains(&t.to_string()), "缺表 {t}（schema 与 Python 版不一致）");
+            assert!(
+                names.contains(&t.to_string()),
+                "缺表 {t}（schema 与 Python 版不一致）"
+            );
         }
     }
 
@@ -706,7 +757,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = EventStore::open(dir.path()).unwrap();
         store.enqueue(sample_event(EventType::Mask, "PHONE", "13800138000", false));
-        store.enqueue(sample_event(EventType::Restore, "PHONE", "13800138000", false));
+        store.enqueue(sample_event(
+            EventType::Restore,
+            "PHONE",
+            "13800138000",
+            false,
+        ));
         // 触发 flush
         std::thread::sleep(std::time::Duration::from_millis(700));
         let evs = store.fetch_events(10, 0);
@@ -816,8 +872,14 @@ mod tests {
         store.clear_events().unwrap();
         assert_eq!(store.fetch_events(10, 0).len(), 0, "明细清空");
         let after = store.today_stats().unwrap();
-        assert_eq!(after["mask_events"], 1, "统计保留（用户要求：统计永久保存）");
-        assert!(after["by_label"].as_object().unwrap().is_empty(), "词级明细清空");
+        assert_eq!(
+            after["mask_events"], 1,
+            "统计保留（用户要求：统计永久保存）"
+        );
+        assert!(
+            after["by_label"].as_object().unwrap().is_empty(),
+            "词级明细清空"
+        );
     }
 
     #[test]
@@ -845,7 +907,12 @@ mod tests {
         let store = EventStore::open(dir.path()).unwrap();
         // 灌入超过队列上限的事件（写线程会消费，所以这里只断言不 panic 且计数存在）
         for i in 0..100 {
-            store.enqueue(sample_event(EventType::Mask, "PHONE", &format!("1380013{i:04}"), false));
+            store.enqueue(sample_event(
+                EventType::Mask,
+                "PHONE",
+                &format!("1380013{i:04}"),
+                false,
+            ));
         }
         std::thread::sleep(std::time::Duration::from_millis(900));
         let s = store.stats.lock().unwrap().clone();
