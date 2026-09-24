@@ -17,13 +17,20 @@ services:
     container_name: maskit-rs
     restart: unless-stopped
 
-    # 关键：镜像内进程默认以 nonroot(65532) 运行，而宿主机 ./data 由 Docker 以
-    # root:root 创建 → 容器写不进去，报「数据目录初始化失败: Permission denied」。
-    # 这里让进程以**宿主当前用户**身份运行，绑定挂载目录天然可写，
-    # 且落盘的文件宿主用户可直接读写。
-    # 宿主机若确实有 root 权限，也可改成 `user: "65532:65532"` 并
-    # 预先 `sudo chown -R 65532:65532 ./data`。
-    user: "${UID:-65532}:${GID:-65532}"
+    # 以镜像内的 nonroot(65532) 运行。
+    #
+    # 本文件默认用**命名卷** `maskit-data`，它初始化时会继承镜像里 /data 的
+    # 属主（nonroot:nonroot），所以 65532 开箱即用、无需改宿主机目录权限。
+    #
+    # ⚠️ 若改成绑定挂载（如 `- ./data:/data`）：宿主机目录由 root 创建，
+    #   65532 写不进去，会报「数据目录初始化失败: Permission denied」。
+    #   此时把下面这行换成以宿主当前用户身份运行：
+    #       user: "${UID:-65532}:${GID:-65532}"
+    #   或者先 `sudo chown -R 65532:65532 ./data`。
+    #
+    # （曾把 `user:` 写了两遍：YAML 映射不允许重复键，新版 compose 直接报
+    #   `mapping key "user" already defined` → `docker compose up -d` 根本起不来。）
+    user: "65532:65532"
 
     ports:
       # 单端口：Web 控制台(/console) + 管理 API + LLM 反代 共用
@@ -47,7 +54,6 @@ services:
       # TZ: Asia/Shanghai
 
     # distroless 镜像没有 shell，无法 exec 排障；需要时用 docker logs
-    user: "65532:65532"   # 与镜像内 nonroot 一致（命名卷场景无需改动）
 
     logging:
       driver: json-file

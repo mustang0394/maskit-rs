@@ -39,9 +39,6 @@ COPY --chmod=0644 config.example.json /app/config.example.json
 COPY --chmod=0644 --chown=nonroot:nonroot docker/.keep /data/.keep
 
 WORKDIR /app
-# distroless 无 shell，不能 RUN mkdir；用 COPY 建目录并指定属主，
-# 这样命名卷初始化时会继承 nonroot 属主（绑定挂载仍需宿主机侧处理属主）
-COPY --chmod=0644 --chown=nonroot:nonroot docker/.keep /data/.keep
 
 VOLUME ["/data"]
 # 绑 0.0.0.0：容器内绑 127.0.0.1 会导致 `-p` 端口映射接不到
