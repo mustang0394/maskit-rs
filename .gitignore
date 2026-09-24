@@ -1,6 +1,9 @@
 # Rust 构建产物
 /target
 
+# CI 下载的预构建二进制（Docker 组装用，本地产物不入库）
+/bin
+
 # 运行时数据（配置含 panel_token、SQLite 事件库，绝不入库）
 /data
 /config.json

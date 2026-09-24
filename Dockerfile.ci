@@ -1,0 +1,43 @@
+# syntax=docker/dockerfile:1
+# ---------------------------------------------------------------------------
+# CI 专用：组装镜像（**不编译**）
+#
+# 二进制由 release job 构建好后以 artifact 形式传入，本文件只负责
+# 「把二进制放进 distroless 运行时」。
+#
+# 为什么单独一个文件：
+#   - `Dockerfile`（多阶段、含 cargo 编译）保留给本地 `docker compose up --build`
+#     与普通用户自行构建；
+#   - CI 若用同一个 Dockerfile，就要为每个平台重编一遍完整依赖树
+#     （arm64 还是 QEMU 模拟编译，十几分钟起），而产物其实和 release
+#     job 里的二进制完全一样 —— 纯重复劳动 + 一致性风险。
+#
+# 关键点：TARGETARCH 是 BuildKit 预定义 ARG，会按构建平台自动填充，
+# 因此一条 `COPY bin/${TARGETARCH}/maskit-rs` 就能覆盖多架构；
+# 且本文件所有指令都是 COPY/ENV/USER/ENTRYPOINT，**不执行任何二进制**，
+# 因此多架构组装无需 QEMU 模拟，速度是秒级。
+# ---------------------------------------------------------------------------
+
+# TARGETARCH 取值：amd64 / arm64（不是完整三元组）
+ARG TARGETARCH
+
+FROM gcr.io/distroless/cc-debian12:nonroot AS runtime
+
+# distroless/cc 提供 glibc + CA 证书（HTTPS 上游需要）；
+# SQLite 已静态链接进二进制，无需系统库。
+COPY bin/${TARGETARCH}/maskit-rs /usr/local/bin/maskit-rs
+COPY config.example.json /app/config.example.json
+
+WORKDIR /app
+VOLUME ["/data"]
+ENV MASKIT_RS_DATA_DIR=/data \
+    RUST_LOG=info
+
+USER nonroot:nonroot
+EXPOSE 18701
+
+# distroless 无 shell，用二进制自身做健康检查
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+  CMD ["/usr/local/bin/maskit-rs", "--health-check"]
+
+ENTRYPOINT ["/usr/local/bin/maskit-rs"]

@@ -15,3 +15,6 @@ config.json
 *.sqlite3-wal
 *.sqlite3-shm
 core.*
+
+# 注意：bin/（CI 下载的预构建二进制）**不能**排除 ——
+# Dockerfile.ci 依赖它组装镜像。默认不在排除列表里，故放行。

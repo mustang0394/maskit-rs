@@ -190,6 +190,17 @@ jobs:
           Remove-Item -Recurse -Force $stage
           Get-ChildItem dist
 
+      # 把 Linux 二进制交给 docker job：镜像直接用这个产物组装，
+      # 不再在容器里重编一遍（arm64 尤其能省掉 QEMU 模拟编译）。
+      - name: 上传 Linux 二进制（供 Docker 组装）
+        if: ${{ !contains(matrix.target, 'windows') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: bin-linux-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/maskit-rs
+          if-no-files-found: error
+          retention-days: 1
+
       - name: 上传 Release 资产
         uses: softprops/action-gh-release@v2
         with:
@@ -204,8 +215,10 @@ jobs:
   # 3. 容器镜像（GHCR，多架构 linux/amd64 + linux/arm64）
   # ---------------------------------------------------------------------
   docker:
-    name: 构建并推送 Docker 镜像
-    needs: [verify, version]
+    name: 组装并推送 Docker 镜像
+    # 依赖 release：直接复用那里已构建好的 Linux 二进制，
+    # 避免在容器里把同样的依赖树重编一遍。
+    needs: [verify, version, release]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -213,8 +226,30 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: docker/setup-qemu-action@v3
+      # 本 Dockerfile 只有 COPY/ENV/USER 等指令，不执行任何二进制，
+      # 因此组装多架构镜像无需 QEMU 模拟。
       - uses: docker/setup-buildx-action@v3
+
+      - name: 下载 Linux 二进制
+        uses: actions/download-artifact@v4
+        with:
+          pattern: bin-linux-*
+          merge-multiple: false
+
+      - name: 摆放二进制到 bin/<arch>/
+        run: |
+          set -euo pipefail
+          mkdir -p bin/amd64 bin/arm64
+          # artifact 下载后是 `bin-linux-<target>/maskit-rs`
+          for d in bin-linux-*; do
+            [ -d "$d" ] || continue
+            case "$d" in
+              *aarch64*) cp "$d/maskit-rs" bin/arm64/maskit-rs ;;
+              *x86_64*)  cp "$d/maskit-rs" bin/amd64/maskit-rs ;;
+            esac
+          done
+          rm -rf bin-linux-*
+          ls -lR bin
 
       - name: 登录 GHCR
         uses: docker/login-action@v3
@@ -234,11 +269,11 @@ jobs:
             type=sha,format=short
           labels: ${{ steps.meta.outputs.labels }}
 
-      - name: 构建并推送（amd64 + arm64）
+      - name: 组装并推送（amd64 + arm64，复用已构建二进制）
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: Dockerfile
+          file: Dockerfile.ci
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
