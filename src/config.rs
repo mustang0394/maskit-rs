@@ -344,7 +344,7 @@ pub struct Config {
     pub stream_response: bool,
     #[serde(default = "default_retention")]
     pub log_retention_days: u32,
-    /// Web 控制台令牌（≥16 位 ASCII；空则启动时生成随机并写入日志）
+    /// Web 控制台令牌（不限长度，原样生效；空则启动时生成 24 位随机值并写入日志）
     #[serde(default)]
     pub panel_token: String,
     /// 脱敏暂停（运行时开关，等价 filter_enabled=false：纯透传 + BYPASS 事件）
@@ -410,11 +410,6 @@ impl Config {
                 "upstream.target 缺少 scheme（http:// 或 https://）".into(),
             ));
         }
-        if !self.panel_token.is_empty() && self.panel_token.len() < 16 {
-            warnings.push(ConfigWarning(
-                "panel_token 少于 16 位，已忽略并回退随机令牌".into(),
-            ));
-        }
         if self.mask.max_body_bytes > 128 * 1024 * 1024 {
             warnings.push(ConfigWarning(
                 "mask.max_body_bytes 超过 128MiB 上限，已截断到 128MiB".into(),
@@ -446,10 +441,8 @@ impl Config {
         if c.mask.mapping_ttl == 0 {
             c.mask.mapping_ttl = 24 * 3600;
         }
-        if c.panel_token.len() < 16 {
-            // 交给启动逻辑生成随机令牌
-            c.panel_token.clear();
-        }
+        // panel_token 不做长度限制：用户设什么就是什么（仅空值才交给启动逻辑生成）。
+        c.panel_token = c.panel_token.trim().to_string();
         // 审计 signals：补默认（全部开启）
         let default_signals = [
             "error_leak",
@@ -765,6 +758,57 @@ mod tests {
         assert!(center
             .patch("nonexistent.deep.key", serde_json::json!(1))
             .is_err());
+    }
+
+    /// 回归：panel_token 曾被强制要求 ≥16 位，短令牌会被 `normalized()` **静默丢弃**
+    /// 并替换为随机 24 位值 —— 用户设了固定短令牌，却发现每次重启/保存都失效。
+    #[test]
+    fn short_panel_token_is_honored() {
+        let dir = tempfile::tempdir().unwrap();
+        let (center, _) = ConfigCenter::load_or_init(dir.path()).unwrap();
+
+        for short in ["a", "123", "abc", "16chars-long-token"] {
+            let mut cfg = center.get();
+            cfg.panel_token = short.to_string();
+            center.update(cfg);
+            assert_eq!(
+                center.get().panel_token,
+                short,
+                "短令牌 {short:?} 必须原样保留，不该被替换成随机值"
+            );
+        }
+
+        // 极端长度：1 位、以及超长（512 位）都应原样保留
+        let mut cfg = center.get();
+        cfg.panel_token = "x".repeat(512);
+        center.update(cfg);
+        assert_eq!(center.get().panel_token.len(), 512);
+
+        // 重启后仍是同一个值（能持久化，不被重新生成）
+        let (center2, _) = ConfigCenter::load_or_init(dir.path()).unwrap();
+        assert_eq!(center2.get().panel_token.len(), 512);
+
+        // 留空仍然走自动生成
+        let mut cfg = center2.get();
+        cfg.panel_token = String::new();
+        let w = center2.update(cfg);
+        assert!(
+            w.is_empty() || !w.iter().any(|x| x.0.contains("panel_token")),
+            "空令牌不应再触发长度告警"
+        );
+    }
+
+    /// 纯空白令牌等同未设置（trim 后触发自动生成），不留「看不见的弱口令」。
+    #[test]
+    fn blank_panel_token_treated_as_unset() {
+        let dir = tempfile::tempdir().unwrap();
+        let (center, _) = ConfigCenter::load_or_init(dir.path()).unwrap();
+        let mut cfg = center.get();
+        cfg.panel_token = "   \t  ".to_string();
+        assert!(
+            cfg.normalized().panel_token.is_empty(),
+            "全空白令牌应 trim 为空"
+        );
     }
 
     #[test]

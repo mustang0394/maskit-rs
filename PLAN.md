@@ -334,7 +334,7 @@ Rust 侧用 `aho-corasick` 对每条规则建立「必含特征串」预筛（�
   "response_scan": true,
   "stream_response": true,
   "log_retention_days": 7,
-  "panel_token": "..."               // Web 登录令牌（≥16 位）
+  "panel_token": "..."               // Web 登录令牌（不限长度）
 }
 ```
 

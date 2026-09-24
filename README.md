@@ -133,7 +133,7 @@ maskit-rs/
 | `fail_closed` | 已路由流量是否绝不放行未脱敏原文（默认 `true`） |
 | `command_block.mode` | `observe` / `rewrite` / `block` |
 | `audit.*` | 审计开关、严重度门槛（**无主动探针**，只做被动检测） |
-| `panel_token` | 控制台令牌（≥16 位；留空自动生成） |
+| `panel_token` | 控制台令牌（不限制长度，原样生效；留空自动生成 24 位随机值） |
 
 ---
 
