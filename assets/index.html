@@ -76,25 +76,17 @@
         <div class="rules-grid" id="ruleToggles"></div>
       </div>
 
-      <!-- 自定义敏感词：主从双栏 -->
+      <!-- 自定义敏感词：分组是独立实体，先建组、再往里加词 -->
       <div class="panel">
         <div class="panel-head">
           <h2>自定义敏感词</h2>
           <span class="hint">
-            命中后替换为 <code>{{分类_xxxxxx}}</code>；原文本就在 <code>config.json</code> 里，
+            命中后替换为 <code>{{分组_xxxxxx}}</code>；原文本就在 <code>config.json</code> 里，
             因此占位符跨重启稳定。以 <code>re:</code> 开头的词按正则处理。
           </span>
         </div>
-        <div class="cw-add">
-          <input id="cwLabel" list="cwLabels" placeholder="分类（留空 = TERM）" class="cw-add-label" />
-          <datalist id="cwLabels"></datalist>
-          <textarea id="cwWords" rows="2" spellcheck="false"
-            placeholder="批量粘贴敏感词：每行一个（也支持逗号 / 顿号 / 空格分隔）"></textarea>
-          <button class="btn btn-primary" id="cwAdd">添加</button>
-        </div>
-        <div class="hint" id="cwHint"></div>
         <div class="split split-tall">
-          <aside class="split-list cw-nav" id="cwNav" aria-label="分类列表"></aside>
+          <aside class="split-list cw-nav" id="cwNav" aria-label="敏感词分组"></aside>
           <section class="split-detail" id="cwMain"></section>
         </div>
       </div>

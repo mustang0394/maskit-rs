@@ -35,6 +35,7 @@
       "USCC": false
     },
     "custom_words": {},
+    "custom_word_groups": [],
     "custom_regexes": [],
     "secret_prefixes": [
       "sk-",

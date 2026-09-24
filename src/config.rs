@@ -164,6 +164,16 @@ pub struct MaskConfig {
     /// 自定义敏感词 {词: 分类}
     #[serde(default)]
     pub custom_words: std::collections::BTreeMap<String, String>,
+    /// 已声明的敏感词分组（**有序**，控制台按此顺序展示）。
+    ///
+    /// 为什么需要单独存一份：词表是 `{词: 分类}` 映射，分组只能由它反推 ——
+    /// 于是「新建分组」这件事无法保存（没有词的组会当场消失），加词也必须
+    /// 每次重新输入分组名。声明表让分组成为**独立实体**：先建组、再往里加词。
+    ///
+    /// 引擎不使用本字段（只认 `custom_words`）；分组的实际生效仍取决于
+    /// 词表里有没有属于它的词。声明但无词的分组只是「空盒子」。
+    #[serde(default)]
+    pub custom_word_groups: Vec<String>,
     /// 禁用的词分组（整个 label 关闭，对齐 Python `sensitive_disabled`）
     #[serde(default)]
     pub sensitive_disabled: Vec<String>,
@@ -230,6 +240,7 @@ impl Default for MaskConfig {
             enabled: true,
             builtin_rules: default_builtin_rules(),
             custom_words: Default::default(),
+            custom_word_groups: Default::default(),
             sensitive_disabled: Default::default(),
             log_credential_plaintext: true,
             sensitive_word_disabled: Default::default(),
@@ -452,6 +463,18 @@ impl Config {
         c.mask
             .builtin_rules
             .retain(|k, _| ALL_BUILTIN_RULES.contains(&k.as_str()));
+        // 分组声明：去空白、去重，保持用户顺序（空分组**必须保留** —— 那是它的意义）
+        {
+            let mut seen = std::collections::HashSet::new();
+            let cleaned: Vec<String> = c
+                .mask
+                .custom_word_groups
+                .iter()
+                .map(|g| g.trim().to_string())
+                .filter(|g| !g.is_empty() && seen.insert(g.clone()))
+                .collect();
+            c.mask.custom_word_groups = cleaned;
+        }
         if c.mask.max_body_bytes > 128 * 1024 * 1024 {
             c.mask.max_body_bytes = 128 * 1024 * 1024;
         }

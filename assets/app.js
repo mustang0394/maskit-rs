@@ -410,8 +410,12 @@
     } catch (e) { toast(e.message, true); }
   });
 
-  /* ==================== 规则：自定义敏感词（主从双栏） ==================== */
-  const cw = { cfg: null, label: null, search: '', onlyDisabled: false };
+  /* ==================== 规则：自定义敏感词（分组是独立实体） ==================== */
+  // 「分组」在配置里是一等公民：`mask.custom_word_groups` 保存**有序**的组名，
+  // `mask.custom_words` 保存 {词: 分组}。组可以只有名字没有词（空盒子），
+  // 所以「新建分组」能落盘、刷新后还在；加词也只需在当前选中的组里输入，
+  // 不必每加一次词就重打一次分组名。
+  const cw = { cfg: null, label: null, search: '', onlyDisabled: false, addingGroup: false, renaming: false };
 
   /** 占位符标签 ASCII 化（与服务端 safe_label 一致：非 [A-Z0-9] 剔除，≤12，空则 TERM）。 */
   function safeLabel(label) {
@@ -426,20 +430,36 @@
   }
   const isAsciiWord = w => /^[\x20-\x7e]+$/.test(w);
 
-  /** 从配置抽出词表模型（分组 / 组开关 / 词开关 / 整词）。 */
+  /**
+   * 从配置抽出分组模型。
+   *
+   * 分组顺序 = 已声明的顺序；手工编辑 config.json 加进来的「未声明」分组
+   * （词表里有、声明表里没有）追加在后面，保证它们不会凭空消失。
+   */
   function wmodel(cfg) {
     const words = cfg.mask.custom_words || {};
-    const groups = new Map();
+    const byGroup = new Map();
     for (const [w, l] of Object.entries(words)) {
       const key = (l || 'TERM');
-      if (!groups.has(key)) groups.set(key, []);
-      groups.get(key).push(w);
+      if (!byGroup.has(key)) byGroup.set(key, []);
+      byGroup.get(key).push(w);
     }
-    // 组开关里可能残留「词已删光」的分类 —— 也列出来，方便用户清掉
-    for (const l of (cfg.mask.sensitive_disabled || [])) if (!groups.has(l)) groups.set(l, []);
-    for (const l of Object.keys(cfg.mask.sensitive_word_disabled || {})) if (!groups.has(l)) groups.set(l, []);
+    // 声明表里出现过、或作为 disabled/wordOff 出现过的组名，也要保留展示，
+    // 否则「词被删光但组还在声明里」的组会消失，用户没法清掉它。
+    const extra = [
+      ...(cfg.mask.sensitive_disabled || []),
+      ...Object.keys(cfg.mask.sensitive_word_disabled || {}),
+    ];
+    const declared = (cfg.mask.custom_word_groups || []).slice();
+    // 顺序：先按声明顺序，再把「未声明但词表/开关表里出现过」的组补在后面。
+    const final = [];
+    const push = g => { if (g && !final.includes(g)) final.push(g); };
+    for (const raw of declared) push(String(raw || '').trim());
+    for (const g of byGroup.keys()) push(g);
+    for (const g of extra) push(g);
     return {
-      groups,
+      order: final,
+      byGroup,
       off: new Set(cfg.mask.sensitive_disabled || []),
       wordOff: cfg.mask.sensitive_word_disabled || {},
       whole: new Set(cfg.mask.sensitive_word_whole || []),
@@ -451,68 +471,125 @@
     return !((m.wordOff[label] || []).includes(word));
   }
 
-  /** 更新敏感词区域的整块视图（导航 + 当前分类词表）。 */
+  /** 当前配置里属于该分组的词（有序）。 */
+  function groupWords(cfg, label) {
+    const out = [];
+    for (const [w, l] of Object.entries(cfg.mask.custom_words || {})) {
+      if ((l || 'TERM') === label) out.push(w);
+    }
+    return out;
+  }
+
+  function currentWords(cfg) {
+    return Object.assign({}, cfg.mask.custom_words || {});
+  }
+
+  /** 把「分组声明 + 词表 + 两个开关表 + 整词表」一次性写回（只发变化的键）。 */
+  async function cwSave(next, opt = {}) {
+    let cfg = cw.cfg;
+    if (next.groups) cfg = await patch(['mask', 'custom_word_groups'], next.groups);
+    if (next.words) cfg = await patch(['mask', 'custom_words'], next.words);
+    if (opt.sensitive_disabled) cfg = await patch(['mask', 'sensitive_disabled'], opt.sensitive_disabled);
+    if (opt.wordOff) cfg = await patch(['mask', 'sensitive_word_disabled'], opt.wordOff);
+    if (opt.whole) cfg = await patch(['mask', 'sensitive_word_whole'], opt.whole);
+    cw.cfg = cfg;
+    renderWords();
+    return cfg;
+  }
+
   function renderWords() {
     const cfg = cw.cfg;
     if (!cfg) return;
     const m = wmodel(cfg);
-    const labels = [...m.groups.keys()].sort((a, b) => a.localeCompare(b));
+    const groups = m.order;
 
-    if (!labels.length) cw.label = null;
-    else if (!labels.includes(cw.label)) cw.label = labels[0];
+    if (!groups.length) cw.label = null;
+    else if (!groups.includes(cw.label)) cw.label = groups[0];
 
-    // 分类补全
-    $('cwLabels').innerHTML = labels.map(l => `<option value="${esc(l)}"></option>`).join('');
-
-    // 目录
-    $('cwNav').innerHTML = labels.length ? labels.map(l => {
-      const ws = m.groups.get(l) || [];
-      const off = m.off.has(l);
-      const disabledN = ws.filter(w => !wordEnabled(m, l, w)).length;
-      return `<button class="nav-item ${l === cw.label ? 'active' : ''} ${off ? 'off' : ''}"
-                data-cw-label="${esc(l)}" title="${esc(l)}">
+    // ---- 左侧：分组导航 ----
+    const nav = groups.map(g => {
+      const ws = groupWords(cfg, g);
+      const off = m.off.has(g);
+      const disabledN = ws.filter(w => !wordEnabled(m, g, w)).length;
+      return `<button class="nav-item ${g === cw.label ? 'active' : ''} ${off ? 'off' : ''}"
+                data-cw-group-pick="${esc(g)}" title="${esc(g)}">
           <span class="nav-dot"></span>
-          <span class="nav-name">${esc(l)}</span>
+          <span class="nav-name">${esc(g)}</span>
           <span class="nav-count">${ws.length}</span>
           ${disabledN ? `<span class="hint mono">${disabledN}关</span>` : ''}
         </button>`;
-    }).join('') + `<button class="nav-item nav-add" data-cw-new="1">＋ 新建分类</button>`
-      : `<div class="cw-empty">暂无自定义敏感词<br><span class="hint">在上方输入分类与词，点「添加」</span></div>`;
+    }).join('');
 
-    // 当前分类
+    const addForm = cw.addingGroup
+      ? `<div class="nav-form">
+           <input data-cw-newgroup-input placeholder="新分组名，如 PERSON" autocomplete="off" />
+           <div class="nav-form-actions">
+             <button class="btn btn-sm btn-primary" data-cw-newgroup-ok>创建</button>
+             <button class="btn btn-sm" data-cw-newgroup-cancel>取消</button>
+           </div>
+         </div>`
+      : `<button class="nav-item nav-add" data-cw-newgroup>＋ 新建分组</button>`;
+
+    $('cwNav').innerHTML = (groups.length ? nav : '') + addForm
+      + (groups.length ? '' : `<div class="cw-empty hint">还没有分组<br>点上面「新建分组」开始</div>`);
+
+    // ---- 右侧：当前分组 ----
     const label = cw.label;
-    if (!label) { $('cwMain').innerHTML = emptyBox('左侧还没有分类'); return; }
-    const all = (m.groups.get(label) || []).slice().sort((a, b) => a.localeCompare(b));
+    if (!label) {
+      $('cwMain').innerHTML = emptyBox('先在左侧新建一个分组');
+      return;
+    }
+    const all = groupWords(cfg, label).sort((a, b) => a.localeCompare(b));
     const q = cw.search.trim().toLowerCase();
     const rows = all.filter(w => {
       if (q && !w.toLowerCase().includes(q)) return false;
       if (cw.onlyDisabled && wordEnabled(m, label, w)) return false;
       return true;
     });
-
     const groupOff = m.off.has(label);
+    const isDeclared = (cfg.mask.custom_word_groups || []).includes(label);
+    const labelMismatch = safeLabel(label) !== label;
+
     $('cwMain').innerHTML = `
       <div class="cw-head">
         <div class="cw-title">
-          <b>${esc(label)}</b>
-          <span class="hint mono">{{${esc(safeLabel(label))}_xxxxxx}}</span>
-          <span class="hint">${all.length} 词${all.length !== rows.length ? `（显示 ${rows.length}）` : ''}</span>
-          ${safeLabel(label) !== label
-            ? `<span class="cw-note" title="占位符标签只保留 A-Z0-9（最多 12 位），中文等字符会被剔除">⚠ 分类名含非 ASCII，占位符前缀用 ${esc(safeLabel(label))}</span>`
-            : ''}
+          ${cw.renaming
+            ? `<input data-cw-rename-input value="${esc(label)}" aria-label="分组名" />
+                 <button class="btn btn-sm btn-primary" data-cw-rename-ok>保存</button>
+                 <button class="btn btn-sm" data-cw-rename-cancel>取消</button>`
+            : `<b>${esc(label)}</b>
+               <span class="hint mono">{{${esc(safeLabel(label))}_xxxxxx}}</span>
+               <span class="hint">${all.length} 词${all.length !== rows.length ? `（显示 ${rows.length}）` : ''}</span>
+               <button class="btn btn-sm" data-cw-rename>重命名</button>
+               ${labelMismatch
+                 ? `<span class="cw-note" title="占位符标签只保留 A-Z0-9（最多 12 位），中文等字符会被剔除">⚠ 分组名含非 ASCII，占位符前缀用 ${esc(safeLabel(label))}</span>`
+                 : ''}
+               ${isDeclared ? '' : '<span class="hint" title="该分组只存在于词表里（如手工编辑过 config.json），保存改动后会被登记进声明表">（未登记）</span>'}
+               `}
         </div>
         <div class="cw-head-actions panel-actions">
-          <label class="switch-inline" title="关闭后该分类下所有词都不再命中">
+          <label class="switch-inline" title="关闭后该分组下所有词都不再命中">
             <input type="checkbox" data-cw-group="${esc(label)}" ${groupOff ? '' : 'checked'} /> 整组启用
           </label>
           <button class="btn btn-sm" data-cw-bulk="on">全部启用</button>
           <button class="btn btn-sm" data-cw-bulk="off">全部停用</button>
-          <button class="btn btn-sm btn-warn" data-cw-delgroup="${esc(label)}">删除分类</button>
+          <button class="btn btn-sm btn-warn" data-cw-delgroup="${esc(label)}">删除分组</button>
         </div>
       </div>
-      ${groupOff ? `<div class="note warn">该分类已被「整组停用」——下面的逐词开关暂时不生效。</div>` : ''}
+      ${groupOff ? `<div class="note warn">该分组已被「整组停用」—— 下面的逐词开关暂时不生效。</div>` : ''}
+
+      <div class="cw-addbox">
+        <div class="cw-addbox-title">向「${esc(label)}」添加敏感词</div>
+        <textarea data-cw-addwords rows="2" spellcheck="false"
+          placeholder="每行一个词（也支持逗号 / 顿号 / 空格分隔）。以 re: 开头则按正则处理。"></textarea>
+        <div class="cw-addbox-actions">
+          <button class="btn btn-primary btn-sm" data-cw-addok>添加到「${esc(label)}」</button>
+          <span class="hint" data-cw-addhint></span>
+        </div>
+      </div>
+
       <div class="cw-bar">
-        <input class="cw-search" data-cw-search placeholder="在该分类内搜索…" value="${esc(cw.search)}" />
+        <input class="cw-search" data-cw-search placeholder="在该分组内搜索…" value="${esc(cw.search)}" />
         <label class="switch-inline">
           <input type="checkbox" data-cw-onlydisabled ${cw.onlyDisabled ? 'checked' : ''} /> 仅显示已停用
         </label>
@@ -535,147 +612,180 @@
             <td><button class="btn btn-sm btn-icon" data-cw-del="${esc(w)}" aria-label="删除">✕</button></td>
           </tr>`;
         }).join('')}</tbody></table>`
-        : `<div class="cw-empty">${all.length ? '没有符合筛选条件的词' : '该分类下暂无词'}</div>`}
+        : `<div class="cw-empty">${all.length ? '没有符合筛选条件的词' : '该分组下还没有词 —— 用上面的输入框添加'}</div>`}
     `;
-  }
-
-  /** 补齐 disabled/whole 的一致性：删词或改分类后清掉孤儿标记。 */
-  async function saveWordsModel(next, also) {
-    let cfg = await patch(['mask', 'custom_words'], next.custom_words);
-    if (also && also.sensitive_disabled !== undefined) {
-      cfg = await patch(['mask', 'sensitive_disabled'], also.sensitive_disabled);
-    }
-    if (also && also.sensitive_word_disabled !== undefined) {
-      cfg = await patch(['mask', 'sensitive_word_disabled'], also.sensitive_word_disabled);
-    }
-    if (also && also.sensitive_word_whole !== undefined) {
-      cfg = await patch(['mask', 'sensitive_word_whole'], also.sensitive_word_whole);
-    }
-    cw.cfg = cfg;
-    renderWords();
-    return cfg;
   }
 
   async function loadWords(cfg) {
     cw.cfg = cfg || await api('/config');
+    cw.addingGroup = false;
+    cw.renaming = false;
     renderWords();
   }
 
-  $('cwWords').addEventListener('input', updateCwHint);
-  $('cwLabel').addEventListener('input', updateCwHint);
-  function updateCwHint() {
-    const pending = $('cwLabel').value.trim();
-    const tok = safeLabel(pending);
-    const n = splitWords($('cwWords').value).length;
-    const parts = [];
-    if (n) parts.push(`待添加 ${n} 个词`);
-    if (pending && tok !== pending) parts.push(`占位符前缀将用 ${tok}（「${pending}」含非 ASCII，会被剔除）`);
-    $('cwHint').textContent = parts.join(' · ');
-  }
-
-  $('cwAdd').addEventListener('click', async () => {
-    const list = splitWords($('cwWords').value);
-    const label = $('cwLabel').value.trim() || 'TERM';
-    if (!list.length) return toast('请输入至少一个敏感词', true);
-    if (list.some(w => w.length > 200)) return toast('单个敏感词不能超过 200 字符', true);
+  /* ---- 左侧：新建 / 选择 / 重命名分组 ---- */
+  $('cwNav').addEventListener('click', async ev => {
+    const t = ev.target;
     try {
-      const cur = (cw.cfg || await api('/config')).mask.custom_words || {};
-      const next = Object.assign({}, cur);
-      const added = [];
-      for (const w of list) {
-        if (!Object.prototype.hasOwnProperty.call(next, w)) added.push(w);
-        next[w] = label;
+      if (t.closest('[data-cw-newgroup]')) {
+        cw.addingGroup = true; cw.renaming = false;
+        renderWords();
+        const inp = $('cwNav').querySelector('[data-cw-newgroup-input]');
+        if (inp) inp.focus();
+        return;
       }
-      // 整个词表一次 patch：避免 N 次往返，也避开读-改-写竞态
-      await patch(['mask', 'custom_words'], next);
-      $('cwWords').value = '';
-      updateCwHint();
-      cw.label = label;
-      toast(added.length
-        ? `已添加 ${added.length} 个词到「${label}」${list.length > added.length ? `（${list.length - added.length} 个已存在，已改分类）` : ''}`
-        : `已更新 ${list.length} 个词的分类为「${label}」`);
-      await loadWords();
+      if (t.closest('[data-cw-newgroup-cancel]')) { cw.addingGroup = false; renderWords(); return; }
+      if (t.closest('[data-cw-newgroup-ok]')) {
+        const inp = $('cwNav').querySelector('[data-cw-newgroup-input]');
+        const name = (inp ? inp.value : '').trim();
+        if (!name) { toast('请输入分组名', true); return; }
+        const groups = (cw.cfg.mask.custom_word_groups || []).slice();
+        if (groups.includes(name) || groupWords(cw.cfg, name).length) {
+          toast('分组「' + name + '」已存在', true);
+          cw.label = name; cw.addingGroup = false; renderWords();
+          return;
+        }
+        await cwSave({ groups: [...groups, name] });
+        cw.label = name; cw.addingGroup = false;
+        renderWords();
+        toast('已创建分组「' + name + '」，现在往里加词');
+        return;
+      }
+      const pick = t.closest('[data-cw-group-pick]');
+      if (pick) {
+        cw.label = pick.dataset.cwGroupPick;
+        cw.search = ''; cw.onlyDisabled = false; cw.renaming = false;
+        renderWords();
+      }
     } catch (e) { toast('保存失败：' + e.message, true); }
   });
 
-  // 目录点击（事件委托，只注册一次）
-  $('cwNav').addEventListener('click', ev => {
-    const add = ev.target.closest('[data-cw-new]');
-    if (add) { $('cwLabel').focus(); $('cwLabel').select(); return; }
-    const item = ev.target.closest('[data-cw-label]');
-    if (!item) return;
-    cw.label = item.dataset.cwLabel;
-    cw.search = '';
-    cw.onlyDisabled = false;
-    renderWords();
+  $('cwNav').addEventListener('keydown', ev => {
+    if (ev.target.matches('[data-cw-newgroup-input]') && ev.key === 'Enter') {
+      ev.preventDefault();
+      const btn = $('cwNav').querySelector('[data-cw-newgroup-ok]');
+      if (btn) btn.click();
+    }
   });
 
-  // 词表交互（事件委托）
+  /* ---- 右侧：交互（事件委托） ---- */
   $('cwMain').addEventListener('click', async ev => {
     const t = ev.target;
     const cfg = cw.cfg;
+    if (!cfg) return;
     const m = wmodel(cfg);
+    const label = cw.label;
     try {
-      // 删除单个词（含 '.' 的词必须用 segs，点分 path 会被切错）
+      // 重命名分组
+      if (t.closest('[data-cw-rename]')) { cw.renaming = true; renderWords(); return; }
+      if (t.closest('[data-cw-rename-cancel]')) { cw.renaming = false; renderWords(); return; }
+      if (t.closest('[data-cw-rename-ok]')) {
+        const inp = $('cwMain').querySelector('[data-cw-rename-input]');
+        const name = (inp ? inp.value : '').trim();
+        if (!name) { toast('分组名不能为空', true); return; }
+        if (name === label) { cw.renaming = false; renderWords(); return; }
+        if ((cfg.mask.custom_word_groups || []).includes(name) || groupWords(cfg, name).length) {
+          toast('分组「' + name + '」已存在', true);
+          return;
+        }
+        // 词表跟着改标签；停用表跟着搬；整词表按词走不用动
+        const words = currentWords(cfg);
+        for (const w of groupWords(cfg, label)) words[w] = name;
+        const wordOff = JSON.parse(JSON.stringify(m.wordOff));
+        if (wordOff[label]) { wordOff[name] = wordOff[label]; delete wordOff[label]; }
+        const groups = (cfg.mask.custom_word_groups || []).map(g => (g === label ? name : g));
+        await cwSave({ groups, words }, {
+          sensitive_disabled: [...m.off].map(g => (g === label ? name : g)),
+          wordOff,
+        });
+        cw.label = name;
+        cw.renaming = false;
+        renderWords();
+        toast(`分组已重命名为「${name}」（占位符前缀随之变化）`);
+        return;
+      }
+
+      // 添加词（当前分组，无需再填分组名）
+      if (t.closest('[data-cw-addok]')) {
+        const box = $('cwMain').querySelector('[data-cw-addwords]');
+        const list = splitWords(box ? box.value : '');
+        if (!list.length) { toast('请输入至少一个敏感词', true); return; }
+        if (list.some(w => w.length > 200)) { toast('单个敏感词不能超过 200 字符', true); return; }
+        const words = currentWords(cfg);
+        let moved = 0, added = 0;
+        for (const w of list) {
+          if (Object.prototype.hasOwnProperty.call(words, w)) {
+            if (words[w] !== label) { words[w] = label; moved++; }
+          } else { words[w] = label; added++; }
+        }
+        // 顺手把该分组登记进声明表（手工建的组也能被固化下来）
+        const groups = (cfg.mask.custom_word_groups || []).includes(label)
+          ? undefined
+          : [...(cfg.mask.custom_word_groups || []), label];
+        await cwSave(groups ? { groups, words } : { words });
+        if (box) box.value = '';
+        const parts = [];
+        if (added) parts.push(`新增 ${added} 个`);
+        if (moved) parts.push(`${moved} 个从别的分组移过来`);
+        toast(`已加入「${label}」${parts.length ? '（' + parts.join('，') + '）' : ''}`);
+        return;
+      }
+
+      // 删除单个词
       const del = t.closest('[data-cw-del]');
       if (del) {
         const w = del.dataset.cwDel;
-        const next = Object.assign({}, cfg.mask.custom_words);
-        delete next[w];
+        const words = currentWords(cfg);
+        delete words[w];
         const wordOff = JSON.parse(JSON.stringify(m.wordOff));
-        let touchedOff = false;
-        for (const l of Object.keys(wordOff)) {
-          const before = wordOff[l].length;
-          wordOff[l] = wordOff[l].filter(x => x !== w);
-          if (!wordOff[l].length) delete wordOff[l];
-          if (wordOff[l] ? wordOff[l].length !== before : true) touchedOff = true;
+        for (const g of Object.keys(wordOff)) {
+          wordOff[g] = wordOff[g].filter(x => x !== w);
+          if (!wordOff[g].length) delete wordOff[g];
         }
-        const whole = [...m.whole].filter(x => x !== w);
-        await saveWordsModel({ custom_words: next }, {
-          sensitive_word_disabled: wordOff,
-          sensitive_word_whole: whole,
+        await cwSave({ words }, {
+          wordOff,
+          whole: [...m.whole].filter(x => x !== w),
         });
         toast('已删除「' + w + '」');
         return;
       }
-      // 删除整个分类
+
+      // 删除分组（连同它的词与声明）
       const delg = t.closest('[data-cw-delgroup]');
       if (delg) {
-        const label = delg.dataset.cwDelgroup;
-        const n = (m.groups.get(label) || []).length;
-        if (!confirm(`删除分类「${label}」及其 ${n} 个词？`)) return;
-        const next = Object.assign({}, cfg.mask.custom_words);
-        for (const w of (m.groups.get(label) || [])) delete next[w];
+        const g = delg.dataset.cwDelgroup;
+        const n = groupWords(cfg, g).length;
+        if (!confirm(`删除分组「${g}」${n ? `及其 ${n} 个词` : ''}？`)) return;
+        const words = currentWords(cfg);
+        for (const w of groupWords(cfg, g)) delete words[w];
         const wordOff = Object.assign({}, m.wordOff);
-        delete wordOff[label];
-        const whole = [...m.whole].filter(w => !(m.groups.get(label) || []).includes(w));
-        await saveWordsModel({ custom_words: next }, {
-          sensitive_disabled: [...m.off].filter(l => l !== label),
-          sensitive_word_disabled: wordOff,
-          sensitive_word_whole: whole,
-        });
-        toast(`已删除分类「${label}」`);
+        delete wordOff[g];
+        await cwSave(
+          { groups: (cfg.mask.custom_word_groups || []).filter(x => x !== g), words },
+          {
+            sensitive_disabled: [...m.off].filter(x => x !== g),
+            wordOff,
+            whole: [...m.whole].filter(w => groupWords(cfg, g).includes(w) === false),
+          },
+        );
+        if (cw.label === g) cw.label = null;
+        renderWords();
+        toast(`已删除分组「${g}」`);
         return;
       }
-      // 全部启用 / 全部停用（本分类）
+
+      // 全部启用 / 全部停用（当前分组）
       const bulk = t.closest('[data-cw-bulk]');
       if (bulk) {
-        const label = cw.label;
-        const ws = m.groups.get(label) || [];
+        const ws = groupWords(cfg, label);
         if (bulk.dataset.cwBulk === 'on') {
-          // 开：清掉整组停用 + 清掉本组逐词停用
           const wordOff = Object.assign({}, m.wordOff);
           delete wordOff[label];
-          await saveWordsModel({ custom_words: cfg.mask.custom_words }, {
-            sensitive_disabled: [...m.off].filter(l => l !== label),
-            sensitive_word_disabled: wordOff,
-          });
+          await cwSave({}, { sensitive_disabled: [...m.off].filter(g => g !== label), wordOff });
         } else {
           const wordOff = Object.assign({}, m.wordOff);
           wordOff[label] = ws.slice();
-          await saveWordsModel({ custom_words: cfg.mask.custom_words }, {
-            sensitive_word_disabled: wordOff,
-          });
+          await cwSave({}, { wordOff });
         }
         toast(`「${label}」已${bulk.dataset.cwBulk === 'on' ? '全部启用' : '全部停用'}`);
       }
@@ -688,38 +798,29 @@
     if (!cfg) return;
     const m = wmodel(cfg);
     try {
-      // 整组启用
       if (t.matches('[data-cw-group]')) {
-        const label = t.dataset.cwGroup;
+        const g = t.dataset.cwGroup;
         const off = new Set(m.off);
-        if (t.checked) off.delete(label); else off.add(label);
-        await saveWordsModel({ custom_words: cfg.mask.custom_words }, {
-          sensitive_disabled: [...off],
-        });
-        toast(`「${label}」已${t.checked ? '启用' : '停用'}`);
+        if (t.checked) off.delete(g); else off.add(g);
+        await cwSave({}, { sensitive_disabled: [...off] });
+        toast(`「${g}」已${t.checked ? '启用' : '停用'}`);
         return;
       }
-      // 逐词启用
       if (t.matches('[data-cw-word]')) {
         const w = t.dataset.cwWord;
-        const label = cw.label;
+        const g = cw.label;
         const wordOff = JSON.parse(JSON.stringify(m.wordOff));
-        const list = new Set(wordOff[label] || []);
-        if (t.checked) list.delete(w); else list.add(w);
-        if (list.size) wordOff[label] = [...list]; else delete wordOff[label];
-        await saveWordsModel({ custom_words: cfg.mask.custom_words }, {
-          sensitive_word_disabled: wordOff,
-        });
+        const set = new Set(wordOff[g] || []);
+        if (t.checked) set.delete(w); else set.add(w);
+        if (set.size) wordOff[g] = [...set]; else delete wordOff[g];
+        await cwSave({}, { wordOff });
         return;
       }
-      // 整词匹配
       if (t.matches('[data-cw-whole]')) {
         const w = t.dataset.cwWhole;
         const whole = new Set(m.whole);
         if (t.checked) whole.add(w); else whole.delete(w);
-        await saveWordsModel({ custom_words: cfg.mask.custom_words }, {
-          sensitive_word_whole: [...whole],
-        });
+        await cwSave({}, { whole: [...whole] });
         return;
       }
       if (t.matches('[data-cw-onlydisabled]')) {
@@ -730,12 +831,41 @@
   });
 
   $('cwMain').addEventListener('input', ev => {
-    if (ev.target.matches('[data-cw-search]')) {
-      cw.search = ev.target.value;
-      const pos = ev.target.selectionStart;
+    const t = ev.target;
+    if (t.matches('[data-cw-addwords]')) {
+      const n = splitWords(t.value).length;
+      const box = $('cwMain').querySelector('[data-cw-addhint]');
+      if (box) {
+        const dup = splitWords(t.value).filter(w =>
+          Object.prototype.hasOwnProperty.call(cw.cfg.mask.custom_words || {}, w)).length;
+        box.textContent = n
+          ? `${n} 个词${dup ? `（${dup} 个已存在，会改到本分组）` : ''}`
+          : '';
+      }
+      return;
+    }
+    if (t.matches('[data-cw-search]')) {
+      cw.search = t.value;
+      const pos = t.selectionStart;
       renderWords();
       const el = $('cwMain').querySelector('[data-cw-search]');
       if (el) { el.focus(); try { el.setSelectionRange(pos, pos); } catch (e) {} }
+    }
+  });
+
+  $('cwMain').addEventListener('keydown', ev => {
+    const t = ev.target;
+    if (t.matches('[data-cw-rename-input]') && ev.key === 'Enter') {
+      ev.preventDefault();
+      const btn = $('cwMain').querySelector('[data-cw-rename-ok]');
+      if (btn) btn.click();
+      return;
+    }
+    // 添加框里 Ctrl/Cmd+Enter 直接提交（多行粘贴时不用去够按钮）
+    if (t.matches('[data-cw-addwords]') && (ev.metaKey || ev.ctrlKey) && ev.key === 'Enter') {
+      ev.preventDefault();
+      const btn = $('cwMain').querySelector('[data-cw-addok]');
+      if (btn) btn.click();
     }
   });
 

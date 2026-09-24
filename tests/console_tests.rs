@@ -1037,3 +1037,44 @@ async fn favicon_is_answered_locally_not_proxied() {
         "favicon 不应进入事件管线"
     );
 }
+
+/// 分组是一等公民：`mask.custom_word_groups` 可独立落盘、保留空组、去重保序。
+///
+/// 需求背景：控制台按「先建组、再往组里加词」交互，因此分组必须在**还没有任何词**
+/// 的时候就能保存（否则刷新即消失），且加词不需要重复填写分组名。
+#[tokio::test]
+async fn custom_word_groups_persist_independently() {
+    let h = Harness::new();
+    // 新建分组（含故意重复 + 含空组 —— 两者都要被正确对待）
+    let body = serde_json::json!({
+        "segs": ["mask", "custom_word_groups"],
+        "value": ["PERSON", "EMPTY_GROUP", "PERSON"]
+    })
+    .to_string();
+    let (s, v) = h
+        .json("POST", "/console/api/config/patch", Some(&body))
+        .await;
+    assert_eq!(s, StatusCode::OK);
+    let groups = &v["config"]["mask"]["custom_word_groups"];
+    assert_eq!(
+        groups,
+        &serde_json::json!(["PERSON", "EMPTY_GROUP"]),
+        "重复分组应去重且保持顺序"
+    );
+    // 空组不能被 normalized 清掉 —— 那是「分组单独保存」的意义
+    let (_, cfg) = h.json("GET", "/console/api/config", None).await;
+    assert_eq!(cfg["mask"]["custom_word_groups"][1], "EMPTY_GROUP");
+    // 持久化：新 ConfigCenter 读同一目录仍在
+    let (center2, _) = ConfigCenter::load_or_init(h.state.config.data_dir()).unwrap();
+    assert!(
+        center2
+            .get()
+            .mask
+            .custom_word_groups
+            .contains(&"EMPTY_GROUP".to_string()),
+        "空分组应跨重启存活"
+    );
+    // 声明表不改变脱敏语义：引擎只认 custom_words（该不变式由引擎自身测试保证），
+    // 这里只验证空组不会让任何东西“多出词来”。
+    assert!(center2.get().mask.custom_words.is_empty());
+}

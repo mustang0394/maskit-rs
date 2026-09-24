@@ -35,7 +35,8 @@ function El(tag, opts = {}) {
     hidden: false,
     value: '',
     textContent: '',
-    innerHTML: '',
+    _html: '',
+    _q: {},          // querySelector 缓存（同一选择器返回同一实例，模拟真实 DOM 节点）
     className: opts.className || '',
     checked: false,
     disabled: false,
@@ -62,7 +63,18 @@ function El(tag, opts = {}) {
     addEventListener(t, fn) { (this._listeners[t] = this._listeners[t] || []).push(fn); },
     removeEventListener() {},
     focus() {}, select() {}, setSelectionRange() {},
-    querySelector() { return null; },
+    // innerHTML 是 setter：重设内容即作废已缓存的子节点（真实 DOM 里旧节点也没了）
+    get innerHTML() { return this._html; },
+    set innerHTML(v) { this._html = String(v); this._q = {}; },
+    // 只支持属性选择器（app.js 只用这种）：只要 innerHTML 里出现过该属性名就返回一个
+    // 持久子节点，使「测试写入 textarea.value → app 通过 querySelector 读回」这条
+    // 真实 DOM 交互链在桩里也能成立。
+    querySelector(sel) {
+      const attr = String(sel).replace(/^\[|\]$/g, '');
+      if (!attr || !this._html.includes(attr)) return null;
+      if (!this._q[attr]) this._q[attr] = El('div');
+      return this._q[attr];
+    },
     querySelectorAll() { return []; },
     closest() { return null; },
     matches() { return false; },
@@ -113,6 +125,7 @@ const cfgPayload = () => ({
     enabled: true,
     builtin_rules: { API_KEY: true, PHONE: true, EMAIL: false },
     custom_words: { 张三: 'PERSON', 李四: 'PERSON', Acme: 'ACME', 'example.com': 'DOMAIN' },
+    custom_word_groups: ['PERSON', 'ACME', 'DOMAIN', 'EMPTY_GROUP'],
     sensitive_disabled: [],
     sensitive_word_disabled: { PERSON: ['李四'] },
     sensitive_word_whole: ['Acme'],
@@ -252,29 +265,58 @@ const tick = (n = 6) => new Promise(async res => {
   // 规则页
   await drive('rules');
   check(byId.get('ruleToggles').innerHTML.includes('PHONE'), '规则页：内置规则未渲染');
-  check(byId.get('cwNav').innerHTML.includes('PERSON'), '规则页：分类导航未渲染');
-  // 默认选中字母序第一个分类（ACME）
-  check(byId.get('cwMain').innerHTML.includes('Acme'), '规则页：词表未渲染');
-  check(byId.get('cwMain').innerHTML.includes('整组启用'), '规则页：缺整组开关');
+  const nav0 = byId.get('cwNav').innerHTML;
+  check(nav0.includes('PERSON'), '规则页：分组导航未渲染');
+  check(nav0.includes('EMPTY_GROUP'), '规则页：空分组没有保留（分组必须能独立存在）');
+  check(nav0.includes('新建分组'), '规则页：缺「新建分组」入口');
 
-  // 切到 PERSON 分类（导航点击）
+  // 切到 PERSON 分组（导航点击）
   byId.get('cwNav').fire('click', {
-    target: { closest: sel => (sel === '[data-cw-label]' ? { dataset: { cwLabel: 'PERSON' } } : null) },
+    target: { closest: sel => (sel === '[data-cw-group-pick]' ? { dataset: { cwGroupPick: 'PERSON' } } : null) },
   });
   await tick(2);
-  check(byId.get('cwMain').innerHTML.includes('张三'), '规则页：切分类后词表未渲染');
+  const main0 = byId.get('cwMain').innerHTML;
+  check(main0.includes('张三'), '规则页：切分组后词表未渲染');
+  check(main0.includes('整组启用'), '规则页：缺整组开关');
+  // 关键需求：加词不需要再填分组名 —— 当前分组内就有添加框
+  check(main0.includes('向「PERSON」添加敏感词'), '规则页：当前分组内缺添加框');
+  check(main0.includes('data-cw-addwords'), '规则页：缺添加输入框');
+  check(!main0.includes('data-cw-label'), '规则页：不应再要求逐次填写分组名');
 
-  // 敏感词交互：停用「张三」
+  // 在 PERSON 分组里加词：只往当前分组的输入框里打字，**不需要再提供分组名**
+  const addBox = byId.get('cwMain').querySelector('[data-cw-addwords]');
+  check(addBox !== null, '规则页：拿不到当前分组的添加输入框');
+  addBox.value = '王五';
   const patchesBefore = calls.filter(u => u.includes('/config/patch')).length;
-  byId.get('cwMain').fire('change', {
-    target: { matches: sel => sel === '[data-cw-word]', dataset: { cwWord: '张三' }, checked: false },
+  byId.get('cwMain').fire('click', {
+    target: { closest: sel => (sel === '[data-cw-addok]' ? {} : null) },
   });
   await tick(2);
   check(
     calls.filter(u => u.includes('/config/patch')).length > patchesBefore,
-    '敏感词交互：未发出配置补丁'
+    '加词：未发出配置补丁'
   );
+
+  // 停用「张三」
+  const p2 = calls.filter(u => u.includes('/config/patch')).length;
+  byId.get('cwMain').fire('change', {
+    target: { matches: sel => sel === '[data-cw-word]', dataset: { cwWord: '张三' }, checked: false },
+  });
+  await tick(2);
+  check(calls.filter(u => u.includes('/config/patch')).length > p2, '逐词停用：未发出配置补丁');
   check(byId.get('cwMain').innerHTML.includes('张三'), '敏感词交互后词表丢失内容');
+
+  // 新建分组：点「新建分组」→ 内联输入 → 创建（分组自身要落盘）
+  byId.get('cwNav').fire('click', { target: { closest: sel => (sel === '[data-cw-newgroup]' ? {} : null) } });
+  await tick(2);
+  check(byId.get('cwNav').innerHTML.includes('data-cw-newgroup-input'), '新建分组：未出现内联输入框');
+  const ngBox = byId.get('cwNav').querySelector('[data-cw-newgroup-input]');
+  check(ngBox !== null, '新建分组：拿不到内联输入框');
+  ngBox.value = 'CONTRACT_NO';
+  const p3 = calls.filter(u => u.includes('/config/patch')).length;
+  byId.get('cwNav').fire('click', { target: { closest: sel => (sel === '[data-cw-newgroup-ok]' ? {} : null) } });
+  await tick(2);
+  check(calls.filter(u => u.includes('/config/patch')).length > p3, '新建分组：未落盘');
 
   // 日志页
   await drive('logs');
