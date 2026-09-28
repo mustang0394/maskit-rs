@@ -388,7 +388,11 @@ pub fn process_and_emit(
                 .take(crate::mask::tree::DIALOG_MAX_CHARS)
                 .collect()
         });
-    meta.resp_dialog = dialog_for_log(&meta.resp_dialog, meta.keep_plaintext, &meta.secret_prefixes);
+    meta.resp_dialog = dialog_for_log(
+        &meta.resp_dialog,
+        meta.keep_plaintext,
+        &meta.secret_prefixes,
+    );
     let meta = &meta;
     let stats = RestoreStats {
         restored: outcome.restored,

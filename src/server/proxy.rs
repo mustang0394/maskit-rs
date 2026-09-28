@@ -422,10 +422,7 @@ pub async fn handler(State(state): State<SharedState>, req: Request) -> Response
         dialog: if keep_plaintext {
             req_dialog.clone()
         } else {
-            crate::server::response::redact_credentials(
-                &req_dialog,
-                &cfg_now.mask.secret_prefixes,
-            )
+            crate::server::response::redact_credentials(&req_dialog, &cfg_now.mask.secret_prefixes)
         },
         // 脱敏后的文本本身已用占位符替代了敏感值，无需再洗
         masked_dialog: req_masked_dialog.clone(),

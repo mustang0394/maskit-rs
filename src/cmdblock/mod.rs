@@ -300,10 +300,11 @@ impl CmdBlockEngine {
         store: &SessionStore,
     ) {
         let (snippet, pid, label) = hit;
-        let clean: String = crate::server::response::redact_credentials(snippet, &self.secret_prefixes)
-            .chars()
-            .take(120)
-            .collect();
+        let clean: String =
+            crate::server::response::redact_credentials(snippet, &self.secret_prefixes)
+                .chars()
+                .take(120)
+                .collect();
         let kind = format!(
             "{}{}",
             pid,
