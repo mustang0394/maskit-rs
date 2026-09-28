@@ -76,6 +76,49 @@ pub fn default_secret_prefixes() -> &'static [&'static str] {
     &["sk-", "ah-"]
 }
 
+/// 前缀规则的命中区间（已过滤左边界与 FIDO 类型串特例）。
+///
+/// 左边界 `(?<![A-Za-z0-9_-])` 手工下沉（regex crate 无环视）：前缀必须落在
+/// 词首。缺了它，`ask_user_question` / `task_queue_processor` /
+/// `risk-based-routing` 这类标识符会被从中间截出 `sk-…`/`sk_…`（`sk-`/`sk_`
+/// 等价展开见 `prefix_regex`）。
+///
+/// **流量脱敏与日志清洗必须共用本函数**：早期日志清洗直接整段 `replace_all`，
+/// 于是 `ask_user_question` 在 dialog 里被洗成 `a[REDACTED]`，与脱敏行为不一致。
+pub fn prefix_match_spans(text: &str, rx: &regex::Regex) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    for m in rx.find_iter(text) {
+        if let Some(c) = text[..m.start()].chars().next_back() {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                continue;
+            }
+        }
+        // FIDO 安全密钥类型串交给 SSH_PUBKEY 整段处理
+        if text[m.end()..].starts_with("@openssh.com") {
+            continue;
+        }
+        out.push((m.start(), m.end()));
+    }
+    out
+}
+
+/// 日志清洗：把前缀规则命中替换为 `replacement`。无前缀配置时返回 None。
+///
+/// 边界语义与 `MaskCtx::mask` 的 step 1 保持一致（共用 `prefix_match_spans`），
+/// 避免「流量里没脱敏、日志里被洗掉」的错位。
+pub fn redact_prefixes(text: &str, prefixes: &[String], replacement: &str) -> Option<String> {
+    let rx = prefix_regex(prefixes)?;
+    let spans = prefix_match_spans(text, &rx);
+    if spans.is_empty() {
+        return Some(text.to_string());
+    }
+    let spans: Vec<(usize, usize, String)> = spans
+        .into_iter()
+        .map(|(s, e)| (s, e, replacement.to_string()))
+        .collect();
+    Some(splice_spans(text, &spans))
+}
+
 // ---------------------------------------------------------------------------
 // 自定义词
 // ---------------------------------------------------------------------------
@@ -283,19 +326,14 @@ impl<'a> MaskCtx<'a> {
                 let mut token_of: std::collections::HashMap<&str, String> =
                     std::collections::HashMap::new();
                 let ph_rx = placeholder::placeholder_rx();
-                for m in rx.find_iter(&out) {
-                    if ph_rx.is_match(m.as_str()) {
+                // 命中区间的边界判定（左边界 + FIDO 特例）统一走 `prefix_match_spans`，
+                // 与日志清洗共用一套语义，避免两边漂移。
+                for (s, e) in prefix_match_spans(&out, &rx) {
+                    let slice = &out[s..e];
+                    if ph_rx.is_match(slice) {
                         continue;
                     }
-                    // `sk-ssh-ed25519@openssh.com` / `sk-ecdsa-sha2-nistp256@openssh.com`
-                    // 是 FIDO 安全密钥的**公钥类型串**，不是 `sk-` 开头的秘密。
-                    // 这里的 `sk-` 前缀规则会先把类型串吃掉，只留下
-                    // `@openssh.com AAAA…` 无人认领（实测确认）。放行给 SSH_PUBKEY
-                    // 规则整段处理（连 blob 一起），才是想要的形态。
-                    if out[m.end()..].starts_with("@openssh.com") {
-                        continue;
-                    }
-                    let orig = m.as_str();
+                    let orig = slice;
                     if !token_of.contains_key(orig) {
                         let token = {
                             if self.store.get(&self.sid).is_none() {
@@ -311,7 +349,7 @@ impl<'a> MaskCtx<'a> {
                         token_of.insert(orig, token);
                     }
                     if let Some(tok) = token_of.get(orig) {
-                        spans.push((m.start(), m.end(), tok.clone()));
+                        spans.push((s, e, tok.clone()));
                     }
                 }
                 if !spans.is_empty() {
@@ -1043,6 +1081,41 @@ mod tests {
         let parts = test_ctx(&[]);
         let masked = mask_with(&parts, "sk-demo ah-test sk-abc ah-1234");
         assert_eq!(masked, "sk-demo ah-test sk-abc ah-1234");
+    }
+
+    /// 前缀规则的左边界回归：`sk-`/`sk_` 只能落在词首。
+    ///
+    /// 回归：此前正则只有右侧收尾，于是 `ask_user_question`、
+    /// `task_queue_processor`、`risk-based-routing` 这类 snake_case /
+    /// kebab-case 标识符会被从中间截出 `sk_…`/`sk-…`，命中即打 API_KEY
+    /// 占位符 —— 工具名被改写（`a{{APIKEY_xxxxxx}}`），作为对象键还会被改名
+    /// 导致上游 400。
+    #[test]
+    fn prefix_rule_word_boundary_keeps_identifiers() {
+        let parts = test_ctx(&[]);
+        let text = "调用 ask_user_question 与 task_queue_processor，参数 risk_assessment_report，\
+                    文件 disk-usage-summary.md，模型 brisk-walk-plan";
+        assert_eq!(
+            mask_with(&parts, text),
+            text,
+            "snake_case / kebab-case 标识符不得被前缀规则切断"
+        );
+        // 词首的正常形态仍必须命中
+        let hit = mask_with(&parts, "key sk-abcdefghijklmnopqrstuvwxyz012345");
+        assert!(!hit.contains("sk-abcdefghijklmnopqrstuvwxyz012345"));
+        assert!(hit.contains("{{APIKEY_"));
+        // 分隔符左邻（引号 / 等号 / 括号 / 行首）照常命中
+        for ctxs in [
+            r#""sk-abcdefghijklmnop""#,
+            "OPENAI=sk-proj-abcdefghijklmnop",
+            "(ah-abcdefghijklmnop)",
+            "sk-abcdefghijklmnop",
+        ] {
+            assert!(
+                !mask_with(&parts, ctxs).contains("abcdefghijklmnop"),
+                "正常形态应命中：{ctxs}"
+            );
+        }
     }
 
     #[test]

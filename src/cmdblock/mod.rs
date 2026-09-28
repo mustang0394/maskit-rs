@@ -150,6 +150,9 @@ pub struct CmdBlockEngine {
     pub channels: HashSet<String>,
     pub patterns: Vec<(String, String, CmdRegex)>,
     pub allow: Vec<Regex>,
+    /// 当前生效的密钥前缀：命中片段落库前的凭据清洗要用真实配置，
+    /// 否则控制台里自定义的前缀（如 `ak-`）会在 `cmd_hits.snippet` 里漏明文。
+    pub secret_prefixes: Vec<String>,
     /// 超预算被停用的规则 id
     pub disabled: std::sync::Mutex<HashSet<String>>,
 }
@@ -176,6 +179,7 @@ impl CmdBlockEngine {
             channels: cb.channels.iter().cloned().collect(),
             patterns,
             allow,
+            secret_prefixes: cfg.mask.secret_prefixes.clone(),
             disabled: std::sync::Mutex::new(HashSet::new()),
         }
     }
@@ -187,6 +191,10 @@ impl CmdBlockEngine {
             channels: HashSet::new(),
             patterns: vec![],
             allow: vec![],
+            secret_prefixes: crate::mask::engine::default_secret_prefixes()
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
             disabled: std::sync::Mutex::new(HashSet::new()),
         }
     }
@@ -292,7 +300,7 @@ impl CmdBlockEngine {
         store: &SessionStore,
     ) {
         let (snippet, pid, label) = hit;
-        let clean: String = crate::server::response::redact_credentials(snippet)
+        let clean: String = crate::server::response::redact_credentials(snippet, &self.secret_prefixes)
             .chars()
             .take(120)
             .collect();
@@ -584,6 +592,10 @@ mod tests {
             channels: channels.iter().map(|s| s.to_string()).collect(),
             patterns: builtin_patterns(),
             allow: vec![],
+            secret_prefixes: crate::mask::engine::default_secret_prefixes()
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
             disabled: std::sync::Mutex::new(HashSet::new()),
         };
         let _ = &mut cfg;

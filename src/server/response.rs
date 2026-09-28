@@ -230,7 +230,7 @@ pub fn stream_response(
         // dialog 取 state.kept —— 那是**还原后**的正文（上游回的是占位符，
         // 用户看到的是原文，事件里也该记原文）。
         let mut rmeta = meta.clone();
-        rmeta.resp_dialog = dialog_for_log(&state.kept, meta.keep_plaintext);
+        rmeta.resp_dialog = dialog_for_log(&state.kept, meta.keep_plaintext, &meta.secret_prefixes);
         emit_restore(&bus, &sid, &rmeta, &stats_total, store, blocked, "stream");
 
         if let Some(hook) = USAGE_HOOK.get() {
@@ -260,6 +260,9 @@ pub struct StreamMeta {
     pub resp_dialog: String,
     /// 日志是否保留凭据类明文（构造时从配置快照，避免热路径读锁）。
     pub keep_plaintext: bool,
+    /// 当前生效的密钥前缀（构造时从配置快照）。日志清洗必须用真实配置，
+    /// 不能用写死的默认值 —— 否则控制台里加的前缀会在日志里漏明文。
+    pub secret_prefixes: Vec<String>,
 }
 
 /// 发 RESTORE 事件（对齐 `_emit_restore_summary`）。
@@ -385,7 +388,7 @@ pub fn process_and_emit(
                 .take(crate::mask::tree::DIALOG_MAX_CHARS)
                 .collect()
         });
-    meta.resp_dialog = dialog_for_log(&meta.resp_dialog, meta.keep_plaintext);
+    meta.resp_dialog = dialog_for_log(&meta.resp_dialog, meta.keep_plaintext, &meta.secret_prefixes);
     let meta = &meta;
     let stats = RestoreStats {
         restored: outcome.restored,
@@ -505,16 +508,19 @@ pub fn scan_response_pii(
 ///
 /// 回归：此前该开关只作用于 `items[].original`，`dialog` / `resp_dialog` 仍存
 /// 凭据全文明文 —— 与 README 「只留 sha256 摘要与打码预览，原文不落库」的承诺不符。
-fn dialog_for_log(text: &str, keep_plaintext: bool) -> String {
+fn dialog_for_log(text: &str, keep_plaintext: bool, prefixes: &[String]) -> String {
     if keep_plaintext {
         text.to_string()
     } else {
-        redact_credentials(text)
+        redact_credentials(text, prefixes)
     }
 }
 
 /// 凭据清洗（对齐 `_redact_credentials`：日志 dialog/preview 落库前洗凭据）。
-pub fn redact_credentials(text: &str) -> String {
+///
+/// `prefixes` 必须是**当前生效配置**里的 `mask.secret_prefixes`（不是写死的
+/// 默认值）：否则用户在控制台加的 `ak-` 之类前缀，流量里脱敏了、日志却照存明文。
+pub fn redact_credentials(text: &str, prefixes: &[String]) -> String {
     use crate::mask::rules::RULES;
     let mut out = text.to_string();
     for rule in RULES.iter() {
@@ -523,13 +529,11 @@ pub fn redact_credentials(text: &str) -> String {
         }
     }
     // 前缀规则（sk-/ah-…）不在 RULES 表里，必须单独过一遍
-    // （否则 `sk-…` 明文会随 dialog/preview 落库）
-    let prefixes: Vec<String> = crate::mask::engine::default_secret_prefixes()
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-    if let Some(rx) = crate::mask::engine::prefix_regex(&prefixes) {
-        out = rx.replace_all(&out, "[REDACTED]").to_string();
+    // （否则 `sk-…` 明文会随 dialog/preview 落库）。
+    // 用 `redact_prefixes` 而非 `replace_all`：前者与 `MaskCtx::mask` 共用
+    // 左边界判定，否则 `ask_user_question` 会在日志里被洗成 `a[REDACTED]`。
+    if let Some(cleaned) = crate::mask::engine::redact_prefixes(&out, prefixes, "[REDACTED]") {
+        out = cleaned;
     }
     out
 }
@@ -654,11 +658,20 @@ mod tests {
 
     #[test]
     fn credential_redaction_in_logs() {
+        let prefixes = vec!["sk-".to_string(), "ah-".to_string()];
         let out = redact_credentials(
             "token sk-abcdefghijklmnopqrstuvwxyz012345 and password=ServerPass123!",
+            &prefixes,
         );
         assert!(!out.contains("sk-abcdefghijklmnopqrstuvwxyz012345"));
         assert!(out.contains("[REDACTED]"));
+        // 自定义前缀也必须洗（此前日志清洗写死默认前缀，ak- 会漏成明文）
+        let custom = vec!["ak-".to_string()];
+        let out2 = redact_credentials("key ak-abcdefghijklmnopqrstuvwxyz", &custom);
+        assert!(!out2.contains("ak-abcdefghijklmnopqrstuvwxyz"), "{out2}");
+        // 左边界一致：snake_case 标识符不得被日志清洗切碎
+        let out3 = redact_credentials("工具 ask_user_question 被调用", &prefixes);
+        assert_eq!(out3, "工具 ask_user_question 被调用");
     }
 
     #[test]

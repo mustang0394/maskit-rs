@@ -136,6 +136,16 @@ fn apikey_r(text: &str, m: Match<'_>, _c: &Captures<'_>) -> bool {
     check_not_followed_by(text, m, is_word_or_dash)
 }
 
+/// 纯字母前缀型规则的左边界（钉钉 `ding…`）：
+///
+/// `ding` 是普通英文词根（`dingleberry`/`dingalings`/`dingbats`）且没有语义
+/// 校验，`apikey_l` 也放行词首，于是这些词的词首会被整段当成 AppKey。
+/// 收紧为「不得紧跟在字母之后」（数字左边不管：`v2ding…` 仍要能命中），
+/// 保留 `my-ding…` / `x_ding…` / 行首等分隔符形态。
+fn alpha_l(text: &str, m: Match<'_>, _c: &Captures<'_>) -> bool {
+    check_not_preceded_by(text, m, |c| c.is_ascii_alphabetic())
+}
+
 /// Stripe 右边界：[A-Za-z0-9]（不含 -_）
 fn stripe_r(text: &str, m: Match<'_>, _c: &Captures<'_>) -> bool {
     check_not_followed_by(text, m, |c| c.is_ascii_alphanumeric())
@@ -414,13 +424,16 @@ fn uscc_r(text: &str, m: Match<'_>, _c: &Captures<'_>) -> bool {
     check_not_followed_by(text, m, is_word_char)
 }
 
-/// MAC 左边界：`(?<![0-9A-Fa-f:-])`
+/// MAC 左边界：`(?<![0-9A-Fa-f:.-])`
+///
+/// 比右边界多收一个 `.`：`v1.00:11:22:33:44:55`、`x.00:11:…` 这类
+/// 「点号+数据」形态不该当成 MAC（右边界早已拒绝 `.`，左侧此前漏了）。
 fn mac_l(text: &str, m: Match<'_>, _c: &Captures<'_>) -> bool {
     if m.start() == 0 {
         return true;
     }
     match text[..m.start()].chars().next_back() {
-        Some(c) => !(c.is_ascii_hexdigit() || c == ':' || c == '-'),
+        Some(c) => !(c.is_ascii_hexdigit() || c == ':' || c == '-' || c == '.'),
         None => true,
     }
 }
@@ -556,6 +569,13 @@ pub static RULES: Lazy<Vec<Rule>> = Lazy::new(|| {
             ci = false
         ),
         // 飞书 / 钉钉
+        //
+        // 钉钉 AppKey 是 `ding` + **16 位**（如 `dingbbikazkr7q2kh8s2`），
+        // 原先的 `ding[a-z0-9]{6,}` 下限太松：`dingalings`、`dingleberry`
+        // 这类普通英文词在词首会被整段吃掉（`apikey_l` 拦不住词首），
+        // 所以下限抬到 12（+ `alpha_l` 词首边界）。
+        // 飞书 App ID 是 `cli_` + **16 位**（如 `cli_9b445f5258795107`），
+        // 带下划线、下限 16，本身已无英文词误伤，保持不变。
         rule!(
             "API_KEY",
             r"cli_[a-z0-9]{16,}",
@@ -568,9 +588,9 @@ pub static RULES: Lazy<Vec<Rule>> = Lazy::new(|| {
         ),
         rule!(
             "API_KEY",
-            r"ding[a-z0-9]{6,}",
+            r"ding[a-z0-9]{12,}",
             0,
-            [apikey_l, lowercase_r],
+            [alpha_l, lowercase_r],
             exempt = false,
             avoid = false,
             markers = ["ding"],
@@ -1342,6 +1362,47 @@ mod tests {
         assert!(mask_hits("SECRET", "token = abcdefgh").is_empty());
         // 说明文案不误报（值以 / 开头）
         assert!(mask_hits("SECRET", "说明: /token=/api_key= 赋值").is_empty());
+    }
+
+    /// 钉钉 `ding` 前缀：普通英文词根不得被当成 AppKey。
+    ///
+    /// 回归：原规则是 `ding[a-z0-9]{6,}` 且左边界只拦 `[A-Za-z0-9_-]`，
+    /// `dingalings` / `dingleberry` 会被整词吃掉。现收为 `alpha_l` 边界
+    /// （不得紧跟在字母后）+ 下限抬到 12 位。
+    #[test]
+    fn dingtalk_apikey_not_english_word() {
+        for word in ["dingalings", "dingleberry", "dingbatsxx"] {
+            assert!(
+                mask_hits("API_KEY", word).is_empty(),
+                "普通英文词不得当 AppKey：{word}"
+            );
+        }
+        // 真实 AppKey 形态（ding + 16 位）仍必须命中
+        assert_eq!(
+            mask_hits("API_KEY", "AppKey=dingbbikazkr7q2kh8s2"),
+            vec!["dingbbikazkr7q2kh8s2"]
+        );
+        // 数字左邻仍放行（版本号前缀等）
+        assert!(!mask_hits("API_KEY", "v2dingbbikazkr7q2kh8s2").is_empty());
+    }
+
+    /// 飞书 `cli_` App ID：官方形态为 `cli_` + 16 位。
+    #[test]
+    fn feishu_appid_still_matches() {
+        assert_eq!(
+            mask_hits("API_KEY", "APP_ID=cli_9b445f5258795107"),
+            vec!["cli_9b445f5258795107"]
+        );
+        // 带分隔左邻正常
+        assert!(!mask_hits("API_KEY", "\"cli_9b445f5258795107\"").is_empty());
+    }
+
+    /// MAC 左边界收紧：`.` 左邻不再命中（与右边界口径对齐）。
+    #[test]
+    fn mac_dot_boundary_tightened() {
+        assert!(mask_hits("MAC", "v1.00:11:22:33:44:55").is_empty());
+        assert!(!mask_hits("MAC", "mac=00:11:22:33:44:55").is_empty());
+        assert!(!mask_hits("MAC", "00:11:22:33:44:55").is_empty());
     }
 
     #[test]

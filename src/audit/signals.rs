@@ -13,6 +13,13 @@ use super::{dedupe_findings, Finding, Severity};
 // ---------------------------------------------------------------------------
 
 /// 凭据形态（对齐 `SECRET_REGEX_PATTERNS`）。
+///
+/// 上限是「正则需不需要左边界」的共享判定（见 `scan_error_leak`）：
+/// 全大写固定前缀（`AKIA`/`AIza`/`LTAI`/`ya29.`）只可能出现在长 token 或
+/// URL 里，收紧反而会漏；小写词根型前缀（`sk-`/`ghp_`…）与普通英文词混同，
+/// **必须**带左边界。
+const NEEDS_LEFT_BOUNDARY: &[&str] = &["sk_prefix_secret"];
+
 fn secret_patterns() -> &'static [(Regex, &'static str)] {
     static P: Lazy<Vec<(Regex, &'static str)>> = Lazy::new(|| {
         vec![
@@ -171,6 +178,16 @@ pub fn scan_error_leak(
             // （正则已锚定 :// 开头与 @ 结尾，这里只确认 @ 是作为 userinfo 结束符）
             if *kind == "db_connstring_password" && !m.as_str().ends_with('@') {
                 continue;
+            }
+            // 小写词根型前缀的**左边界**：前缀必须落在词首，否则
+            // `ask_user_question` / `task-pipeline` 这类标识符会被从中间截出
+            // `sk_…`/`sk-…`，产生假「凭据泄漏」告警（与 mask 前缀规则同源问题）。
+            if NEEDS_LEFT_BOUNDARY.contains(kind) {
+                if let Some(c) = hay[..m.start()].chars().next_back() {
+                    if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                        continue;
+                    }
+                }
             }
             let sev = if matches!(
                 *kind,
@@ -526,6 +543,11 @@ fn exfil_payload_re() -> &'static Regex {
 }
 
 /// 凭据回流形态。
+///
+/// 与 `secret_patterns` 同口径：小写词根型前缀（`xox`）必须带左边界，
+/// 否则 `xox` 会从普通词里截出凭据告警。全大写固定前缀免边界（不会与单词混同）。
+const ECHO_NEEDS_LEFT_BOUNDARY: &[&str] = &["slack_token"];
+
 fn credential_patterns() -> &'static [(Regex, &'static str)] {
     static P: Lazy<Vec<(Regex, &'static str)>> = Lazy::new(|| {
         vec![
@@ -738,6 +760,14 @@ pub fn scan_response_poison(text: &str, request_text: Option<&str>) -> Vec<Findi
             if let Some(req) = request_text {
                 if req.contains(m.as_str()) {
                     continue;
+                }
+            }
+            // 小写词根型前缀的左边界（同 `secret_patterns` 的判定）
+            if ECHO_NEEDS_LEFT_BOUNDARY.contains(kind) {
+                if let Some(c) = text[..m.start()].chars().next_back() {
+                    if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                        continue;
+                    }
                 }
             }
             let value = m.as_str();
@@ -1073,6 +1103,25 @@ mod tests {
         let ph = format!("{{{{APIKEY_{}}}}}", "bcdfgh");
         let r = scan_error_leak(Some(500), &format!("{{\"err\":\"{ph}\"}}"), "");
         assert!(!r.iter().any(|f| f.kind == "sk_prefix_secret"));
+    }
+
+    /// `sk-` 审计模式同样要带左边界：标识符里的 `sk_`/`sk-` 不是凭据泄漏。
+    #[test]
+    fn error_leak_sk_identifier_not_flagged() {
+        for text in [
+            "trace: ask_user_question failed at task_queue_processor",
+            "report=risk_assessment_report",
+            "path=disk-usage-summary.md",
+        ] {
+            let r = scan_error_leak(Some(500), text, "");
+            assert!(
+                !r.iter().any(|f| f.kind == "sk_prefix_secret"),
+                "标识符不得误报：{text} -> {r:?}"
+            );
+        }
+        // 词首的真实密钥仍要报
+        let r = scan_error_leak(Some(500), "key sk-abcdefghijklmnopqrstuvwxyz012345", "");
+        assert!(r.iter().any(|f| f.kind == "sk_prefix_secret"));
     }
 
     #[test]

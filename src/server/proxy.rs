@@ -391,7 +391,8 @@ pub async fn handler(State(state): State<SharedState>, req: Request) -> Response
     let mask_ms = mask_t0.elapsed().as_secs_f64() * 1000.0;
 
     // MASK 事件（含命中明细 + 用户消息原文）
-    let keep_plaintext = crate::config::log_keeps_credential_plaintext(&state.config.get());
+    let cfg_now = state.config.get();
+    let keep_plaintext = crate::config::log_keeps_credential_plaintext(&cfg_now);
     let items = build_event_items(store, &sid, keep_plaintext);
     let new_count = store.get(&sid).map(|s| s.new_orig.len()).unwrap_or(0);
     let mut ev_meta = RequestMeta {
@@ -421,7 +422,10 @@ pub async fn handler(State(state): State<SharedState>, req: Request) -> Response
         dialog: if keep_plaintext {
             req_dialog.clone()
         } else {
-            crate::server::response::redact_credentials(&req_dialog)
+            crate::server::response::redact_credentials(
+                &req_dialog,
+                &cfg_now.mask.secret_prefixes,
+            )
         },
         // 脱敏后的文本本身已用占位符替代了敏感值，无需再洗
         masked_dialog: req_masked_dialog.clone(),
@@ -699,6 +703,7 @@ async fn forward_inner(
                         keep_plaintext: crate::config::log_keeps_credential_plaintext(
                             &state.config.get(),
                         ),
+                        secret_prefixes: state.config.get().mask.secret_prefixes.clone(),
                     };
                     let cmdblock = state.cmdblock();
                     let store: &'static crate::mask::session::SessionStore = state.sessions;
