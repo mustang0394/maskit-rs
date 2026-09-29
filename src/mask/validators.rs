@@ -226,7 +226,54 @@ pub fn landline_ok(num_str: &str) -> bool {
 // 邮箱
 // ---------------------------------------------------------------------------
 
+/// 常见**文件名后缀**。出现在域名末段时基本可以断定不是邮箱：
+/// `exceljs@4.4.0.patch`、`lodash@4.17.21.tgz`、`logo@2x.png`
+/// 都不是地址，而是「包名/资源名 + 版本或倍率 + 文件后缀」。
+///
+/// ⚠️ **本表里绝不能出现真实 TLD** —— IANA 后缀是不断新增的（`.zip`/`.mov`
+/// 2023 年才开放），一旦入表，`admin@company.zip` 这类**真实邮箱会被漏检**
+/// （漏检泄 PII，比误报严重得多）。下列候选曾被剔除：
+/// `zip` / `mov` / `py` / `so` / `md` / `map`（均为 IANA 注册 TLD）。
+/// `email_file_exts_are_not_real_tlds` 测试守住这条不变量。
+const EMAIL_FILE_EXTS: &[&str] = &[
+    "patch", "diff", "tgz", "whl", "lock", "tar", "gz", "bz2", "xz", "zst", "rar", "7z", "rpm",
+    "deb", "msi", "exe", "dll", "dylib", "jar", "war", "class", "rb", "js", "ts", "jsx", "tsx",
+    "css", "scss", "less", "html", "htm", "xml", "json", "yml", "yaml", "toml", "ini", "cfg",
+    "conf", "txt", "csv", "log", "sql", "png", "jpg", "jpeg", "gif", "bmp", "webp", "svg", "ico",
+    "pdf", "woff", "woff2", "ttf", "otf", "eot", "mp3", "mp4", "avi", "mkv", "wav", "flac", "swp",
+    "tmp", "bak", "orig", "rej", "min",
+];
+
+/// 已知与「文件后缀」同名的 IANA TLD（守 `EMAIL_FILE_EXTS` 的不变量）。
+/// 含 2023 年新增的 gTLD `.zip`/`.mov`/`.map`，与 ccTLD `.py`(巴拉圭) /
+/// `.so`(索马里) / `.md`(摩尔多瓦)。
+#[cfg(test)]
+const TLD_FILE_EXT_COLLISIONS: &[&str] = &["zip", "mov", "py", "so", "md", "map"];
+
+/// 是否为「版本号形态」的域名（`0.87.1` / `4.4.0` / `2024.01.01`）。
+///
+/// 判据：末段前的标签至少两个是**纯数字**。真实域名的中间标签几乎不会
+/// 是纯数字（`mail.163.com` 只有一个 `163`），而版本号 / 日期必然如此。
+fn version_like_domain(domain: &str) -> bool {
+    let labels: Vec<&str> = domain.split('.').collect();
+    if labels.len() < 3 {
+        return false;
+    }
+    labels[..labels.len() - 1]
+        .iter()
+        .filter(|l| !l.is_empty() && l.bytes().all(|b| b.is_ascii_digit()))
+        .count()
+        >= 2
+}
+
 /// 邮箱校验（对齐 `_email_ok`）：单 @、无连续双点、TLD ≥ 2。
+///
+/// 在原件基础上收紧了「看起来像邮箱但不是」的两类形态（有回归测试）：
+/// ① 域名是版本号形态（`x@0.87.1.patch`）
+/// ② 域名单个末段是已知文件名后缀（`x@4.4.0.patch`、`x@2x.png`）
+///
+/// 这两类来自包管理器 / 构建产物 / 资源文件名，实践里误报量很大；
+/// 真实邮箱域名不会长这样，因此收紧不损失召回。
 pub fn email_ok(email_str: &str) -> bool {
     let s = email_str.trim();
     if !s.contains('@') || s.starts_with('@') || s.ends_with('@') {
@@ -248,7 +295,18 @@ pub fn email_ok(email_str: &str) -> bool {
         return false;
     }
     let tld = domain.rsplit('.').next().unwrap_or("");
-    tld.len() >= 2
+    if tld.len() < 2 {
+        return false;
+    }
+    // ① 版本号形态域名（`0.87.1.patch` / `4.17.21.tgz` / `2024.01.01.csv`）
+    if version_like_domain(domain) {
+        return false;
+    }
+    // ② 域名末段是已知文件后缀（`2x.png` / `1.0.0.patch`）
+    if EMAIL_FILE_EXTS.contains(&tld.to_ascii_lowercase().as_str()) {
+        return false;
+    }
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -829,6 +887,60 @@ mod tests {
         assert!(!email_ok("a@b.c")); // TLD 1 位
         assert!(!email_ok("@example.com"));
         assert!(!email_ok("test@exam..com"));
+        // 真实域名不得因新增的文件后缀 / 版本号判定被误伤
+        for good in [
+            "user@mail.company.co.uk",
+            "x@y.io",
+            "foo@bar.dev",
+            "me@app.dev",
+            "wang@mail.163.com", // 中间标签纯数字但只有一个
+            "first.last+tag@sub.domain.org",
+        ] {
+            assert!(email_ok(good), "真实邮箱不得误伤：{good}");
+        }
+        // 回归：包名 / 资源名 + 版本号 + 文件后缀，不是邮箱
+        for bad in [
+            "earendil-works__pi-ai@0.87.1.patch",
+            "exceljs@4.4.0.patch",
+            "electron__osx-sign@1.3.3.patch",
+            "lodash@4.17.21.tgz",
+            "requests@2.31.0.whl",
+            "pkg@1.0.0.tar.gz",
+            "bar@0.1.0.min.js",
+            "logo@2x.png",
+            "icon@16x16.svg",
+            "data@2024.01.01.csv",
+            "asset@3.0.0.min.css",
+        ] {
+            assert!(!email_ok(bad), "包名/文件名不得当邮箱：{bad}");
+        }
+    }
+
+    /// `EMAIL_FILE_EXTS` 里绝不能出现真实 TLD。
+    ///
+    /// 背景：`.zip` / `.mov` 是 2023 年才开放的 IANA TLD，`py`/`so`/`md`/`map`
+    /// 也是注册后缀。把它们当「文件后缀」拉黑，会让 `admin@company.zip`、
+    /// `user@mail.so` 这类**真实邮箱漏检** —— 漏检泄 PII，比误报严重得多。
+    /// 这条测试把不变量钉死，避免以后往表里随手加。
+    #[test]
+    fn email_file_exts_are_not_real_tlds() {
+        for ext in EMAIL_FILE_EXTS {
+            assert!(
+                !TLD_FILE_EXT_COLLISIONS.contains(ext),
+                "`{ext}` 是真实 IANA TLD，不得当文件后缀拉黑（会导致真实邮箱漏检）"
+            );
+        }
+        // 反向锁：这些真实邮箱必须照常命中
+        for real in [
+            "admin@company.zip",
+            "user@mail.so",
+            "dev@example.py",
+            "a@b.md",
+            "x@y.mov",
+            "me@corp.map",
+        ] {
+            assert!(email_ok(real), "真实 TLD 邮箱不得漏检：{real}");
+        }
     }
 
     #[test]

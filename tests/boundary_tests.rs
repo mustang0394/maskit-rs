@@ -129,6 +129,34 @@ fn boundary_email_word_prefix() {
     );
 }
 
+/// 回归：包名/资源名 + 版本号 + 文件后缀不得当邮箱脱敏。
+///
+/// `earendil-works__pi-ai@0.87.1.patch` / `exceljs@4.4.0.patch` /
+/// `electron__osx-sign@1.3.3.patch` 等来自 patch / 依赖清单 / 构建产物，
+/// 被当成邮箱改造后，文件名与包名都会变。
+#[test]
+fn boundary_email_package_and_asset_names() {
+    let parts = fresh();
+    for text in [
+        "earendil-works__pi-ai@0.87.1.patch",
+        "exceljs@4.4.0.patch",
+        "electron__osx-sign@1.3.3.patch",
+        "lodash@4.17.21.tgz",
+        "requests@2.31.0.whl",
+        "bar@0.1.0.min.js",
+        "logo@2x.png",
+        "data@2024.01.01.csv",
+    ] {
+        let m = mask(&parts, text);
+        assert_eq!(m, text, "不得当邮箱脱敏：{text}");
+    }
+    // 旁边的真实邮箱仍要脱敏（不能因为放宽而漏）
+    let mixed = "包 exceljs@4.4.0.patch 作者 alice@example.com";
+    let m = mask(&parts, mixed);
+    assert!(m.contains("exceljs@4.4.0.patch"), "包名保留：{m}");
+    assert!(!m.contains("alice@example.com"), "真实邮箱仍脱敏：{m}");
+}
+
 // ===========================================================================
 // API_KEY/TOKEN/ACCESS_KEY 边界（[A-Za-z0-9_-] 不可相邻）
 // ===========================================================================

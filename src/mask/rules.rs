@@ -1330,6 +1330,29 @@ mod tests {
         );
     }
 
+    /// 回归：包名/资源名 + 版本号 + 文件后缀不得命中（email_ok 语义校验拦下）。
+    #[test]
+    fn email_ignores_package_and_asset_names() {
+        for not_email in [
+            "earendil-works__pi-ai@0.87.1.patch",
+            "exceljs@4.4.0.patch",
+            "electron__osx-sign@1.3.3.patch",
+            "lodash@4.17.21.tgz",
+            "logo@2x.png",
+            "data@2024.01.01.csv",
+        ] {
+            assert!(
+                mask_hits("EMAIL", not_email).is_empty(),
+                "不得当邮箱：{not_email}"
+            );
+        }
+        // 同一段里的真实邮箱仍要命中
+        assert_eq!(
+            mask_hits("EMAIL", "包 exceljs@4.4.0.patch 作者 alice@example.com"),
+            vec!["alice@example.com"]
+        );
+    }
+
     #[test]
     fn connstr_captures_password_group() {
         let text = "postgres://usr:Zq9xLm2pTv8w@db.internal:5432/prod";
