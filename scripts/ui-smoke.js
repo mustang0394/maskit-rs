@@ -150,6 +150,16 @@ const maskEvent = {
     { label: 'PHONE', tok: '{{PHONE_bcdfgh}}', original: '13800138000', cred: false, length: 11 },
     { label: 'EMAIL', tok: '{{EMAIL_qwrtzx}}', original: 'a@b.com', cred: false, length: 7 },
   ],
+  // 请求头：含凭据（已打码）、同名重复头（accept ×2）、普通头
+  request_headers: [
+    ['host', '127.0.0.1:18701'],
+    ['content-type', 'application/json'],
+    ['authorization', '***'],
+    ['cookie', '***'],
+    ['anthropic-version', '2023-06-01'],
+    ['accept', 'application/json'],
+    ['accept', 'text/event-stream'],
+  ],
 };
 // 老事件：没有 masked_dialog，必须走「按命中明细推算」兜底
 const legacyEvent = {
@@ -331,6 +341,23 @@ const tick = (n = 6) => new Promise(async res => {
   check(detail.includes('13800138000'), '日志详情：原文应可见');
   check(!detail.includes('>13800138000<') || detail.includes('发给上游'), '日志详情：结构异常');
   check(byId.get('logMeta').textContent.includes('共 3 条'), '日志页：缺总数');
+
+  // 请求头面板：头名/值渲染、凭据打码标记、同名头不合并、列表行计数
+  check(detail.includes('请求头 · 7'), '日志详情：缺「请求头」面板');
+  check(detail.includes('hdr-table'), '日志详情：请求头未用表格渲染');
+  check(detail.includes('anthropic-version'), '日志详情：普通请求头未渲染');
+  check(detail.includes('2023-06-01'), '日志详情：请求头值未渲染');
+  check(
+    detail.includes('hdr-redacted') || detail.includes('hdr-cred'),
+    '日志详情：凭据头未标记为已打码',
+  );
+  check(!detail.includes('sk-') && !detail.includes('session='), '日志详情：凭据值泄漏');
+  // 同名 accept 两条都必须在（不能合并/覆盖）
+  check(
+    detail.includes('application/json') && detail.includes('text/event-stream'),
+    '日志详情：同名 accept 被合并了',
+  );
+  check(listHtml.includes('7 头'), '日志列表：缺请求头条数');
 
   // 切到「老事件」（无 masked_dialog）→ 必须走推算兜底
   byId.get('logList').fire('click', {

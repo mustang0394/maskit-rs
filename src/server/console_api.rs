@@ -435,6 +435,9 @@ pub async fn export_logs(State(state): State<SharedState>) -> Response {
             obj.remove("dialog");
             obj.remove("req_preview");
             obj.remove("resp_preview");
+            // 请求头同样属原文类：含 `authorization`/`cookie` 等，导出恒脱敏
+            // （默认 `log_credential_plaintext=true` 时它们本就是明文）。
+            obj.remove("request_headers");
             if let Some(items) = obj.get_mut("items").and_then(|i| i.as_array_mut()) {
                 for it in items.iter_mut() {
                     if let Some(o) = it.as_object_mut() {

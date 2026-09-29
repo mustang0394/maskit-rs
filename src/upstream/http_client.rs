@@ -203,9 +203,68 @@ impl UpstreamClient {
     }
 }
 
+/// 日志用请求头上限。
+///
+/// 防滥用：请求头是**客户端完全可控**的，不设上限时恶意客户端可以用
+/// 几百个超大自定义头把事件库撑爆（每个头都会随 payload 落 SQLite）。
+const LOG_HEADERS_MAX_COUNT: usize = 100;
+const LOG_HEADERS_MAX_VALUE_LEN: usize = 2048;
+const LOG_HEADERS_MAX_TOTAL_BYTES: usize = 16 * 1024;
+
+/// 采集请求头供事件日志展示（**保序 + 保留同名重复头**）。
+///
+/// * `keep_plaintext` — 为 false 时把凭据类头的**值**换成 `***`
+///   （头名保留，否则排查时看不出客户端到底带了哪些认证头）。
+///   与 `dialog` 的 `log_credential_plaintext` 同一开关、同一语义。
+///
+/// 头名统一转小写（HTTP 头名大小写不敏感，归一化后更好检索与比对）；
+/// 非 UTF-8 头值用 lossy 转换（`HeaderValue` 里的原始字节无法直接当字符串）。
+///
+/// 超限行为：单值超长截断并带 `…` 后缀；头数或总字节超限则**停止采集并追加
+/// 一条 `x-shield-truncated` 标记**，而不是静默丢头 —— 日志里必须看得出
+/// 「这里被截了」，否则会误导排查。
+pub fn collect_log_headers(headers: &HeaderMap, keep_plaintext: bool) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> =
+        Vec::with_capacity(headers.len().min(LOG_HEADERS_MAX_COUNT));
+    let mut total = 0usize;
+    let mut truncated = false;
+    for (name, value) in headers {
+        if out.len() >= LOG_HEADERS_MAX_COUNT {
+            truncated = true;
+            break;
+        }
+        let key = name.as_str().to_ascii_lowercase();
+        let val = if !keep_plaintext && is_credential_header(&key) {
+            "***".to_string()
+        } else {
+            let s = String::from_utf8_lossy(value.as_bytes()).to_string();
+            if s.len() > LOG_HEADERS_MAX_VALUE_LEN {
+                // 按字符边界安全截断（不能切在多字节序列中间）
+                let mut cut = LOG_HEADERS_MAX_VALUE_LEN;
+                while cut > 0 && !s.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                format!("{}…", &s[..cut])
+            } else {
+                s
+            }
+        };
+        let cost = key.len() + val.len();
+        if total + cost > LOG_HEADERS_MAX_TOTAL_BYTES {
+            truncated = true;
+            break;
+        }
+        total += cost;
+        out.push((key, val));
+    }
+    if truncated {
+        out.push(("x-shield-truncated".to_string(), "true".to_string()));
+    }
+    out
+}
+
 /// 判定是否为凭据类请求头（PLAN §2.2 / Python `_CREDENTIAL_HEADER_NAMES`）。
 /// extra_headers 注入时凭据头一律跳过——凭据归客户端所有。
-#[allow(dead_code)] // M6 使用
 pub fn is_credential_header(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
@@ -323,6 +382,94 @@ mod tests {
         assert!(is_credential_header("X-GitHub-Token"));
         assert!(!is_credential_header("anthropic-version"));
         assert!(!is_credential_header("content-type"));
+    }
+
+    /// 采集：保序 + 同名头不丢掉 + 头名归一化为小写。
+    #[test]
+    fn collect_log_headers_preserves_order_and_duplicates() {
+        let mut h = HeaderMap::new();
+        h.append("accept", HeaderValue::from_static("text/event-stream"));
+        h.append("accept", HeaderValue::from_static("application/json"));
+        h.insert("Content-Type", HeaderValue::from_static("application/json"));
+        h.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
+        let got = collect_log_headers(&h, true);
+        // 头名全小写
+        assert!(got.iter().all(|(k, _)| *k == k.to_ascii_lowercase()));
+        // 同名 accept 两条都在
+        let accepts: Vec<&str> = got
+            .iter()
+            .filter(|(k, _)| k == "accept")
+            .map(|(_, v)| v.as_str())
+            .collect();
+        assert_eq!(accepts, vec!["text/event-stream", "application/json"]);
+        assert!(got
+            .iter()
+            .any(|(k, v)| k == "content-type" && v == "application/json"));
+        assert!(got
+            .iter()
+            .any(|(k, v)| k == "anthropic-version" && v == "2023-06-01"));
+    }
+
+    /// 凭据头：开关关闭时值打码，但**头名必须保留**（否则看不出带了认证头）。
+    #[test]
+    fn collect_log_headers_redacts_credential_values() {
+        let mut h = HeaderMap::new();
+        h.insert(
+            "authorization",
+            HeaderValue::from_static("Bearer sk-supersecret123456"),
+        );
+        h.insert("x-api-key", HeaderValue::from_static("AIzaSyAAAsecret"));
+        h.insert("cookie", HeaderValue::from_static("session=abc"));
+        h.insert("user-agent", HeaderValue::from_static("curl/8"));
+
+        let redacted = collect_log_headers(&h, false);
+        for (k, v) in &redacted {
+            assert!(!v.contains("supersecret"), "凭据值泄漏：{k}={v}");
+            assert!(!v.contains("AIzaSyAAAsecret"), "凭据值泄漏：{k}={v}");
+            assert!(!v.contains("session=abc"), "凭据值泄漏：{k}={v}");
+        }
+        // 头名保留
+        assert!(redacted.iter().any(|(k, _)| k == "authorization"));
+        assert!(redacted.iter().any(|(k, _)| k == "x-api-key"));
+        assert!(redacted.iter().any(|(k, _)| k == "cookie"));
+        // 非凭据头不受影响
+        assert!(redacted
+            .iter()
+            .any(|(k, v)| k == "user-agent" && v == "curl/8"));
+
+        // keep_plaintext=true 时保留明文（与 dialog 同策略）
+        let plain = collect_log_headers(&h, true);
+        assert!(plain
+            .iter()
+            .any(|(k, v)| k == "authorization" && v.contains("supersecret")));
+    }
+
+    /// 恶意客户端不能用超大/超多头把事件库撑爆。
+    #[test]
+    fn collect_log_headers_is_bounded() {
+        let mut h = HeaderMap::new();
+        // 超长值 → 截断且带标记
+        let long = "x".repeat(LOG_HEADERS_MAX_VALUE_LEN + 500);
+        h.insert("x-big", HeaderValue::from_str(&long).unwrap());
+        let got = collect_log_headers(&h, true);
+        let big = got.iter().find(|(k, _)| k == "x-big").unwrap();
+        assert!(big.1.ends_with('…'), "超长值应截断");
+        assert!(big.1.len() <= LOG_HEADERS_MAX_VALUE_LEN + 3);
+
+        // 超多头数 → 停采并标记
+        let mut many = HeaderMap::new();
+        for i in 0..(LOG_HEADERS_MAX_COUNT + 20) {
+            many.insert(
+                HeaderName::from_bytes(format!("x-h{i}").as_bytes()).unwrap(),
+                HeaderValue::from_static("v"),
+            );
+        }
+        let got = collect_log_headers(&many, true);
+        assert!(
+            got.iter().any(|(k, _)| k == "x-shield-truncated"),
+            "超限必须留下截断标记"
+        );
+        assert!(got.len() <= LOG_HEADERS_MAX_COUNT + 1);
     }
 
     #[test]

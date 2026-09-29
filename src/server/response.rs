@@ -263,6 +263,8 @@ pub struct StreamMeta {
     /// 当前生效的密钥前缀（构造时从配置快照）。日志清洗必须用真实配置，
     /// 不能用写死的默认值 —— 否则控制台里加的前缀会在日志里漏明文。
     pub secret_prefixes: Vec<String>,
+    /// 客户端请求头（随 RESTORE 事件落库，与同请求的 MASK 事件同一份）。
+    pub request_headers: Vec<(String, String)>,
 }
 
 /// 发 RESTORE 事件（对齐 `_emit_restore_summary`）。
@@ -312,6 +314,7 @@ pub fn emit_restore(
         restored: restored as usize,
         count: restored as usize,
         dialog: meta.resp_dialog.clone(),
+        request_headers: meta.request_headers.clone(),
         message: String::new(),
         ..Default::default()
     };

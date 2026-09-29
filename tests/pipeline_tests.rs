@@ -150,15 +150,39 @@ impl Harness {
         &self.state.bus
     }
 
+    /// 同 `new`，但把 `mask.log_credential_plaintext` 设为指定值
+    /// （请求头凭据打码测试用）。
+    async fn with_plaintext(keep_plaintext: bool) -> Self {
+        let h = Self::new(true, false, true).await;
+        let mut cfg = h.state.config.get();
+        cfg.mask.log_credential_plaintext = keep_plaintext;
+        h.state.config.update(cfg);
+        h
+    }
+
     /// 发一个请求，返回 (状态码, 响应体)。
     async fn send(&self, method: &str, path: &str, ct: &str, body: &str) -> (StatusCode, Vec<u8>) {
+        self.send_with_headers(method, path, ct, body, &[]).await
+    }
+
+    /// 带自定义请求头发送（验证请求头采集落到事件里）。
+    async fn send_with_headers(
+        &self,
+        method: &str,
+        path: &str,
+        ct: &str,
+        body: &str,
+        extra: &[(&str, &str)],
+    ) -> (StatusCode, Vec<u8>) {
         let app = build_router(self.state.clone());
-        let req = Request::builder()
+        let mut b = Request::builder()
             .method(method)
             .uri(path)
-            .header("content-type", ct)
-            .body(Body::from(body.to_string()))
-            .unwrap();
+            .header("content-type", ct);
+        for (k, v) in extra {
+            b = b.header(*k, *v);
+        }
+        let req = b.body(Body::from(body.to_string())).unwrap();
         let resp = app.oneshot(req).await.unwrap();
         let status = resp.status();
         let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024 * 1024)
@@ -345,6 +369,89 @@ async fn matrix_non_object_root_masked() {
     let up = String::from_utf8_lossy(&h.mock.last_body().unwrap()).to_string();
     assert!(!up.contains(SENTINEL_PHONE), "数组根也必须整棵脱敏");
     assert!(!up.contains("__shield_root__"), "包装键不得上行");
+}
+
+/// 请求头采集：客户端发的头要落到 MASK 事件里（保序 + 凭据打码）。
+///
+/// 回归：功能目的就是让控制台能看到「这个请求到底带了哪些头」，
+/// 而凭据头的**值**必须受 `log_credential_plaintext` 控制。
+#[tokio::test]
+async fn mask_event_records_request_headers() {
+    let h = Harness::with_plaintext(true).await;
+    let body = format!(
+        r#"{{"model":"gpt-4o","messages":[{{"role":"user","content":"{SENTINEL_PHONE}"}}]}}"#
+    );
+    let (status, _) = h
+        .send_with_headers(
+            "POST",
+            "/v1/chat/completions",
+            "application/json",
+            &body,
+            &[
+                ("authorization", "Bearer sk-supersecretvalue123"),
+                ("anthropic-version", "2023-06-01"),
+                ("accept", "application/json"),
+                ("accept", "text/event-stream"),
+            ],
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let ev = find_event(h.bus(), maskit_rs::store::events::EventType::Mask).expect("MASK 事件");
+    let hdrs = &ev.request_headers;
+    assert!(!hdrs.is_empty(), "必须记录请求头");
+    // 非凭据头原样保留（头名小写）
+    assert!(hdrs
+        .iter()
+        .any(|(k, v)| k == "anthropic-version" && v == "2023-06-01"));
+    // 同名头不合并（HTTP 允许，且顺序有意义）
+    let accepts: Vec<&str> = hdrs
+        .iter()
+        .filter(|(k, _)| k == "accept")
+        .map(|(_, v)| v.as_str())
+        .collect();
+    assert_eq!(accepts, vec!["application/json", "text/event-stream"]);
+    // 默认 log_credential_plaintext=true：凭据头保留明文（与 dialog 同策略）
+    assert!(hdrs
+        .iter()
+        .any(|(k, v)| k == "authorization" && v.contains("sk-supersecretvalue123")));
+}
+
+/// `log_credential_plaintext=false` 时，请求头里的凭据值必须打码，
+/// 但**头名要保留**（否则排查时看不出客户端带了认证头）。
+#[tokio::test]
+async fn mask_event_redacts_credential_header_values() {
+    let h = Harness::with_plaintext(false).await;
+    let body = format!(
+        r#"{{"model":"gpt-4o","messages":[{{"role":"user","content":"{SENTINEL_PHONE}"}}]}}"#
+    );
+    let (status, _) = h
+        .send_with_headers(
+            "POST",
+            "/v1/chat/completions",
+            "application/json",
+            &body,
+            &[
+                ("authorization", "Bearer sk-supersecretvalue123"),
+                ("cookie", "session=topsecret"),
+                ("x-api-key", "AIzaSyTopSecret"),
+                ("user-agent", "curl/8"),
+            ],
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let ev = find_event(h.bus(), maskit_rs::store::events::EventType::Mask).expect("MASK 事件");
+    let hdrs = &ev.request_headers;
+    for (k, v) in hdrs {
+        assert!(!v.contains("supersecret"), "凭据值泄漏：{k}={v}");
+        assert!(!v.contains("topsecret"), "凭据值泄漏：{k}={v}");
+        assert!(!v.contains("TopSecret"), "凭据值泄漏：{k}={v}");
+    }
+    // 头名保留 + 值打码
+    assert!(hdrs.iter().any(|(k, v)| k == "authorization" && v == "***"));
+    assert!(hdrs.iter().any(|(k, v)| k == "cookie" && v == "***"));
+    assert!(hdrs.iter().any(|(k, v)| k == "x-api-key" && v == "***"));
+    // 非凭据头不受影响
+    assert!(hdrs.iter().any(|(k, v)| k == "user-agent" && v == "curl/8"));
 }
 
 /// 行 11：已路由的未知形态 JSON + fail_closed=true → **整棵脱敏** + unknown_shape。

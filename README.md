@@ -85,7 +85,8 @@ MASKIT_RS_DATA_DIR=/var/lib/maskit-rs ./target/release/maskit-rs
 - **8 类被动审计信号**：错误泄露 / 换芯 / 工具重写 / 流异常 / 响应投毒 / 跨请求污染 / 凭据回流 / 危险动作
 - **token 用量统计**：按模型统计输入/输出 token（`/api/stats/today`、`/api/stats/models`）。**只统计数量，不做价格/费用计算**
 - **事件与统计**：SQLite（事件表与 Python 版同 schema，可互读写；Rust 版另增一张 `placeholder_map` 映射表，见下）、每日聚合、保留期清理
-- **控制台**：单文件原生 JS（无构建步骤）。日志/审计/敏感词均为**主从双栏**；日志详情并排对照「原文（客户端发出）」与「发给上游（已脱敏）」（`masked_dialog`），支持全文搜索、类型过滤、分页、自动刷新；页面状态写入 URL hash（`/console#logs` 可直达、刷新不丢页）
+- **控制台**：单文件原生 JS（无构建步骤）。日志/审计/敏感词均为**主从双栏**；日志详情并排对照「原文（客户端发出）」与「发给上游（已脱敏）」（`masked_dialog`），并展示本次请求的**全部请求头**（保序、同名头不合并），支持全文搜索、类型过滤、分页、自动刷新；页面状态写入 URL hash（`/console#logs` 可直达、刷新不丢页）
+  - **请求头日志**：`events[].request_headers`，为 `[[name, value], …]`（保序 + 保留同名重复头，如多个 `accept`）。头名统一转小写。凭据类（`authorization` / `cookie` / `x-api-key` 等）的值按 `mask.log_credential_plaintext` 决定是否显示为 `***`；导出（`/api/logs/export`）**恒剔除**该字段。为防客户端用超大/超多头撑爆事件库，上限为 100 个、单值 2048 字符、合计 16KiB，超限截断并附 `x-shield-truncated` 标记
 - **凭据明文落盘（按设计）**：脱敏命中的映射表 `placeholder_map` 会无条件记录**所有**分类（含凭据类）的 `占位符 → 原文`，用于进程重启后还原历史对话里的占位符。
   因此「凭据类原文永不落库」**只对 `events` 表成立**（受 `mask.log_credential_plaintext` 控制），不适用于映射表；`config.json` 里的原始敏感词同理。**备份数据目录必须加密。**
 

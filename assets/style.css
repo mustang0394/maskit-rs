@@ -317,6 +317,15 @@ table.cmp-items th:nth-child(1), table.cmp-items td:nth-child(1) { width: 108px;
 table.cmp-items th:nth-child(2), table.cmp-items td:nth-child(2) { width: 32%; }
 table.cmp-items th:nth-child(4), table.cmp-items td:nth-child(4) { width: 168px; }
 
+/* 请求头表：头名定宽不折行，值可长可换行 */
+table.hdr-table th:nth-child(1), table.hdr-table td:nth-child(1) {
+  width: 210px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+table.hdr-table td.hdr-val { word-break: break-all; white-space: pre-wrap; }
+/* 凭据类头：值打码后整行淡出，一眼可辩 */
+table.hdr-table td.hdr-redacted { color: var(--fg-muted); letter-spacing: 2px; }
+table.hdr-table td.hdr-cred { color: var(--warn); }
+
 /* ---------------- 自定义敏感词：分组是独立实体，主从双栏 ---------------- */
 .cw-nav { padding: 5px; max-height: 460px; }
 .nav-item {

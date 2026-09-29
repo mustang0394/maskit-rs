@@ -74,6 +74,7 @@ fn emit(
         unresolved_samples: vec![],
         unknown_shape: source.unknown_shape,
         message: source.message.clone(),
+        request_headers: source.request_headers.clone(),
         ..Default::default()
     };
     let ev = bus.emit(ev);
@@ -87,6 +88,9 @@ pub struct RequestMeta {
     pub unknown_shape: bool,
     pub message: String,
     pub body_shape: Option<String>,
+    /// 客户端请求头（已按 `log_credential_plaintext` 决定是否打码凭据值）。
+    /// 在 `handler()` 入口采集一次，整条生命周期共用。
+    pub request_headers: Vec<(String, String)>,
 }
 
 /// 反代 handler（完整管线，M6）。
@@ -105,6 +109,13 @@ pub async fn handler(State(state): State<SharedState>, req: Request) -> Response
     let method = parts.method.clone();
     let method_str = method.as_str().to_string();
     let path = parts.uri.path().to_string();
+
+    // 请求头只采集一次，整条生命周期（Block/Bypass/Pass/MASK/RESTORE）共用。
+    // 凭据头的值按 `log_credential_plaintext` 决定是否打码 —— 与 `dialog` 同一开关。
+    let log_headers = crate::upstream::http_client::collect_log_headers(
+        &parts.headers,
+        crate::config::log_keeps_credential_plaintext(&state.config.get()),
+    );
 
     // ── 判定①：上游未配置 → 502（新单上游模型下等价 Python 的 no_reverse_route） ──
     let cfg = state.config.get();
@@ -143,6 +154,7 @@ pub async fn handler(State(state): State<SharedState>, req: Request) -> Response
                 "",
                 &RequestMeta {
                     req_bytes: max_body,
+                    request_headers: log_headers.clone(),
                     ..Default::default()
                 },
             );
@@ -166,6 +178,7 @@ pub async fn handler(State(state): State<SharedState>, req: Request) -> Response
             "",
             &RequestMeta {
                 req_bytes,
+                request_headers: log_headers.clone(),
                 ..Default::default()
             },
         );
@@ -187,6 +200,7 @@ pub async fn handler(State(state): State<SharedState>, req: Request) -> Response
             "",
             &RequestMeta {
                 req_bytes,
+                request_headers: log_headers.clone(),
                 ..Default::default()
             },
         );
@@ -220,6 +234,7 @@ pub async fn handler(State(state): State<SharedState>, req: Request) -> Response
                 &RequestMeta {
                     req_bytes,
                     message: ct.chars().take(80).collect(),
+                    request_headers: log_headers.clone(),
                     ..Default::default()
                 },
             );
@@ -237,6 +252,7 @@ pub async fn handler(State(state): State<SharedState>, req: Request) -> Response
             "",
             &RequestMeta {
                 req_bytes,
+                request_headers: log_headers.clone(),
                 ..Default::default()
             },
         );
@@ -260,6 +276,7 @@ pub async fn handler(State(state): State<SharedState>, req: Request) -> Response
                 "",
                 &RequestMeta {
                     req_bytes,
+                    request_headers: log_headers.clone(),
                     ..Default::default()
                 },
             );
@@ -277,6 +294,7 @@ pub async fn handler(State(state): State<SharedState>, req: Request) -> Response
             "",
             &RequestMeta {
                 req_bytes,
+                request_headers: log_headers.clone(),
                 ..Default::default()
             },
         );
@@ -302,6 +320,7 @@ pub async fn handler(State(state): State<SharedState>, req: Request) -> Response
             "",
             &RequestMeta {
                 req_bytes,
+                request_headers: log_headers.clone(),
                 ..Default::default()
             },
         );
@@ -362,6 +381,7 @@ pub async fn handler(State(state): State<SharedState>, req: Request) -> Response
                 &RequestMeta {
                     req_bytes,
                     message: e.chars().take(200).collect(),
+                    request_headers: log_headers.clone(),
                     ..Default::default()
                 },
             );
@@ -382,6 +402,7 @@ pub async fn handler(State(state): State<SharedState>, req: Request) -> Response
                 &RequestMeta {
                     req_bytes,
                     message: e.to_string(),
+                    request_headers: log_headers.clone(),
                     ..Default::default()
                 },
             );
@@ -398,6 +419,7 @@ pub async fn handler(State(state): State<SharedState>, req: Request) -> Response
     let mut ev_meta = RequestMeta {
         req_bytes,
         unknown_shape,
+        request_headers: log_headers.clone(),
         ..Default::default()
     };
     ev_meta.body_shape = masked.body_shape.map(str::to_string);
@@ -435,6 +457,7 @@ pub async fn handler(State(state): State<SharedState>, req: Request) -> Response
         unresolved_samples: vec![],
         unknown_shape,
         message: String::new(),
+        request_headers: log_headers.clone(),
         ..Default::default()
     };
     if let Some(mut s) = store.get_mut(&sid) {
@@ -467,6 +490,7 @@ pub async fn handler(State(state): State<SharedState>, req: Request) -> Response
         model: model.clone(),
         req_bytes,
         req_dialog,
+        request_headers: log_headers,
     };
     forward_with_restore(&state, &method_str, &parts.uri, &headers, out_body, sess).await
 }
@@ -632,6 +656,8 @@ pub struct RestoreSession {
     pub model: String,
     pub req_bytes: usize,
     pub req_dialog: String,
+    /// 客户端请求头（随 RESTORE 事件落库，与 MASK 事件同一份）。
+    pub request_headers: Vec<(String, String)>,
 }
 
 async fn forward_inner(
@@ -701,6 +727,7 @@ async fn forward_inner(
                             &state.config.get(),
                         ),
                         secret_prefixes: state.config.get().mask.secret_prefixes.clone(),
+                        request_headers: sess.request_headers.clone(),
                     };
                     let cmdblock = state.cmdblock();
                     let store: &'static crate::mask::session::SessionStore = state.sessions;

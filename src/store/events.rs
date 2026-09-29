@@ -155,6 +155,16 @@ pub struct Event {
     /// 错误信息
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub message: String,
+    /// 客户端请求头（**保序 + 允许同名重复**，HTTP 同名单头如 `accept` 是合法的）。
+    ///
+    /// 为什么用 `Vec<(String, String)>` 而不是 map：同名头会互相覆盖，
+    /// 且 map 会打乱客户端发送顺序（排查问题时顺序有意义）。
+    ///
+    /// 凭据类头（`authorization`/`cookie`/`x-api-key`…）的值由
+    /// `mask.log_credential_plaintext` 决定：false 时值已被替换为 `***`。
+    /// 采集与上限截断见 `upstream::http_client::collect_log_headers`。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub request_headers: Vec<(String, String)>,
 }
 
 fn is_zero_usize(v: &usize) -> bool {
@@ -208,6 +218,7 @@ impl Default for Event {
             unresolved_samples: vec![],
             unknown_shape: false,
             message: String::new(),
+            request_headers: vec![],
         }
     }
 }

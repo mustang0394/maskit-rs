@@ -130,7 +130,9 @@
         </div>
         <p class="hint">
           左选事件、右侧看详情。详情里「原文」是客户端发出的内容，「发给上游」是脱敏后
-          实际转发给上游的内容（含 <code>{{占位符}}</code>）。凭据类受
+          实际转发给上游的内容（含 <code>{{占位符}}</code>），下方另有本次请求的
+          <strong>全部请求头</strong>。凭据类（<code>dialog</code> / 请求头里的
+          <code>authorization</code>、<code>cookie</code> 等）受
           <code>mask.log_credential_plaintext</code> 控制。
         </p>
         <div class="split">

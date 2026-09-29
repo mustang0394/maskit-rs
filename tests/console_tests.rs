@@ -337,6 +337,13 @@ async fn exported_logs_never_contain_plaintext() {
         method: "POST".into(),
         path: "/v1/chat/completions".into(),
         dialog: "【用户】\n电话13800138000 key sk-abcdefghijklmnopqrstuvwxyz012345".into(),
+        request_headers: vec![
+            (
+                "authorization".into(),
+                "Bearer sk-live-token-plaintext".into(),
+            ),
+            ("user-agent".into(), "curl/8".into()),
+        ],
         items: vec![
             maskit_rs::store::events::EventItem {
                 label: "PHONE".into(),
@@ -378,6 +385,15 @@ async fn exported_logs_never_contain_plaintext() {
     );
     assert!(!blob.contains("\"original\""));
     assert!(!blob.contains("\"dialog\""));
+    // 请求头含 authorization 明文（默认 log_credential_plaintext=true），导出必须剔除
+    assert!(
+        !blob.contains("request_headers"),
+        "导出不得含请求头（会泄 authorization/cookie）"
+    );
+    assert!(
+        !blob.contains("sk-live-token-plaintext"),
+        "导出不得含请求头里的凭据"
+    );
     assert!(
         blob.contains("abcdef1234567890"),
         "摘要保留（可对照同一性）"

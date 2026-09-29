@@ -929,12 +929,14 @@
     if (e.degraded) stat.push(`容错 ${e.degraded}`);
     if (e.status >= 400) stat.push(`HTTP ${e.status}`);
     const hits = e.count || e.restored || (e.items || []).length;
+    const hdrN = (e.request_headers || []).length;
     return `<button class="lrow ${log.sel === e.id ? 'active' : ''}" data-log-id="${e.id}" role="option"
               aria-selected="${log.sel === e.id ? 'true' : 'false'}">
         <span class="lrow-top">
           <span class="lrow-time">${esc(fmtTime(e.ts))}</span>
           <span class="badge ${esc(t)}">${esc(t)}</span>
           ${hits ? `<span class="hint">${hits} 命中</span>` : ''}
+          ${hdrN ? `<span class="hint">${hdrN} 头</span>` : ''}
           ${e.mask_ms != null ? `<span class="hint mono">${esc(fmtMs(e.mask_ms))}</span>` : ''}
         </span>
         <span class="lrow-sub"><span class="lrow-path">${esc(e.method || '')} ${esc(e.path || '')}</span></span>
@@ -946,6 +948,7 @@
   function logDetailHtml(e) {
     const type = String(e.type || '');
     const items = e.items || [];
+    const headers = e.request_headers || [];
     const needles = items.map(it => it.original).filter(Boolean);
     const parts = [];
 
@@ -1006,6 +1009,36 @@
         parts.push(`<div class="detail-section"><div class="detail-title">${esc(title)}</div>
           <pre class="cmp2-pre">${highlight(orig, needles)}</pre></div>`);
       }
+    }
+
+    // 请求头（客户端实际发送的全部头；凭据类值受 mask.log_credential_plaintext 控制）
+    if (headers.length) {
+      const credNames = ['authorization', 'proxy-authorization', 'cookie',
+        'x-api-key', 'api-key', 'apikey', 'x-goog-api-key', 'x-auth-token',
+        'x-access-token', 'x-token', 'x-session-token', 'private-token',
+        'x-gitlab-token', 'x-github-token', 'x-amz-security-token',
+        'x-amz-credential', 'x-client-secret', 'client-secret'];
+      const rows = headers.map(([k, v]) => {
+        const name = String(k || '');
+        const val = String(v == null ? '' : v);
+        const isCred = credNames.includes(name.toLowerCase());
+        const masked = val === '***';
+        const cls = masked ? 'hdr-val hdr-redacted' : (isCred ? 'hdr-val hdr-cred' : 'hdr-val');
+        return `<tr>
+          <td class="mono hdr-name">${isCred ? '🔒 ' : ''}${esc(name)}</td>
+          <td class="mono ${cls}">${esc(val) || '<span class="hint">—</span>'}</td>
+        </tr>`;
+      }).join('');
+      const truncated = headers.some(([k]) => String(k).toLowerCase() === 'x-shield-truncated');
+      parts.push(`<div class="detail-section">
+        <div class="detail-title">请求头 · ${headers.length}</div>
+        <table class="cmp cmp-items hdr-table"><thead><tr>
+          <th>Header</th><th>值</th>
+        </tr></thead><tbody>${rows}</tbody></table>
+        ${truncated
+          ? '<div class="note warn">请求头过多/过长，已截断（仅展示前一部分）</div>'
+          : '<div class="hint">凭据类头的值受 <code>mask.log_credential_plaintext</code> 控制；关闭时显示 <code>***</code>。</div>'}
+      </div>`);
     }
 
     if (items.length) {
