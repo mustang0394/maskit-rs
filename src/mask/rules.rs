@@ -787,28 +787,6 @@ pub static RULES: Lazy<Vec<Rule>> = Lazy::new(|| {
             markers = ["1"],
             ci = false
         ),
-        // EMAIL —— **拉丁本地部分精确版**（必须排在下面的贪婪版之前！）
-        //
-        // 为什么分成两条同 label 的规则：贪婪版的本地部分允许任意混排 CJK，
-        // 于 `我的邮箱是zhangsan@qq.com` 会把前面的中文正文（最长 64 字）
-        // 一起吞进占位符。正则引擎按起点从左到右扫描，单条正则无法「优先选
-        // 后起的拉丁起点」，只能靠**规则顺序**：先跑这条把邮箱本体遮掉，
-        // 贪婪版随后看到的已是占位符（防污染跳过），自然不会再吞正文。
-        //
-        // 关键实现：CJK 前缀写进正则并用 **value_group=1** 把它排除在替换范围
-        // 外 —— 这样既保证「只在 CJK 紧邻邮箱（≥5 字，即正文而非姓名）时才
-        // 介入」，又不多余扫一遍普通邮箱（实测与单规则时性能持平）。正则已保证
-        // 「≥5 个 CJK」，所以边界检查就是通用 `email_l`。
-        rule!(
-            "EMAIL",
-            r"(?:[\u{4e00}-\u{9fff}]){5,}?([a-zA-Z0-9_][A-Za-z0-9._%+\-]{0,63}@[a-zA-Z0-9\-]+(?:\.[a-zA-Z0-9\-]+)*\.(?:[a-zA-Z]{2,}|[\u{4e00}-\u{9fff}]{2,}))",
-            1,
-            [email_l, email_r],
-            exempt = false,
-            avoid = true,
-            markers = ["@"],
-            ci = false
-        ),
         // EMAIL（CONNSTR 之后！左/右边界下沉）
         //
         // TLD 用**同质交替** `(?:[A-Za-z]{2,}|[CJK]{2,})` 而不是单一混合类：
@@ -1432,9 +1410,8 @@ mod tests {
 
     #[test]
     fn rules_compile() {
-        // 32 条对齐 Python 版 + 本版新增的 3 条（IPV6_PUBLIC / SSH_PUBKEY /
-        // EMAIL 拉丁精确版）
-        assert_eq!(RULES.len(), 35);
+        // 32 条对齐 Python 版 + 本版新增的 2 条（IPV6_PUBLIC / SSH_PUBKEY）
+        assert_eq!(RULES.len(), 34);
         for r in RULES.iter() {
             assert!(!r.rx.as_str().is_empty());
         }
@@ -1608,19 +1585,53 @@ mod tests {
         }
     }
 
-    /// EMAIL：中文正文不得被吞进占位符；中文姓名仍整体命中；不因长 CJK 前缀漏检。
+    /// EMAIL：**整段 CJK + 邮箱一起遮**（不做「保留正文」的裁剪）。
+    ///
+    /// 为什么不做裁剪：为了让中文正文不被吞进占位符，曾尝试用「CJK 前缀 + value_group
+    /// 只替换邮箱本体」把前缀排除在替换范围外。但 CJK 前导段究竟是**正文**还是
+    /// **姓名**（本地部分的一部分）无法区分 —— 只要把前导 CJK 排除在替换范围外，
+    /// 紧随的姓名就会残留明文（`我的邮箱是张三2024@qq.com` → `张三` 留在明文）。
+    ///
+    /// 结构性论证：记 R = 邮箱前连续 CJK 长度、P = 保留长度、A = 遮掉长度（P+A=R）。
+    /// 要「正文可辨」需 P ≥ 5（把 ≥5 字当前缀），于是 A = min(R-5, 4)；
+    /// 2 字姓名在 R ≤ 6 时（A ≤ 1）**必然泄漏**。降低 P 下限则 A 增大但 P 变小，
+    /// 「保留正文」失去意义，且 R = P 时依旧泄漏 —— 与阈值取值无关。
+    ///
+    /// 按项目「漏检（PII 原文上行）比误报更不可接受」的原则，选择**不裁剪**：
+    /// 宁可多遮几个中文字（过度脱敏、可完整还原），也不让姓名落到上游。
     #[test]
-    fn email_keeps_chinese_prose_and_cjk_local_part() {
-        // 正文（连续 CJK ≥ 5）不得被吞
-        assert_eq!(
-            mask_hits("EMAIL", "我的邮箱是zhangsan@qq.com"),
-            vec!["zhangsan@qq.com"]
-        );
-        assert_eq!(
-            mask_hits("EMAIL", "请联系我们或发邮件至support@example.com办理"),
-            vec!["support@example.com"]
-        );
-        // 中文姓名（CJK ≤4）必须与邮箱一起整体命中，不能只遮后半截
+    fn email_masks_whole_cjk_run_without_leaking_names() {
+        // 三轮 review 提出的反例：不得只遮后半截而把姓名留在明文。
+        // 用真实引擎断言「遮敏后的输出不含姓名」，并用规则层断言命中范围含姓名。
+        use crate::mask::engine::{CustomWords, MaskCtx};
+        use crate::mask::session::SessionStore;
+        let mut cfg = crate::config::Config::default();
+        for k in crate::config::ALL_BUILTIN_RULES {
+            cfg.mask.builtin_rules.insert(k.to_string(), true);
+        }
+        let store = SessionStore::new();
+        store.new_session("cjk");
+        let custom = CustomWords::build(&cfg);
+        let ctx = MaskCtx::new(&cfg, &store, "cjk".into(), &custom);
+        for (text, name) in [
+            ("我的邮箱是张三2024@qq.com", "张三"),
+            ("请联系王五2024@qq.com", "王五"),
+            ("邮箱是李四@qq.com", "李四"),
+        ] {
+            let masked = ctx.mask(text);
+            assert!(
+                !masked.contains(name),
+                "姓名不得残留明文：{text} -> {masked}"
+            );
+            // 规则层：命中范围必须包含姓名与完整邮箱
+            let hit = mask_hits("EMAIL", text);
+            assert_eq!(hit.len(), 1, "应命中一次：{text} -> {hit:?}");
+            assert!(
+                hit[0].contains(name) && hit[0].ends_with("@qq.com"),
+                "命中范围应含「姓名 + 完整邮箱」：{text} -> {hit:?}"
+            );
+        }
+        // 中文姓名/中文本地部分：整体命中
         assert_eq!(
             mask_hits("EMAIL", "张三2024@qq.com"),
             vec!["张三2024@qq.com"]
@@ -1630,27 +1641,21 @@ mod tests {
             vec!["李四_work@qq.com"]
         );
         assert_eq!(mask_hits("EMAIL", "张三@qq.com"), vec!["张三@qq.com"]);
-        // 纯中文正文 + 中文本地部分：整段 CJK 依旧整体遮住（不泄露姓名）
         assert_eq!(
             mask_hits("EMAIL", "联系人张三@qq.com"),
             vec!["联系人张三@qq.com"]
         );
-        // 超长 CJK 前缀（旧实现在这里整段漏检）
+        // 超长 CJK 前缀（旧实现在这里整段漏检）：至少遮住邮箱本体
         let long = format!("{}zhangsan@qq.com", "汉".repeat(65));
-        assert_eq!(
-            mask_hits("EMAIL", &long),
-            vec!["zhangsan@qq.com"],
-            "65 个连续汉字不得导致邮箱整段漏检"
-        );
-        // 纯中文本地部分 + 超长 CJK 前缀：贪婪版只能从「后缀」开始匹配，
-        // 若左边界一律拒绝 CJK 前一字符，就会整段漏检（PII 上行）。
+        let hit = mask_hits("EMAIL", &long);
+        assert_eq!(hit.len(), 1, "65 个连续汉字不得导致邮箱整段漏检");
+        assert!(hit[0].ends_with("zhangsan@qq.com"), "实际 {hit:?}");
+        // 纯中文本地部分 + 超长 CJK 前缀：若左边界一律拒绝 CJK 前一字符，
+        // 贪婪版只能从「后缀」开始匹配 → 整段漏检（PII 上行）。
         let long_cjk_local = format!("{}张三@qq.com", "汉".repeat(65));
         let hit = mask_hits("EMAIL", &long_cjk_local);
         assert_eq!(hit.len(), 1, "纯中文邮箱在长 CJK 前缀下不得整段漏检");
-        assert!(
-            hit[0].ends_with("张三@qq.com"),
-            "应至少遮住邮箱本体（可含少量 CJK 上下文），实际 {hit:?}"
-        );
+        assert!(hit[0].ends_with("张三@qq.com"), "实际 {hit:?}");
     }
 
     /// TOKEN：Bearer 值必须含数字或符号（纯字母词形正文不算 token）。

@@ -140,10 +140,21 @@ pub fn prefix_match_spans(
         if text[m.end()..].starts_with("@openssh.com") {
             continue;
         }
-        // 短尾且全无数字 → 视为标识符（见 `PREFIX_SHORT_TAIL_MAX`）
+        // 短尾且**尾部**全无数字 → 视为标识符（见 `PREFIX_SHORT_TAIL_MAX`）。
+        //
+        // 只扫尾部而不是整个命中：前缀本身可能含数字（如用户配 `v2-`），
+        // 若把前缀也算进去，每条命中都“含数字”，保护会自动失效。
         if let Some(tail) = prefix_tail_len(m.as_str(), prefixes) {
-            if tail <= PREFIX_SHORT_TAIL_MAX && !m.as_str().bytes().any(|b| b.is_ascii_digit()) {
-                continue;
+            if tail <= PREFIX_SHORT_TAIL_MAX {
+                let s = m.as_str();
+                let total = s.chars().count();
+                let tail_has_digit = s
+                    .chars()
+                    .skip(total.saturating_sub(tail))
+                    .any(|c| c.is_ascii_digit());
+                if !tail_has_digit {
+                    continue;
+                }
             }
         }
         out.push((m.start(), m.end()));
@@ -1214,6 +1225,33 @@ mod tests {
             mask_with(&parts, long_alpha).contains("{{APIKEY_"),
             "长尾全字母仍需命中（不能把长真钥漏掉）"
         );
+    }
+
+    /// 含数字的**前缀**不得让「短尾需数字」的保护失效。
+    ///
+    /// 回归：数字检查若扫整个命中（含前缀），用户配 `v2-` 这类含数字的前缀后，
+    /// 每条命中都“含数字”，标识符保护就自动失效了。必须只扫尾部。
+    #[test]
+    fn prefix_rule_digit_check_ignores_prefix_digits() {
+        let mut cfg = Config::default();
+        for k in crate::config::ALL_BUILTIN_RULES {
+            cfg.mask.builtin_rules.insert(k.to_string(), true);
+        }
+        cfg.mask.secret_prefixes = vec!["v2-".into()];
+        let store = SessionStore::new();
+        store.new_session("t");
+        let custom = CustomWords::build(&cfg);
+        let ctx = MaskCtx::new(&cfg, &store, "t".into(), &custom);
+        // 含数字前缀 + 全字母短尾 → 应视为标识符放行
+        for ident in ["v2_learn_utils_loader", "v2-forecast-model"] {
+            assert_eq!(
+                ctx.mask(ident),
+                ident,
+                "前缀里的数字不得让标识符保护失效：{ident}"
+            );
+        }
+        // 尾部含数字 → 照常命中
+        assert!(ctx.mask("v2-key1234567890").contains("{{APIKEY_"));
     }
 
     #[test]
