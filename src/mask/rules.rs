@@ -108,14 +108,51 @@ fn phone_r(text: &str, m: Match<'_>, _c: &Captures<'_>) -> bool {
     check_not_followed_by(text, m, is_word_char)
 }
 
-/// 邮箱左边界：前一字符不是 `:` 也不是 [A-Za-z0-9._中文]
+/// 取匹配起点之前、**同一个空白分隔 token** 内的文本（最多回看 256 字节）。
+///
+/// 用来判断「这个冒号是不是连接串 userinfo 的冒号」：限定在同一 token 内，
+/// 既精确（不会被别的行的 `://` 误伤）又不会在超长 token 上退化。
+fn token_tail_before(before: &str) -> &str {
+    let start = before
+        .char_indices()
+        .rev()
+        .take_while(|(_, c)| !c.is_whitespace())
+        .last()
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+    // 超长 token：只回看尾部 256 字节（`://` 一定紧跟在 user 之前，够用）
+    let mut b = if before.len() - start > 256 {
+        before.len() - 256
+    } else {
+        start
+    };
+    while b < before.len() && !before.is_char_boundary(b) {
+        b += 1;
+    }
+    &before[b..]
+}
+
+/// 邮箱左边界：前一字符不是 [A-Za-z0-9._中文]。
+///
+/// **不再用「前一字符是冒号就否决」**（旧实现）。那个规则本意是防连接串
+/// userinfo 的 `pass@host` 被当成邮箱，但副作用是**所有**「标签:邮箱」
+/// 无空格写法全部漏检 —— `mailto:alice@example.com`、`Email:alice@…`、
+/// `收件人:bob@corp.cn;cc:carol@corp.cn` 都是常见写法，漏检 = PII 原文上行。
+///
+/// 现在把冒号否决**收窄为真正的连接串形态**：仅当同一 token 里出现过
+/// `://`（即 `scheme://user:pass@host` 的 userinfo）才否决。于是：
+/// * `redis://user:password@example.com` → 否决（不把口令当邮箱）；
+/// * `mailto:` / `Email:` / `收件人:` / 中文全角 `：` → 正常命中；
+/// * `https://host/?email=a@b.com` → 邮箱前是 `=`，本来就不进冒号分支。
 fn email_l(text: &str, m: Match<'_>, _c: &Captures<'_>) -> bool {
     if m.start() == 0 {
         return true;
     }
-    match text[..m.start()].chars().next_back() {
-        Some(':') => false,
-        Some(c) => !is_word_char_cn(c) && c != '.',
+    let before = &text[..m.start()];
+    match before.chars().next_back() {
+        Some('.') => false,
+        Some(':') => !token_tail_before(before).contains("://"),
+        Some(c) => !is_word_char_cn(c),
         None => true,
     }
 }
@@ -144,6 +181,34 @@ fn apikey_r(text: &str, m: Match<'_>, _c: &Captures<'_>) -> bool {
 /// 保留 `my-ding…` / `x_ding…` / 行首等分隔符形态。
 fn alpha_l(text: &str, m: Match<'_>, _c: &Captures<'_>) -> bool {
     check_not_preceded_by(text, m, |c| c.is_ascii_alphabetic())
+}
+
+/// 两段原文片段是否**区间重叠**（仅靠文本，不需坐标）。
+///
+/// 为什么需要它：CONNSTR 被否决时要豁免其中的 `pass@host`，但 CONNSTR 命中
+/// 形如 `scheme://user:pass@`，而 EMAIL 命中形如 `pass@host` —— 二者是
+/// **后缀/前缀部分重叠**（既非包含也非被包含），所以需要真正的前后缀重叠判定。
+///
+/// 为什么不用坐标：每条规则命中后会 splice 改写 `out`，占位符长度 ≠ 原文，
+/// 后继规则的坐标空间已偏移；用坐标会误判（CONNSTR 同时有命中与否决时
+/// 必然错位）。文本重叠与坐标无关，因此不受影响。
+pub fn overlaps(a: &str, b: &str) -> bool {
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    if a.contains(b) || b.contains(a) {
+        return true;
+    }
+    let (ab, bb) = (a.as_bytes(), b.as_bytes());
+    let max = ab.len().min(bb.len());
+    (1..=max).any(|k| ab[ab.len() - k..] == bb[..k] || bb[bb.len() - k..] == ab[..k])
+}
+
+/// 钉钉 AppKey 后缀必须含至少一位数字（下沉 `(?=[a-z0-9]*[0-9])`；
+/// `regex` crate 无环视）。真实 AppKey 是随机串，`dingtalkwebhookurl` /
+/// `dingtalknotificationtemplate` 这类英文词根标识符则无数字。
+fn ding_suffix_has_digit(text: &str, m: Match<'_>, _c: &Captures<'_>) -> bool {
+    text[m.start()..m.end()].bytes().any(|b| b.is_ascii_digit())
 }
 
 /// Stripe 右边界：[A-Za-z0-9]（不含 -_）
@@ -586,11 +651,20 @@ pub static RULES: Lazy<Vec<Rule>> = Lazy::new(|| {
             markers = ["cli_"],
             ci = false
         ),
+        // 钉钉 AppKey：`ding` + 16 位小写字母/数字（官方文档：unique ID 由
+        // lowercase letters、numbers、`-` 组成，长度 < 32）。
+        //
+        // 为何要求「至少一位数字」：`ding` 是普通英文词根，
+        // `dingtalkwebhookurl` / `dingtalknotificationtemplate` 这类小写连写
+        // 标识符会被整词吃掉（`alpha_l` 只在前面有字母时拦，拦不住词首）。
+        // 代价：全字母的真实 AppKey（随机 16 位无数字，概率约 (26/36)^16 ≈ 0.6%）
+        // 会漏检。权衡依据：AppKey 是**应用标识**而非密钥（真正的凭据是
+        // AppSecret），漏检危害远低于把普通标识符改写成占位符对上游的干扰。
         rule!(
             "API_KEY",
             r"ding[a-z0-9]{12,}",
             0,
-            [alpha_l, lowercase_r],
+            [alpha_l, ding_suffix_has_digit, lowercase_r],
             exempt = false,
             avoid = false,
             markers = ["ding"],
@@ -686,10 +760,15 @@ pub static RULES: Lazy<Vec<Rule>> = Lazy::new(|| {
             markers = ["1"],
             ci = false
         ),
-        // EMAIL（CONNSTR 之后！左/右边界 + `(?<!:)` 下沉）
+        // EMAIL（CONNSTR 之后！左/右边界下沉）
+        //
+        // TLD 用**同质交替** `(?:[A-Za-z]{2,}|[CJK]{2,})` 而不是单一混合类：
+        // 混合类会把中文正文粘进 TLD —— `zhangsan@qq.com请查收` 的 `com请查收`
+        // 会被整段吃掉，把正文大段挖空。同质交替在 latin/CJK 边界自然停下，
+        // 中文 TLD（`.中国`）仍支持。
         rule!(
             "EMAIL",
-            r"[a-zA-Z0-9_\u{4e00}-\u{9fff}][\u{4e00}-\u{9fff}A-Za-z0-9._%+\-]{0,63}@[a-zA-Z0-9\-]+(?:\.[a-zA-Z0-9\-]+)*\.[a-zA-Z\u{4e00}-\u{9fff}]{2,}",
+            r"[a-zA-Z0-9_\u{4e00}-\u{9fff}][\u{4e00}-\u{9fff}A-Za-z0-9._%+\-]{0,63}@[a-zA-Z0-9\-]+(?:\.[a-zA-Z0-9\-]+)*\.(?:[a-zA-Z]{2,}|[\u{4e00}-\u{9fff}]{2,})",
             0,
             [email_l, email_r],
             exempt = false,
@@ -1328,6 +1407,90 @@ mod tests {
             vec!["user@example.com"],
             "首字符类排除 + 是指 + 不进本地部分"
         );
+    }
+
+    /// P1 回归：「标签:邮箱」无空格写法必须命中（不得因冒号一刀切漏检）。
+    ///
+    /// 旧实现只要前一字符是 `:` 就否决，于是 `mailto:` / `Email:` / `收件人:`
+    /// 全部漏检 —— 这些是极常见写法，漏检 = PII 原文上行。
+    #[test]
+    fn email_after_colon_label() {
+        assert_eq!(
+            mask_hits("EMAIL", "mailto:alice@example.com"),
+            vec!["alice@example.com"]
+        );
+        assert_eq!(
+            mask_hits("EMAIL", "Email:alice@example.com"),
+            vec!["alice@example.com"]
+        );
+        assert_eq!(
+            mask_hits("EMAIL", "收件人:bob@corp.cn;cc:carol@corp.cn"),
+            vec!["bob@corp.cn", "carol@corp.cn"]
+        );
+        // URL 查询参数里的邮箱（前一字符是 `=`）
+        assert_eq!(
+            mask_hits("EMAIL", "https://host/?email=alice@example.com"),
+            vec!["alice@example.com"]
+        );
+    }
+
+    /// P1 反向：连接串 userinfo 尾的口令**不得**被当成邮箱。
+    ///
+    /// 冒号否决收窄为「同一 token 里出现过 `://`」，靠这条守住。
+    #[test]
+    fn email_connstr_userinfo_tail_still_rejected() {
+        assert!(mask_hits("EMAIL", "redis://user:password@example.com").is_empty());
+        assert!(mask_hits("EMAIL", "postgres://svc:Zq9xLm2p@db.internal:5432/p").is_empty());
+        // 没有 `://` 的普通冒号写法不受影响
+        assert!(!mask_hits("EMAIL", "收件人:bob@corp.cn").is_empty());
+    }
+
+    /// P3：TLD 采用同质交替，中文正文不得被粘进邮箱。
+    #[test]
+    fn email_tld_stops_at_script_boundary() {
+        // 尾部中文正文必须保留
+        assert_eq!(
+            mask_hits("EMAIL", "zhangsan@qq.com请查收"),
+            vec!["zhangsan@qq.com"]
+        );
+        // 中文 TLD 仍支持
+        assert_eq!(mask_hits("EMAIL", "a@b.中国"), vec!["a@b.中国"]);
+        // 普通邮箱不受影响
+        assert_eq!(
+            mask_hits("EMAIL", "alice@mail.example.co.uk"),
+            vec!["alice@mail.example.co.uk"]
+        );
+    }
+
+    /// P4a：钉钉 AppKey 需含数字，普通英文词根标识符不得被当 AppKey。
+    #[test]
+    fn dingtalk_appkey_requires_digit() {
+        for word in ["dingtalkwebhookurl", "dingtalknotificationtemplate"] {
+            assert!(
+                mask_hits("API_KEY", word).is_empty(),
+                "英文标识符不得当 AppKey：{word}"
+            );
+        }
+        // 真实 AppKey（含数字）仍必须命中
+        assert_eq!(
+            mask_hits("API_KEY", "AppKey=dingbbikazkr7q2kh8s2"),
+            vec!["dingbbikazkr7q2kh8s2"]
+        );
+    }
+
+    /// `overlaps`：前缀/后缀部分重叠必须判真（CONNSTR ↔ EMAIL 豁免依赖它）。
+    #[test]
+    fn overlaps_semantics() {
+        // CONNSTR 命中 vs EMAIL 命中：后缀/前缀部分重叠
+        assert!(overlaps("redis://user:password@", "password@example.com"));
+        assert!(overlaps("password@example.com", "redis://user:password@"));
+        // 包含
+        assert!(overlaps("abcdef", "bcd"));
+        assert!(overlaps("bcd", "abcdef"));
+        // 不相干
+        assert!(!overlaps("abcdef", "xyz"));
+        assert!(!overlaps("", "abc"));
+        assert!(!overlaps("abc", ""));
     }
 
     /// 回归：包名/资源名 + 版本号 + 文件后缀不得命中（email_ok 语义校验拦下）。

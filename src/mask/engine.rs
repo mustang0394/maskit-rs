@@ -370,7 +370,17 @@ impl<'a> MaskCtx<'a> {
         //
         // 性能：先用 RegexSet 单趟预筛出「有候选匹配的规则」，再逐条精细处理。
         // 逐条 captures_iter 在长会话（每轮上千条小消息）上开销显著。
-        let mut exempt_conn: Vec<(usize, usize)> = Vec::new();
+        // 跨规则豁免集（CONNSTR 否决 → EMAIL 跳过）。
+        //
+        // 存**匹配到的原文片段**而不是 `(start, end)` 坐标：
+        // 每条规则命中后会 `splice_spans` 改写 `out`（占位符长度 ≠ 原文），
+        // 于是后继规则的坐标空间已偏移 —— 早期用坐标记录，一旦 CONNSTR 在同
+        // 一次调用里既命中了又否决了（先 splice 移位、后用旧坐标比对），
+        // 豁免判定就会错位。改用**文本区间重叠判定**（`rules::overlaps`）
+        // 后与坐标无关。
+        //
+        // 性能：被否决的 CONNSTR 上限 512 条、每条都很短；仅 EMAIL 会查它。
+        let mut exempt_conn: Vec<String> = Vec::new();
         let candidate: std::collections::HashSet<usize> =
             rules::candidate_rule_indices(&out).into_iter().collect();
         for (rule_idx, rule) in RULES.iter().enumerate() {
@@ -431,17 +441,15 @@ impl<'a> MaskCtx<'a> {
                 }
                 // 语义校验
                 if !rules::semantic_check(rule.label, orig, &out, m0, &caps) {
-                    // CONNSTR 被否决 → 压入豁免区间
+                    // CONNSTR 被否决 → 记下**原文片段**（该段不会被替换，
+                    // 因此后续规则看到的仍是同一段文本）
                     if rule.exempt_on_reject && exempt_conn.len() < 512 {
-                        exempt_conn.push((m0.start(), m0.end()));
+                        exempt_conn.push(m0.as_str().to_string());
                     }
                     continue;
                 }
-                // EMAIL 与豁免区间重叠 → 跳过
-                if rule.avoid_exempt
-                    && exempt_conn
-                        .iter()
-                        .any(|(s, e)| m0.start() < *e && m0.end() > *s)
+                // EMAIL 与任一豁免片段重叠 → 跳过（文本重叠判定，与坐标无关）
+                if rule.avoid_exempt && exempt_conn.iter().any(|s| rules::overlaps(s, m0.as_str()))
                 {
                     continue;
                 }

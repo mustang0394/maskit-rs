@@ -449,7 +449,10 @@ pub fn scan_response_pii(
     };
     let mut found: Vec<EventItem> = Vec::new();
     let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
-    let mut exempt_conn: Vec<(usize, usize)> = Vec::new();
+    // 跨规则豁免集（CONNSTR 否决 → EMAIL 跳过）。
+    // 与 `engine::mask` 同口径：存原文片段而非坐标（那边会因为 splice 而
+    // 坐标失效；本函数虽不 splice，也统一用文本判定避免两边语义漂移）。
+    let mut exempt_conn: Vec<String> = Vec::new();
     for rule in RULES.iter() {
         if !rules::rule_enabled(rule.label, builtin_rules) {
             continue;
@@ -466,15 +469,11 @@ pub fn scan_response_pii(
             }
             if !rules::semantic_check(rule.label, orig, scan_text, m0, &caps) {
                 if rule.exempt_on_reject && exempt_conn.len() < 512 {
-                    exempt_conn.push((m0.start(), m0.end()));
+                    exempt_conn.push(m0.as_str().to_string());
                 }
                 continue;
             }
-            if rule.avoid_exempt
-                && exempt_conn
-                    .iter()
-                    .any(|(s2, e2)| m0.start() < *e2 && m0.end() > *s2)
-            {
+            if rule.avoid_exempt && exempt_conn.iter().any(|s| rules::overlaps(s, m0.as_str())) {
                 continue;
             }
             if known.contains(orig) {

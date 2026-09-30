@@ -74,6 +74,7 @@ MASKIT_RS_DATA_DIR=/var/lib/maskit-rs ./target/release/maskit-rs
   - **SSH 公钥**：`ssh-rsa` / `ssh-ed25519` / `ecdsa-sha2-nistp*` / FIDO `sk-*@openssh.com`，命中「类型 + base64 blob」；blob 会按 SSH wire format 解出来核对内部类型串，几乎不可能误报。注释里的邮箱由 EMAIL 规则单独处理
   - **公网 IPv6**：全局单播 `2000::/3`（排除 RFC 3849 文档段 `2001:db8::/32`）。默认**关闭**，与 IPv4 公网 / IPv6 私网保持一致（网络类文档里地址太常见）
   - SSH **私钥**（`-----BEGIN RSA|OPENSSH … PRIVATE KEY-----` 整块）由 `PRIVATE_KEY` 覆盖，该项默认关闭
+  - **已知误报率（如实声明）**：`CARD`（银行卡）仅靠「位数 + Luhn 校验」判定，而 Luhn 是 1/10 的弱校验 —— 实测 13-19 位、`3-6` 开头的随机数字串有 **~10%** 会通过，即订单号 / 运单号会被误脱敏。这是 Luhn 方案的固有代价（Python 版同样），敏感数字串较多的场景建议**关掉 `CARD`**。
 - **自定义敏感词分组**：分组是独立实体（`mask.custom_word_groups` 有序声明 + `mask.custom_words` 的 `{词: 分组}`），可以**只有名字没有词**——先建组、再往组里加词，不必每次重打分组名；支持组内搜索、重命名、整组/逐词启用、整词匹配、批量粘贴；以 `re:` 开头的词按正则处理
 - **多轮一致性**：同一原文在 TTL 内复用同一占位符（`session_ttl`，默认 600s）
 - **路径感知脱敏**：协议位置字段（`role`/`model`/`id` 等）不动，业务区（工具参数）强制扫描

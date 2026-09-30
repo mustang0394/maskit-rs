@@ -114,8 +114,43 @@ fn is_real_date(y: i32, m: u32, d: u32) -> bool {
     (1..=max_d).contains(&d)
 }
 
+/// 当前年份（**取真实时钟**）。
+///
+/// 为什么不能用常量：身份证年份上界是「今年」——写死年份会在次年静默漏检
+/// （2027 年出生的人，其真实号码从 2027-01-01 起全部判否 → PII 原文上行）。
+/// 早期版本为了避免测试时钟漂移写死 `2026`，属于用生产正确性换测试稳定，
+/// 已修正；测试只需使用「过去的年份」即可保持确定性。
+///
+/// 与 `store::db::today_str` 同算法（Howard Hinnant civil_from_days），
+/// 但只需要年份，故内联避免反向依赖 store 层。
+fn current_year() -> i32 {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let z = (secs / 86400) as i64 + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (if m <= 2 { y + 1 } else { y }) as i32
+}
+
 /// 18 位身份证（对齐 `_idcard18_ok`）：省份 + 真实日期 + ISO 7064 MOD 11-2。
+///
+/// 年份上界取真实当前年（见 `idcard18_ok_at`）。
 pub fn idcard18_ok(num: &str) -> bool {
+    idcard18_ok_at(num, current_year())
+}
+
+/// 同 `idcard18_ok`，但年份上界由调用方给出。
+///
+/// 抽出 `now_year` 参数是为了让「上界随年份变化」这件事**可被确定性地测试**：
+/// 写死常量会让测试「碰巧在当前年通过」，等到次年才爆——这正是之前的 bug 形态。
+fn idcard18_ok_at(num: &str, now_year: i32) -> bool {
     if num.len() != 18 || !num[..17].chars().all(|c| c.is_ascii_digit()) {
         return false;
     }
@@ -128,7 +163,6 @@ pub fn idcard18_ok(num: &str) -> bool {
     if !is_real_date(y, m, d) {
         return false;
     }
-    let now_year = 2026; // 与测试运行期一致；Python 用当前年，这里固定避免时钟漂移
     if !(1880..=now_year).contains(&y) {
         return false;
     }
@@ -252,8 +286,14 @@ const TLD_FILE_EXT_COLLISIONS: &[&str] = &["zip", "mov", "py", "so", "md", "map"
 
 /// 是否为「版本号形态」的域名（`0.87.1` / `4.4.0` / `2024.01.01`）。
 ///
-/// 判据：末段前的标签至少两个是**纯数字**。真实域名的中间标签几乎不会
-/// 是纯数字（`mail.163.com` 只有一个 `163`），而版本号 / 日期必然如此。
+/// 判据：**末段（TLD）之前的标签必须全是纯数字**。
+///
+/// 为什么是「全部」而不是「至少两个」：真实通配 DNS 服务（`nip.io` /
+/// `sslip.io`）的域名形如 `app.10.0.0.1.nip.io` —— 中间有 4 个数字标签，
+/// 但还夹着 `app` / `nip` 这类字母标签。用「至少两个数字」会把它误判成
+/// 版本号，导致 `user@app.10.0.0.1.nip.io` 这类**真实邮箱**不被识别（只靠
+/// IP 规则零碎遮掉中间那段，地址被切碎）。要求「全是数字」后，
+/// `0.87.1.patch` 仍然命中，而 `app.10.0.0.1.nip.io` / `mail.163.com` 不受影响。
 fn version_like_domain(domain: &str) -> bool {
     let labels: Vec<&str> = domain.split('.').collect();
     if labels.len() < 3 {
@@ -261,9 +301,7 @@ fn version_like_domain(domain: &str) -> bool {
     }
     labels[..labels.len() - 1]
         .iter()
-        .filter(|l| !l.is_empty() && l.bytes().all(|b| b.is_ascii_digit()))
-        .count()
-        >= 2
+        .all(|l| !l.is_empty() && l.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// 邮箱校验（对齐 `_email_ok`）：单 @、无连续双点、TLD ≥ 2。
@@ -469,7 +507,7 @@ pub fn ip_public_ok(orig: &str) -> bool {
         return false;
     }
     let [a, b, c, _d] = parts;
-    // 私网/保留段/环回/组播（is_global 的展开）
+    // 私网/保留/文档/环回/组播（对齐 Python `is_global` 的展开）
     let is_private = a == 10
         || (a == 172 && (16..=31).contains(&b))
         || (a == 192 && b == 168)
@@ -477,7 +515,15 @@ pub fn ip_public_ok(orig: &str) -> bool {
         || (a == 100 && (64..=127).contains(&b))
         || a == 127
         || a == 0
+        // IETF 协议专用段 192.0.0.0/24
+        || (a == 192 && b == 0 && c == 0)
+        // TEST-NET-1/2/3（RFC 5737 文档示例段）
         || (a == 192 && b == 0 && c == 2)
+        || (a == 198 && b == 51 && c == 100)
+        || (a == 203 && b == 0 && c == 113)
+        // 6to4 中继（RFC 7526 已弃用）192.88.99.0/24
+        || (a == 192 && b == 88 && c == 99)
+        // 基准测试段 198.18.0.0/15
         || (a == 198 && (b == 18 || b == 19))
         || a >= 224; // 组播 + 保留
     !is_private
@@ -861,8 +907,7 @@ mod tests {
     fn idcard() {
         // 18 位（GB11643 校验位 4）
         assert!(idcard18_ok("110101199003074514"));
-        assert!(!idcard18_ok("11010119900307451X"));
-        // 15 位（省份 11 + 1990-03-07 真实日期）
+        assert!(!idcard18_ok("11010119900307451X")); // 15 位（省份 11 + 1990-03-07 真实日期）
         assert!(idcard15_ok("110101900307451"));
         assert!(!idcard15_ok("065217391304348")); // 省份 06 非法
                                                   // 数值型身份证（校验位合法）
@@ -887,6 +932,18 @@ mod tests {
         assert!(!email_ok("a@b.c")); // TLD 1 位
         assert!(!email_ok("@example.com"));
         assert!(!email_ok("test@exam..com"));
+        // 版本号形态要求「TLD 之前**全是**数字」：nip.io / sslip.io 这类
+        // 通配 DNS 域名（`app.10.0.0.1.nip.io`）夹着字母标签，不得被误杀。
+        for wildcard_dns in [
+            "user@app.10.0.0.1.nip.io",
+            "admin@web.192.168.1.9.sslip.io",
+            "svc@node.127.0.0.1.nip.io",
+        ] {
+            assert!(
+                email_ok(wildcard_dns),
+                "通配 DNS 邮箱不得误杀：{wildcard_dns}"
+            );
+        }
         // 真实域名不得因新增的文件后缀 / 版本号判定被误伤
         for good in [
             "user@mail.company.co.uk",
@@ -964,6 +1021,50 @@ mod tests {
         assert!(!uscc_ok("91100000100003962A")); // 篡改校验位
     }
 
+    /// 出生年份上界必须**跟随真实年份**，不能是写死的常量。
+    ///
+    /// 回归：早先为「避免测试时钟漂移」写死 `2026`。后果是从 2027 年起，
+    /// 2027 年出生的人的真实身份证号全部判否 → 静默漏检、PII 原文上行。
+    /// 这里以参数形式给定「当前年」，所以不依赖机器时钟，能在**任意年份**
+    /// 都验证「当年出生判真 / 次年出生判否」。
+    #[test]
+    fn idcard_birth_year_bound_tracks_year() {
+        let mk = |y: i32| {
+            let body = format!("110105{y:04}0307451");
+            let total: u32 = body
+                .chars()
+                .zip(IDCARD_WEIGHTS.iter())
+                .map(|(c, x)| c.to_digit(10).unwrap() * x)
+                .sum();
+            format!("{body}{}", IDCARD_CODES[(total % 11) as usize] as char)
+        };
+        // 上界随参数移动：同一个号码，在不同「当前年」下结论不同
+        for year in [2026, 2027, 2030, 2099] {
+            assert!(
+                idcard18_ok_at(&mk(year), year),
+                "{year} 年出生、当前年同为 {year} → 必须判真"
+            );
+            assert!(
+                !idcard18_ok_at(&mk(year), year - 1),
+                "{year} 年出生但在 {} 年 → 必须判否（防伪造）",
+                year - 1
+            );
+        }
+        assert!(!idcard18_ok_at(&mk(1879), 2026), "1880 之前判否");
+        // 生产入口（`idcard18_ok`）必须把**真实年份**传给上界。
+        // 局限（如实说明）：若有人在包装层写死「恰好等于当前年」的常量，
+        // 这两条断言在当年仍会通过——只靠时钟无法区分「算出来的」与
+        // 「写死的」，要完全确定性需引入可注入时钟。但从**次年**起它会
+        // 立即失败（旧的 `2026` 常量就是这个形态，已修）。
+        let now = current_year();
+        assert!(now > 2000, "时钟异常：current_year 返回过去年份");
+        assert!(idcard18_ok(&mk(now)), "生产入口必须用真实年份（now={now}）");
+        assert!(
+            !idcard18_ok(&mk(now + 1)),
+            "生产入口不得接受次年出生（now={now}）"
+        );
+    }
+
     #[test]
     fn ip_public() {
         assert!(ip_public_ok("123.57.89.10"));
@@ -972,6 +1073,19 @@ mod tests {
         assert!(!ip_public_ok("1.1.1.1"));
         assert!(!ip_public_ok("114.114.114.114"));
         assert!(!ip_public_ok("1.2.3.4")); // 全个位数 = 版本号
+                                           // RFC 5737 文档段 + IETF 保留段 + 6to4 中继（对齐 Python `is_global`）：
+                                           // 开了 IP_PUBLIC 后，技术文档里的示例地址不得被误脱敏。
+        for doc_ip in [
+            "192.0.2.5",    // TEST-NET-1
+            "198.51.100.5", // TEST-NET-2（此前漏排除）
+            "203.0.113.5",  // TEST-NET-3（此前漏排除）
+            "192.0.0.5",    // IETF 协议专用（此前漏排除）
+            "192.88.99.5",  // 6to4 中继（此前漏排除）
+            "198.18.0.1",   // 基准测试段
+            "198.19.255.1", // 基准测试段
+        ] {
+            assert!(!ip_public_ok(doc_ip), "文档/保留段不得判为公网：{doc_ip}");
+        }
         assert!(!ip_public_ok("192.168.1.1")); // 私网
         assert!(!ip_public_ok("10.0.0.1"));
         assert!(!ip_public_ok("127.0.0.1")); // 环回
