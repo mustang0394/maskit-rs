@@ -76,7 +76,46 @@ pub fn default_secret_prefixes() -> &'static [&'static str] {
     &["sk-", "ah-"]
 }
 
-/// 前缀规则的命中区间（已过滤左边界与 FIDO 类型串特例）。
+/// 前缀规则命中区间的下游策略（与具体前缀集无关）。
+///
+/// * 尾部 8-19 位字符且**不含任何数字** → 不命中。
+///   理由：真实密钥是随机串，几乎必含数字；而 `sk_learn_utils_loader` /
+///   `sk-forecast-model` 这类词首标识符与真钥形状**完全相同**（左边界拦不住），
+///   只能靠「是否含数字」区分。代价如实声明：全字母的短密钥（8-19 位，
+///   假定随机字母数字则概率约 (52/62)^16 ≈ 6%）会漏检 —— 权衡依据是
+///   标识符被整体改写为占位符会直接干扰上游对代码/工具名的理解。
+/// * 尾部 ≥ 20 位 → 保持原样（真 OpenAI key 40+，全字母概率可忽略）。
+const PREFIX_SHORT_TAIL_MAX: usize = 19;
+
+/// 前缀规则下的「尾部」字符数（尾部 = 前缀之后、受长度阈值约束的那一段）。
+/// 返回 None 表示这个 match 不以任何已配置前缀开头（理论上不会发生）。
+///
+/// 前缀里的 `-` 与 `_` 是等价展开的（见 `prefix_regex`），故比对时二者互通。
+fn prefix_tail_len(matched: &str, prefixes: &[String]) -> Option<usize> {
+    let chars: Vec<char> = matched.chars().collect();
+    for p in prefixes {
+        if p.is_empty() {
+            continue;
+        }
+        let pc: Vec<char> = p.chars().collect();
+        if pc.len() > chars.len() {
+            continue;
+        }
+        let hit = pc.iter().zip(chars.iter()).all(|(a, b)| {
+            if *a == '-' || *a == '_' {
+                *b == '-' || *b == '_'
+            } else {
+                a == b
+            }
+        });
+        if hit {
+            return Some(chars.len() - pc.len());
+        }
+    }
+    None
+}
+
+/// 前缀规则的命中区间（已过滤左边界、FIDO 类型串与短尾无数字的情形）。
 ///
 /// 左边界 `(?<![A-Za-z0-9_-])` 手工下沉（regex crate 无环视）：前缀必须落在
 /// 词首。缺了它，`ask_user_question` / `task_queue_processor` /
@@ -85,7 +124,11 @@ pub fn default_secret_prefixes() -> &'static [&'static str] {
 ///
 /// **流量脱敏与日志清洗必须共用本函数**：早期日志清洗直接整段 `replace_all`，
 /// 于是 `ask_user_question` 在 dialog 里被洗成 `a[REDACTED]`，与脱敏行为不一致。
-pub fn prefix_match_spans(text: &str, rx: &regex::Regex) -> Vec<(usize, usize)> {
+pub fn prefix_match_spans(
+    text: &str,
+    rx: &regex::Regex,
+    prefixes: &[String],
+) -> Vec<(usize, usize)> {
     let mut out = Vec::new();
     for m in rx.find_iter(text) {
         if let Some(c) = text[..m.start()].chars().next_back() {
@@ -96,6 +139,12 @@ pub fn prefix_match_spans(text: &str, rx: &regex::Regex) -> Vec<(usize, usize)> 
         // FIDO 安全密钥类型串交给 SSH_PUBKEY 整段处理
         if text[m.end()..].starts_with("@openssh.com") {
             continue;
+        }
+        // 短尾且全无数字 → 视为标识符（见 `PREFIX_SHORT_TAIL_MAX`）
+        if let Some(tail) = prefix_tail_len(m.as_str(), prefixes) {
+            if tail <= PREFIX_SHORT_TAIL_MAX && !m.as_str().bytes().any(|b| b.is_ascii_digit()) {
+                continue;
+            }
         }
         out.push((m.start(), m.end()));
     }
@@ -108,7 +157,7 @@ pub fn prefix_match_spans(text: &str, rx: &regex::Regex) -> Vec<(usize, usize)> 
 /// 避免「流量里没脱敏、日志里被洗掉」的错位。
 pub fn redact_prefixes(text: &str, prefixes: &[String], replacement: &str) -> Option<String> {
     let rx = prefix_regex(prefixes)?;
-    let spans = prefix_match_spans(text, &rx);
+    let spans = prefix_match_spans(text, &rx, prefixes);
     if spans.is_empty() {
         return Some(text.to_string());
     }
@@ -328,7 +377,7 @@ impl<'a> MaskCtx<'a> {
                 let ph_rx = placeholder::placeholder_rx();
                 // 命中区间的边界判定（左边界 + FIDO 特例）统一走 `prefix_match_spans`，
                 // 与日志清洗共用一套语义，避免两边漂移。
-                for (s, e) in prefix_match_spans(&out, &rx) {
+                for (s, e) in prefix_match_spans(&out, &rx, &self.cfg.mask.secret_prefixes) {
                     let slice = &out[s..e];
                     if ph_rx.is_match(slice) {
                         continue;
@@ -1114,16 +1163,57 @@ mod tests {
         assert!(hit.contains("{{APIKEY_"));
         // 分隔符左邻（引号 / 等号 / 括号 / 行首）照常命中
         for ctxs in [
-            r#""sk-abcdefghijklmnop""#,
+            r#""sk-abcdefghijklmnop1""#,
             "OPENAI=sk-proj-abcdefghijklmnop",
-            "(ah-abcdefghijklmnop)",
-            "sk-abcdefghijklmnop",
+            "(ah-abcdefghijklmnop1)",
+            "sk-abcdefghijklmnop1",
         ] {
             assert!(
                 !mask_with(&parts, ctxs).contains("abcdefghijklmnop"),
                 "正常形态应命中：{ctxs}"
             );
         }
+    }
+
+    /// 前缀规则的「短尾必须有数字」分档（标识符误伤的最后一层防线）。
+    ///
+    /// 词首的 `sk_`/`sk-` 标识符与真密钥**形状完全相同**，左边界拦不住；
+    /// 只能靠「真密钥是随机串、几乎必含数字」区分。
+    /// 代价（已接受）：8-19 位的全字母短密钥会漏检。
+    #[test]
+    fn prefix_rule_short_tail_requires_digit() {
+        let parts = test_ctx(&[]);
+        // 词首标识符（短尾、无数字）→ 放行
+        for ident in [
+            "sk_learn_utils_loader",
+            "sk-forecast-model",
+            "ah_header_parser",
+        ] {
+            assert_eq!(
+                mask_with(&parts, ident),
+                ident,
+                "短尾无数字的标识符不得当密钥：{ident}"
+            );
+        }
+        // 短尾含数字 → 照常命中（典型真钥形态）
+        for key in [
+            "sk-1234567890abcdef",
+            "ah-key_v2_release",
+            "sk-abcdefghijklmnop1",
+        ] {
+            assert!(
+                mask_with(&parts, key).contains("{{APIKEY_"),
+                "短尾含数字应命中：{key}"
+            );
+        }
+        // 长尾（≥20）不要求数字 —— 真 OpenAI key 40+ 位，全字母概率可忽略
+        let long = "sk-abcdefghijklmnopqrstuvwxyz0123456789ABCD";
+        assert!(mask_with(&parts, long).contains("{{APIKEY_"));
+        let long_alpha = "sk-abcdefghijklmnopqrstuvwxyzABCDEFGHIJ";
+        assert!(
+            mask_with(&parts, long_alpha).contains("{{APIKEY_"),
+            "长尾全字母仍需命中（不能把长真钥漏掉）"
+        );
     }
 
     #[test]

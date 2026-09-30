@@ -804,7 +804,7 @@ async fn mask_test_does_not_pollute_global_store() {
             "POST",
             "/console/api/mask/test",
             Some(
-                r#"{"text":"电话13800138000，邮箱zhangsan@example.com，key sk-abcdefghijklmnop"}"#,
+                r#"{"text":"电话13800138000，邮箱zhangsan@example.com，key sk-proj-abc123def456ghi789"}"#,
             ),
         )
         .await;

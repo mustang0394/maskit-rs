@@ -45,7 +45,12 @@ fn is_word_or_dash(c: char) -> bool {
     is_word_char(c) || c == '-'
 }
 fn is_word_char_cn(c: char) -> bool {
-    c.is_ascii_alphanumeric() || c == '_' || ('\u{4e00}'..='\u{9fff}').contains(&c)
+    c.is_ascii_alphanumeric() || c == '_' || is_cjk(c)
+}
+
+/// CJK 统一表意文字（与各规则正则里的 `\u{4e00}-\u{9fff}` 同一范围）。
+fn is_cjk(c: char) -> bool {
+    ('\u{4e00}'..='\u{9fff}').contains(&c)
 }
 fn is_secret_value_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || "!@#$%^&*_~+=-".contains(c)
@@ -132,7 +137,7 @@ fn token_tail_before(before: &str) -> &str {
     &before[b..]
 }
 
-/// 邮箱左边界：前一字符不是 [A-Za-z0-9._中文]。
+/// 邮箱左边界（贪婪版用）。
 ///
 /// **不再用「前一字符是冒号就否决」**（旧实现）。那个规则本意是防连接串
 /// userinfo 的 `pass@host` 被当成邮箱，但副作用是**所有**「标签:邮箱」
@@ -144,6 +149,11 @@ fn token_tail_before(before: &str) -> &str {
 /// * `redis://user:password@example.com` → 否决（不把口令当邮箱）；
 /// * `mailto:` / `Email:` / `收件人:` / 中文全角 `：` → 正常命中；
 /// * `https://host/?email=a@b.com` → 邮箱前是 `=`，本来就不进冒号分支。
+///
+/// **CJK 前一字符不再拒绝**：贪婪正则会从连续 CJK 段的**起点**开始匹配，
+/// 因此「前一字符是 CJK」只在连续段超过本地部分上限（64）时才会出现
+/// （即匹配到的是后缀）。此时拒绝 = **整段漏检**（PII 原文上行），
+/// 放行至少能把邮箱本体遮住 —— 两害相权取其轻。
 fn email_l(text: &str, m: Match<'_>, _c: &Captures<'_>) -> bool {
     if m.start() == 0 {
         return true;
@@ -152,6 +162,7 @@ fn email_l(text: &str, m: Match<'_>, _c: &Captures<'_>) -> bool {
     match before.chars().next_back() {
         Some('.') => false,
         Some(':') => !token_tail_before(before).contains("://"),
+        Some(c) if is_cjk(c) => true,
         Some(c) => !is_word_char_cn(c),
         None => true,
     }
@@ -302,6 +313,18 @@ fn connstr_word_boundary(text: &str, m: Match<'_>, _c: &Captures<'_>) -> bool {
     // \b：前一个字符是词字符则匹配起点不是词边界 → 不成立
     // Python \b[a-z] 要求 a-z 前是非词字符或行首
     !prev.is_alphanumeric() && prev != '_'
+}
+
+/// Bearer 值必须含至少一位数字或一个非字母字符（`-._~+/=`）。
+///
+/// 真实 token（base64url / hex / JWT）几乎必然满足；而
+/// `Bearer authenticationtokensystem` 这类 20+ 位纯字母正文会被拦下。
+/// 代价：全字母的随机 token（20 位 base64 约 1.6%）会漏检 —— 该规则默认关闭，
+/// 且词形正文比随机 token 常见得多。
+fn bearer_value_has_digit_or_symbol(text: &str, _m: Match<'_>, caps: &Captures<'_>) -> bool {
+    let Some(v) = caps.get(1) else { return false };
+    let _ = text;
+    v.as_str().chars().any(|c| !c.is_ascii_alphabetic())
 }
 
 /// Bearer `\b`（Unicode 词边界 + (?i)）
@@ -519,9 +542,13 @@ fn mac_r(text: &str, m: Match<'_>, _c: &Captures<'_>) -> bool {
 pub static RULES: Lazy<Vec<Rule>> = Lazy::new(|| {
     vec![
         // PEM 私钥整块（Python 同款线性形态：头尾锚定 + {20,}?）
+        //
+        // 可选前缀必须包含 `ENCRYPTED `：PKCS#8 加密私钥是
+        // `-----BEGIN ENCRYPTED PRIVATE KEY-----`（openssl pkcs8 -topk8 的产物，
+        // 备份/中间件配置里很常见）。漏它 = 整块加密私钥原文上行。
         rule!(
             "PRIVATE_KEY",
-            r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY-----[\s\S]{20,}?-----END[^-]*PRIVATE KEY-----",
+            r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP |ENCRYPTED )?PRIVATE KEY-----[\s\S]{20,}?-----END[^-]*PRIVATE KEY-----",
             0,
             [],
             exempt = false,
@@ -708,7 +735,7 @@ pub static RULES: Lazy<Vec<Rule>> = Lazy::new(|| {
             "TOKEN",
             r"(?i)Bearer\s+([A-Za-z0-9._~+/=\-]{20,})",
             1,
-            [bearer_word_boundary],
+            [bearer_value_has_digit_or_symbol, bearer_word_boundary],
             exempt = false,
             avoid = false,
             markers = ["Bearer", "bearer", "BEARER"],
@@ -760,6 +787,28 @@ pub static RULES: Lazy<Vec<Rule>> = Lazy::new(|| {
             markers = ["1"],
             ci = false
         ),
+        // EMAIL —— **拉丁本地部分精确版**（必须排在下面的贪婪版之前！）
+        //
+        // 为什么分成两条同 label 的规则：贪婪版的本地部分允许任意混排 CJK，
+        // 于 `我的邮箱是zhangsan@qq.com` 会把前面的中文正文（最长 64 字）
+        // 一起吞进占位符。正则引擎按起点从左到右扫描，单条正则无法「优先选
+        // 后起的拉丁起点」，只能靠**规则顺序**：先跑这条把邮箱本体遮掉，
+        // 贪婪版随后看到的已是占位符（防污染跳过），自然不会再吞正文。
+        //
+        // 关键实现：CJK 前缀写进正则并用 **value_group=1** 把它排除在替换范围
+        // 外 —— 这样既保证「只在 CJK 紧邻邮箱（≥5 字，即正文而非姓名）时才
+        // 介入」，又不多余扫一遍普通邮箱（实测与单规则时性能持平）。正则已保证
+        // 「≥5 个 CJK」，所以边界检查就是通用 `email_l`。
+        rule!(
+            "EMAIL",
+            r"(?:[\u{4e00}-\u{9fff}]){5,}?([a-zA-Z0-9_][A-Za-z0-9._%+\-]{0,63}@[a-zA-Z0-9\-]+(?:\.[a-zA-Z0-9\-]+)*\.(?:[a-zA-Z]{2,}|[\u{4e00}-\u{9fff}]{2,}))",
+            1,
+            [email_l, email_r],
+            exempt = false,
+            avoid = true,
+            markers = ["@"],
+            ci = false
+        ),
         // EMAIL（CONNSTR 之后！左/右边界下沉）
         //
         // TLD 用**同质交替** `(?:[A-Za-z]{2,}|[CJK]{2,})` 而不是单一混合类：
@@ -777,9 +826,13 @@ pub static RULES: Lazy<Vec<Rule>> = Lazy::new(|| {
             ci = false
         ),
         // 座机
+        //
+        // ⚠️ 国家码分组是**可选**的（`(?:(?:…))?`）。原实现把它写成强制分组，
+        // 导致 `010-62345678` / `(010)62345678` 这类**国内常见写法全部漏检**
+        // （只有带 `+86`/`86`/`(86)` 前缀才命中）—— 默认开启的规则实际形同虚设。
         rule!(
             "LANDLINE",
-            r"(?:\+?86|0086|[\(（]\+?86[\)）])[\s\-]?(?:[\(（]0(?:10|2[0-9]|[3-9][0-9]{2})[\)）][\s\-]?[2-9][0-9]{6,7}|0(?:10|2[0-9]|[3-9][0-9]{2})[\-\s][2-9][0-9]{6,7})(?:[\-\s]?(?:转|分机|ext|x|#)[\-\s]?[0-9]{1,5})?",
+            r"(?:(?:\+?86|0086|[\(（]\+?86[\)）])[\s\-]?)?(?:[\(（]0(?:10|2[0-9]|[3-9][0-9]{2})[\)）][\s\-]?[2-9][0-9]{6,7}|0(?:10|2[0-9]|[3-9][0-9]{2})[\-\s][2-9][0-9]{6,7})(?:[\-\s]?(?:转|分机|ext|x|#)[\-\s]?[0-9]{1,5})?",
             0,
             [landline_l, landline_r],
             exempt = false,
@@ -1133,7 +1186,15 @@ mod tests {
         RULES.iter().filter(|r| r.label == label).collect()
     }
 
+    /// 收集某 label 下所有规则的命中（按规则顺序，且**重叠时先到者胜**）。
+    ///
+    /// 为什么要按重叠去重：一个 label 可以有多条 pattern（如 EMAIL 的
+    /// 「精确拉丁版 + 贪婪版」），同一段文本会被两条都匹配到，且区间**重叠**
+    /// （`zhangsan@qq.com` 在 `我的邮箱是zhangsan@qq.com` 里面）。
+    /// 生产引擎里先执行的规则已把它换成占位符、后续条因「占位符防污染」
+    /// 跳过；测试辅助函数必须同样模拟这点，否则会把执行期互斥误报成两次命中。
     fn mask_hits(label: &str, text: &str) -> Vec<String> {
+        let mut taken: Vec<(usize, usize)> = Vec::new();
         let mut out = Vec::new();
         for r in rule_by_label(label) {
             if !r.may_hit(text) {
@@ -1151,6 +1212,12 @@ mod tests {
                 if !semantic_check(r.label, orig, text, m0, &c) {
                     continue;
                 }
+                // 与已接受的命中区间重叠 → 先到者胜（等价占位符防污染）
+                let (s, e) = (m0.start(), m0.end());
+                if taken.iter().any(|(ts, te)| s < *te && e > *ts) {
+                    continue;
+                }
+                taken.push((s, e));
                 out.push(orig.to_string());
             }
         }
@@ -1365,8 +1432,9 @@ mod tests {
 
     #[test]
     fn rules_compile() {
-        // 32 条对齐 Python 版 + 本版新增的 2 条（IPV6_PUBLIC / SSH_PUBKEY）
-        assert_eq!(RULES.len(), 34);
+        // 32 条对齐 Python 版 + 本版新增的 3 条（IPV6_PUBLIC / SSH_PUBKEY /
+        // EMAIL 拉丁精确版）
+        assert_eq!(RULES.len(), 35);
         for r in RULES.iter() {
             assert!(!r.rx.as_str().is_empty());
         }
@@ -1491,6 +1559,111 @@ mod tests {
         assert!(!overlaps("abcdef", "xyz"));
         assert!(!overlaps("", "abc"));
         assert!(!overlaps("abc", ""));
+    }
+
+    /// PRIVATE_KEY 必须覆盖 PKCS#8 **加密**私钥（`ENCRYPTED PRIVATE KEY`）。
+    ///
+    /// 回归：可选前缀交替里没有 `ENCRYPTED `，于是
+    /// `-----BEGIN ENCRYPTED PRIVATE KEY-----` 整块私钥原文上行（`openssl
+    /// pkcs8 -topk8` 的产物，备份/中间件配置里很常见）。
+    #[test]
+    fn private_key_covers_encrypted_pkcs8() {
+        let body = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASC"; // 需 ≥20 字符
+        for head in [
+            "PRIVATE KEY",
+            "ENCRYPTED PRIVATE KEY",
+            "RSA PRIVATE KEY",
+            "EC PRIVATE KEY",
+            "DSA PRIVATE KEY",
+            "OPENSSH PRIVATE KEY",
+        ] {
+            let pem = format!("-----BEGIN {head}-----\n{body}\n-----END {head}-----");
+            let hits = mask_hits("PRIVATE_KEY", &pem);
+            assert_eq!(hits.len(), 1, "{head} 应整块命中，实际 {hits:?}");
+            assert_eq!(hits[0], pem, "{head} 命中范围应为整块");
+        }
+    }
+
+    /// LANDLINE 不得强制要求国家码：`010-62345678` 这类国内常见写法必须命中。
+    ///
+    /// 回归：国家码分组被写成**强制**（缺 `?`），结果是默认开启的座机规则
+    /// 实际只认带 `+86`/`86`/`(86)` 前缀的号码，**国内座机全部漏检**。
+    #[test]
+    fn landline_country_code_is_optional() {
+        for ok in [
+            "010-62345678",
+            "010-8234567",
+            "0311-87654321",
+            "(010)62345678",
+            "010-62345678转123",
+            "+86 010-62345678",
+            "0086010-62345678",
+            "(86)010-62345678",
+        ] {
+            assert_eq!(mask_hits("LANDLINE", ok).len(), 1, "座机应命中：{ok}");
+        }
+        // 不应命中的形态
+        for bad in ["01062345678", "010-1234567", "13812345678"] {
+            assert!(mask_hits("LANDLINE", bad).is_empty(), "不应命中：{bad}");
+        }
+    }
+
+    /// EMAIL：中文正文不得被吞进占位符；中文姓名仍整体命中；不因长 CJK 前缀漏检。
+    #[test]
+    fn email_keeps_chinese_prose_and_cjk_local_part() {
+        // 正文（连续 CJK ≥ 5）不得被吞
+        assert_eq!(
+            mask_hits("EMAIL", "我的邮箱是zhangsan@qq.com"),
+            vec!["zhangsan@qq.com"]
+        );
+        assert_eq!(
+            mask_hits("EMAIL", "请联系我们或发邮件至support@example.com办理"),
+            vec!["support@example.com"]
+        );
+        // 中文姓名（CJK ≤4）必须与邮箱一起整体命中，不能只遮后半截
+        assert_eq!(
+            mask_hits("EMAIL", "张三2024@qq.com"),
+            vec!["张三2024@qq.com"]
+        );
+        assert_eq!(
+            mask_hits("EMAIL", "李四_work@qq.com"),
+            vec!["李四_work@qq.com"]
+        );
+        assert_eq!(mask_hits("EMAIL", "张三@qq.com"), vec!["张三@qq.com"]);
+        // 纯中文正文 + 中文本地部分：整段 CJK 依旧整体遮住（不泄露姓名）
+        assert_eq!(
+            mask_hits("EMAIL", "联系人张三@qq.com"),
+            vec!["联系人张三@qq.com"]
+        );
+        // 超长 CJK 前缀（旧实现在这里整段漏检）
+        let long = format!("{}zhangsan@qq.com", "汉".repeat(65));
+        assert_eq!(
+            mask_hits("EMAIL", &long),
+            vec!["zhangsan@qq.com"],
+            "65 个连续汉字不得导致邮箱整段漏检"
+        );
+        // 纯中文本地部分 + 超长 CJK 前缀：贪婪版只能从「后缀」开始匹配，
+        // 若左边界一律拒绝 CJK 前一字符，就会整段漏检（PII 上行）。
+        let long_cjk_local = format!("{}张三@qq.com", "汉".repeat(65));
+        let hit = mask_hits("EMAIL", &long_cjk_local);
+        assert_eq!(hit.len(), 1, "纯中文邮箱在长 CJK 前缀下不得整段漏检");
+        assert!(
+            hit[0].ends_with("张三@qq.com"),
+            "应至少遮住邮箱本体（可含少量 CJK 上下文），实际 {hit:?}"
+        );
+    }
+
+    /// TOKEN：Bearer 值必须含数字或符号（纯字母词形正文不算 token）。
+    #[test]
+    fn bearer_value_requires_digit_or_symbol() {
+        assert!(mask_hits("TOKEN", "Authorization: Bearer authenticationtokensystem").is_empty());
+        for ok in [
+            "Authorization: Bearer abcdefghijklmnopqrstuvwxyz123456",
+            "Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.abc.def",
+            "Authorization: Bearer abcdefghijklmnopqrstuvwxyz-_.~",
+        ] {
+            assert_eq!(mask_hits("TOKEN", ok).len(), 1, "真 token 应命中：{ok}");
+        }
     }
 
     /// 回归：包名/资源名 + 版本号 + 文件后缀不得命中（email_ok 语义校验拦下）。
