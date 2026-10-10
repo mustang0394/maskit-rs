@@ -195,6 +195,13 @@ impl SessionStore {
         self.suffix_index_add(token);
     }
 
+    /// 还原方向（token → 原文）未命中内存时，用 DB 结果回填两张内存表。
+    ///
+    /// 与 [`SessionStore::rehydrate`] 同义，但调用方来自还原路径，命名按方向取。
+    pub fn remember_rev(&self, token: &str, orig: &str, label: &str) {
+        self.rehydrate(orig, token, label);
+    }
+
     pub fn set_ttl(&self, session_ttl_secs: u64) {
         self.ttl_secs.store(
             RECENT_TTL.max(session_ttl_secs),

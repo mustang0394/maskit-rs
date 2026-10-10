@@ -10,12 +10,72 @@
 //! restore()：三遍扫描（严格 → 转义 → 宽松）+ per-channel 扣留缓冲。
 
 use once_cell::sync::Lazy;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 
 use super::placeholder;
 use super::rules::{self, RULES};
 use super::session::{token_taken, SessionStore};
 use crate::config::{is_credential_label, Config};
 use aho_corasick::AhoCorasick;
+
+// ---------------------------------------------------------------------------
+// 还原方向的 DB 兜底查询
+// ---------------------------------------------------------------------------
+
+/// 还原方向（token → 原文）的 DB 兜底查询钩子。
+///
+/// 与签发方向的 `lookup_hook` 对称：内存 `recent_rev` 只是 SQLite 映射表的
+/// 缓存，被 LRU 挤掉（`RECENT_MAX = 10000`）或 TTL 过期后，若还原方向不回查
+/// DB，就会出现「同一会话前几轮还能还原、后面突然把裸占位符下发给 agent」的
+/// 间歇泄漏 —— 而库里其实还留着未过期的映射。
+///
+/// 只在**内存完全未命中**时调用（低频），失败一律静默返回 `None`。
+static REV_LOOKUP_HOOK: Mutex<Option<RevLookupHook>> = Mutex::new(None);
+/// 钩子是否已接线：未接线时（嵌入式调用 / 无事件库）不必为每次未命中上锁。
+static REV_HOOK_READY: AtomicBool = AtomicBool::new(false);
+
+pub type RevLookupHook =
+    std::sync::Arc<dyn Fn(&str) -> Option<(String, String)> + Send + Sync + 'static>;
+
+/// 注入还原方向钩子（`main` 在事件库就绪后调用）。
+pub fn set_rev_lookup_hook(hook: RevLookupHook) {
+    if let Ok(mut g) = REV_LOOKUP_HOOK.lock() {
+        *g = Some(hook);
+        REV_HOOK_READY.store(true, Ordering::Release);
+    }
+}
+
+fn rev_db_lookup(token: &str) -> Option<(String, String)> {
+    if !REV_HOOK_READY.load(Ordering::Acquire) {
+        return None;
+    }
+    let g = REV_LOOKUP_HOOK.lock().ok()?;
+    (g.as_ref()?)(token)
+}
+
+/// 还原时取原文：先查内存，未命中且钩子已接线时回查 DB，命中则回填内存。
+///
+/// `token` 可以是严格/转义/宽松遍给出的**任意形态**，这里统一归一化成
+/// `{{LABEL_suffix}}` 再查库（`placeholder_map.token` 存的就是归一化形态）。
+fn lookup_with_db(store: &SessionStore, token: &str, sid: &str) -> Option<String> {
+    if let Some(orig) = store.lookup(token, sid) {
+        return Some(orig);
+    }
+    let canon = if placeholder::placeholder_rx().is_match(token) {
+        token.to_string()
+    } else {
+        let inner = token.trim_matches(|c| c == '{' || c == '}').trim();
+        if inner.is_empty() {
+            return None;
+        }
+        format!("{{{{{inner}}}}}")
+    };
+    let (orig, label) = rev_db_lookup(&canon)?;
+    // 回填内存：后续同一占位符直接命中，不再打扰 DB。
+    store.remember_rev(&canon, &orig, &label);
+    Some(orig)
+}
 
 // ---------------------------------------------------------------------------
 // 前缀规则（sk-…）
@@ -930,7 +990,7 @@ fn restore_pass(
         let label_raw = caps.get(1).map(|g| g.as_str()).unwrap_or("");
         let suffix = caps.get(2).map(|g| g.as_str()).unwrap_or("");
         let canon = placeholder::canonicalize(label_raw, suffix);
-        let orig = store.lookup(&canon, sid);
+        let orig = lookup_with_db(store, &canon, sid);
         out.push_str(&text[last..m0.start()]);
         match orig {
             Some(o) => {
@@ -969,7 +1029,7 @@ fn restore_pass_escaped(
         let label_raw = caps.get(1).map(|g| g.as_str()).unwrap_or("");
         let suffix = caps.get(2).map(|g| g.as_str()).unwrap_or("");
         let canon = placeholder::canonicalize(label_raw, suffix);
-        let orig = store.lookup(&canon, sid);
+        let orig = lookup_with_db(store, &canon, sid);
         out.push_str(&text[last..m0.start()]);
         match orig {
             Some(o) => {
@@ -1016,13 +1076,13 @@ fn restore_pass_loose(
             .map(|g| g.as_str().trim().to_string())
             .unwrap_or_default();
         let canon = format!("{{{{{}}}}}", tok_body);
-        let orig = store.lookup(&canon, sid);
+        let orig = lookup_with_db(store, &canon, sid);
         let real = if orig.is_none() && whole.starts_with('{') {
             store.suffix_real_token(&canon)
         } else {
             None
         };
-        let orig = orig.or_else(|| real.as_ref().and_then(|r| store.lookup(r, sid)));
+        let orig = orig.or_else(|| real.as_ref().and_then(|r| lookup_with_db(store, r, sid)));
         out.push_str(&text[last..m0.start()]);
         match orig {
             Some(o) => {
@@ -1413,6 +1473,166 @@ mod tests {
     }
 
     /// 安全门回归（对齐 Python `test_t7`）：会话不存在 → 绝不借全局复用表还原。
+    /// D6/C5：还原方向必须也处理**键名**。
+    ///
+    /// 正向 `mask_tree`/`mask_body` 会脱敏键名（`protected_key_names()`
+    /// 之外一律扫描），于是键位置完全可能是占位符；
+    /// 早期 `restore_tree` 只处理值，于是这类占位符原样下发
+    /// 且不计入 `unresolved`（统计上看不见）。
+    #[test]
+    fn restore_tree_restores_key_names() {
+        let parts = test_ctx(&[]);
+        let masked = mask_with(&parts, "电话13800138000");
+        let v: serde_json::Value =
+            serde_json::from_str(&format!("{{\"{masked}\": \"ok\"}}")).unwrap();
+        let mut stats = RestoreStats::default();
+        let out = crate::mask::tree::restore_tree(&v, "t", &parts.1, &mut stats, 0);
+        let s = serde_json::to_string(&out).unwrap();
+        assert!(s.contains("电话13800138000"), "键位占位符必须还原: {s}");
+        assert!(!s.contains("{{"), "不应残留占位符: {s}");
+        assert_eq!(stats.restored, 1);
+    }
+
+    /// 键名还原冲突时**不得静默覆盖丢数据**。
+    ///
+    /// 若模型回显出 `{"占位符": 1, "原文": 2}` 这种键，直接 `insert`
+    /// 会把先写入的那一项吞掉。此时宁可保留占位符键（可见）。
+    #[test]
+    fn restore_tree_key_conflict_does_not_drop_entries() {
+        let parts = test_ctx(&[]);
+        let masked = mask_with(&parts, "13800138000");
+        let v: serde_json::Value =
+            serde_json::from_str(&format!("{{\"{masked}\": 1, \"13800138000\": 2}}")).unwrap();
+        let mut stats = RestoreStats::default();
+        let out = crate::mask::tree::restore_tree(&v, "t", &parts.1, &mut stats, 0);
+        let obj = out.as_object().expect("仍应是对象");
+        assert_eq!(obj.len(), 2, "不得静默丢掉键: {obj:?}");
+        assert_eq!(obj["13800138000"], 2, "原有同名键必须保留");
+    }
+
+    /// 键名还原撞上**同级的普通键**（含 `_`）也不得丢数据。
+    ///
+    /// 回归：冲突预扫早期只收集不含 `_`/`{` 的字面键，
+    /// 于是 `{"占位符": 1, "user_name": 2}` 这种撞名依然依赖键顺序丢数据。
+    #[test]
+    fn restore_tree_key_conflict_with_underscore_key_is_safe() {
+        let parts = test_ctx(&[]);
+        // 自定义词：原文 `user_name` 会被脱敏成 `{{TERM_xxx}}`
+        let parts = {
+            let mut cfg = parts.0;
+            cfg.mask
+                .custom_words
+                .insert("user_name".into(), "TERM".into());
+            let store = SessionStore::new();
+            store.new_session("t");
+            let custom = CustomWords::build(&cfg);
+            (cfg, store, custom)
+        };
+        let masked = mask_with(&parts, "user_name");
+        assert_ne!(masked, "user_name", "预置条件：应被脱敏");
+        // 占位符键在后，普通键 `user_name` 在前
+        let v: serde_json::Value =
+            serde_json::from_str(&format!("{{\"user_name\": 2, \"{masked}\": 1}}")).unwrap();
+        let mut stats = RestoreStats::default();
+        let out = crate::mask::tree::restore_tree(&v, "t", &parts.1, &mut stats, 0);
+        let obj = out.as_object().expect("仍应是对象");
+        assert_eq!(obj.len(), 2, "不得丢键: {obj:?}");
+        assert_eq!(obj["user_name"], 2, "原有普通键必须保留");
+    }
+
+    /// 安全不变量：新增的 DB 回查**不得**绕过
+    /// 「会话不存在 → 绝不还原」的安全门。
+    ///
+    /// 否则任意自造 sid 都能借全局反向跡归把占位符换回原文（越权读取）。
+    #[test]
+    fn rev_db_fallback_does_not_bypass_missing_session_gate() {
+        let parts = test_ctx(&[]);
+        let masked = mask_with(&parts, "13800138000");
+        // 钩子已接线且能命中
+        let m = masked.clone();
+        set_rev_lookup_hook(std::sync::Arc::new(move |token: &str| {
+            if token == m {
+                Some(("13800138000".to_string(), "PHONE".to_string()))
+            } else {
+                None
+            }
+        }));
+        // 会话不存在 → 必须原样返回且只计数不还原
+        parts.1.drop_session("nope");
+        let mut stats = RestoreStats::default();
+        assert_eq!(
+            restore_final(&masked, "nope", false, &parts.1, &mut stats),
+            masked
+        );
+        assert_eq!(stats.restored, 0, "不得还原");
+        assert_eq!(stats.unresolved, 1, "必须如实计数未还原");
+    }
+
+    /// 普通文本不得被误当占位符去查库并误还原。
+    #[test]
+    fn plain_text_is_not_mistaken_for_token_in_db_fallback() {
+        let parts = test_ctx(&[]);
+        // 钩子对任何输入都返回同一原文（模拟狂热的 DB）
+        set_rev_lookup_hook(std::sync::Arc::new(|_t: &str| {
+            Some(("LEAKED".to_string(), "PHONE".to_string()))
+        }));
+        let mut stats = RestoreStats::default();
+        let out = restore_final(
+            "check_user_id and my_var here",
+            "t",
+            false,
+            &parts.1,
+            &mut stats,
+        );
+        assert_eq!(out, "check_user_id and my_var here", "普通标识符不得被改写");
+        assert_eq!(stats.restored, 0);
+    }
+
+    /// D8：还原方向内存未命中时应回查 DB（与签发方向对称）。
+    ///
+    /// 回归：`lookup` 早期只查内存（会话 rev → `recent_rev` →
+    /// `custom_rev`），LRU 淘汰（`RECENT_MAX`）或 TTL 过期后——库里还有
+    /// 未过期的映射——依然查不到，裸占位符会下发给 agent。
+    #[test]
+    fn rev_lookup_falls_back_to_db_hook() {
+        let parts = test_ctx(&[]);
+        // 只脱敏号码本体：这样 `masked` 就是一个完整的占位符，
+        // 便于模拟 DB 返回的‘token → 原文’。
+        let masked = mask_with(&parts, "13800138000");
+        assert!(masked.starts_with("{{") && masked.ends_with("}}"));
+        // 模拟“内存被 LRU 淘殖”：清空两张内存表与会话
+        parts.1.recent_rev.clear();
+        parts.1.recent_fwd.clear();
+        parts.1.drop_session("t");
+        parts.1.new_session("t");
+        // 未接线钩子：只能未还原
+        let mut stats = RestoreStats::default();
+        assert_eq!(
+            restore_final(&masked, "t", false, &parts.1, &mut stats),
+            masked
+        );
+        assert_eq!(stats.unresolved, 1);
+        // 接线钩子（模拟 SQLite 命中）：应还原并回填内存
+        let masked_clone = masked.clone();
+        set_rev_lookup_hook(std::sync::Arc::new(move |token: &str| {
+            if token == masked_clone {
+                Some(("13800138000".to_string(), "PHONE".to_string()))
+            } else {
+                None
+            }
+        }));
+        let mut stats2 = RestoreStats::default();
+        assert_eq!(
+            restore_final(&masked, "t", false, &parts.1, &mut stats2),
+            "13800138000"
+        );
+        assert_eq!(stats2.restored, 1);
+        assert!(
+            parts.1.recent_rev.contains_key(&masked),
+            "DB 命中后应回填内存，避免每次都查库"
+        );
+    }
+
     #[test]
     fn restore_without_session_is_gated() {
         let parts = test_ctx(&[("张三", "TERM")]);

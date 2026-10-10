@@ -180,10 +180,21 @@ pub fn loose_placeholder_rx() -> &'static Regex {
 
 /// 行尾半截占位符（流式扣留判定，`_PARTIAL_RX`）。
 /// 反斜杠封顶 {0,3}、空白封顶 {0,4}，防 O(N²)（对齐 Python 修复）。
+///
+/// 末位分支 `[A-Z0-9]{1,12}_[a-z0-9]{0,5}$` 覆盖**裸形态**（无花括号）残片：
+/// 模型常把占位符降级成 `TERM_bcdfgh`，而还原侧的宽松遍
+/// （`loose_placeholder_rx` 的第二分支）是认这种形态的 —— 若扣留正则不认，
+/// 上游把它拆到两个 chunk 时两半都会被直接下发，且**永远拼不回来**。
+///
+/// 该分支要求后缀不足 6 位才命中，因此**完整**的裸 token（6 位后缀）不会被扣留；
+/// 副作用是「以 `大写词_` 结尾」的普通文本可能被多扣一个 chunk，
+/// 但扣留内容会与下一块精确拼接、并在终止事件/流末补发，不会丢内容。
 pub fn partial_rx() -> &'static Regex {
     static RX: Lazy<Regex> = Lazy::new(|| {
-        Regex::new(r"(?:\\{0,3}\{){1,3}\s{0,4}[A-Za-z0-9_]{0,20}\s{0,4}\\{0,3}\}?\\{0,3}$|\\{1,3}$")
-            .unwrap()
+        Regex::new(
+            r"(?:\\{0,3}\{){1,3}\s{0,4}[A-Za-z0-9_]{0,20}\s{0,4}\\{0,3}\}?\\{0,3}$|\\{1,3}$|[A-Z0-9]{1,12}_[a-z0-9]{0,5}$",
+        )
+        .unwrap()
     });
     &RX
 }
@@ -269,6 +280,15 @@ mod tests {
         assert!(partial_rx().is_match("结尾{{NAME_ab"));
         assert!(partial_rx().is_match("文本\\"));
         assert!(!partial_rx().is_match("普通文本结尾"));
+        // 裸形态残片(无花括号)必须扣留:模型会把占位符降级成 `TERM_bcdfgh`,
+        // 而宽松遍是认这种形态的 —— 不扣留就永远拼不回来。
+        assert!(partial_rx().is_match("电话 TERM_bc"));
+        assert!(partial_rx().is_match("TERM_"), "刚吐出下划线也要扣");
+        // **完整**的裸 token(6 位后缀)不得扣留,否则会白等一个 chunk
+        assert!(!partial_rx().is_match("TERM_bcdfgh"));
+        assert!(!partial_rx().is_match("电话 TERM_bcdfgh"));
+        // 长度上限必须覆盖新分支的理论最大匹配：12(标签)+1(下划线)+5(后缀) = 18
+        const _: () = assert!(PARTIAL_MAX >= 18);
     }
 
     /// 回归：label 与 suffix 之间**必须**有下划线。

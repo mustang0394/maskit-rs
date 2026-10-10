@@ -108,13 +108,32 @@ pub fn process_whole(
     } else if is_ndjson_ct(&c) {
         let mut lines = Vec::new();
         let all: Vec<&str> = text.split('\n').collect();
-        let last = all.len().saturating_sub(1);
+        // `final_frame` 必须落在**最后一个非空行**上。
+        //
+        // 回归：NDJSON body 通常以 `\n` 结尾，`split('\n')` 的最后一项是空串，
+        // 而 `restore_ndjson_line` 对空行直接短路返回 —— 于是**任何通道都拿不到
+        // final 收尾**，被扣住的半截占位符既不还原也不补发。
+        let last = all
+            .iter()
+            .rposition(|l| !l.trim().is_empty())
+            .unwrap_or(all.len().saturating_sub(1));
         for (i, line) in all.iter().enumerate() {
             let r =
                 crate::stream::sse::restore_ndjson_line(line, sid, store, &mut stats, i == last);
             lines.push(r);
         }
-        lines.join("\n")
+        // 与 event-stream 分支对称：流末补发各通道滞留的半截占位符。
+        // 缺这一步时残片会**静默丢弃**（既不下发也不计数）。
+        let mut joined = lines.join("\n");
+        let tail = crate::stream::sse::flush_pending(sid, store, Framing::Ndjson, &mut stats);
+        if !tail.is_empty() {
+            if !joined.ends_with('\n') {
+                joined.push('\n');
+            }
+            joined.push_str(tail.trim_end_matches('\n'));
+            joined.push('\n');
+        }
+        joined
     } else if c.contains("event-stream") {
         let mut blocks = Vec::new();
         for block in text.split("\n\n") {
@@ -620,6 +639,32 @@ mod tests {
         // 结构仍是 NDJSON：逐行可解析
         for line in s.lines().filter(|l| !l.trim().is_empty()) {
             assert!(serde_json::from_str::<serde_json::Value>(line).is_ok());
+        }
+    }
+
+    /// R1：非流式 NDJSON 路径必须补发滞留残片，且 `final_frame` 要落在最后一个
+    /// **非空**行上。
+    #[test]
+    fn ndjson_whole_body_flushes_pending_tail() {
+        let parts = setup();
+        let masked = mask_and_register(&parts, "电话13800138000");
+        let half = masked.len() / 2;
+        let (a, b) = masked.split_at(half);
+        let body = format!(
+            "{}\n{}\n",
+            serde_json::json!({"message": {"content": format!("电话 {a}")}, "done": false}),
+            serde_json::json!({"message": {"content": b}, "done": true})
+        );
+        let cmd = crate::cmdblock::CmdBlockEngine::new(&parts.0);
+        let out = process_whole(body.as_bytes(), "application/x-ndjson", "r", &parts.1, &cmd);
+        let s = String::from_utf8_lossy(&out.body);
+        assert!(!s.contains(&masked), "半截占位符必须被扣留并还原: {s}");
+        assert!(s.contains("13800138000"), "补发后必须出现原文: {s}");
+        for line in s.lines().filter(|l| !l.trim().is_empty()) {
+            assert!(
+                serde_json::from_str::<serde_json::Value>(line).is_ok(),
+                "补发帧必须保持 NDJSON 合法: {line}"
+            );
         }
     }
 

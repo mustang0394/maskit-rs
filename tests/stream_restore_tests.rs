@@ -428,3 +428,221 @@ fn split_placeholder_across_chunks_restores() {
     }
     assert!(leaks.is_empty(), "拆分场景有 {} 条泄漏", leaks.len());
 }
+
+// ---------------------------------------------------------------------------
+// 回归：本轮修复的 8 类「脱敏正常但还原有缺漏」缺陷
+// ---------------------------------------------------------------------------
+
+/// D3/C6：未登记的增量字段（中转自创字段名）也必须能跨事件扣留半截占位符。
+///
+/// 回归：`text_slots` 早期只登记白名单字段，未登记字段落入「逐事件整树兜底」，
+/// 而那条路径**没有跨事件缓冲** —— 占位符被上游拆成两半时两半都还原不了，
+/// agent 直接拿到 `{{TERM_bc` 这样的残片。
+#[test]
+fn unregistered_incremental_fields_hold_split_placeholder() {
+    let (store, tok) = setup();
+    let half = tok.len() / 2;
+    let (a, b) = tok.split_at(half);
+
+    // (名字, framing, 事件1, 事件2) —— 字段名全是不在白名单里的“中转自创”字段
+    let cases: Vec<(&str, Framing, String, String)> = vec![
+        (
+            "responses 自定义 tool 输入增量事件",
+            Framing::Sse,
+            format!("data: {{\"type\":\"response.custom_tool_call_input.delta\",\"output_index\":0,\"delta\":\"{a}\"}}\n\n"),
+            format!("data: {{\"type\":\"response.custom_tool_call_input.delta\",\"output_index\":0,\"delta\":\"{b}\"}}\n\n"),
+        ),
+        (
+            "chat delta.tool_input",
+            Framing::Sse,
+            format!("data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"tool_input\":\"{a}\"}}}}]}}\n\n"),
+            format!("data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"tool_input\":\"{b}\"}}}}]}}\n\n"),
+        ),
+        (
+            "anthropic delta.input_json",
+            Framing::Sse,
+            format!("data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"input_json\":\"{a}\"}}}}\n\n"),
+            format!("data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"input_json\":\"{b}\"}}}}\n\n"),
+        ),
+        (
+            "ollama 自创增量字段",
+            Framing::Ndjson,
+            format!("{{\"message\":{{\"explain\":\"{a}\"}},\"done\":false}}\n"),
+            format!("{{\"message\":{{\"explain\":\"{b}\"}},\"done\":false}}\n"),
+        ),
+    ];
+    let mut leaks = Vec::new();
+    for (name, framing, c1, c2) in &cases {
+        let mut st = StreamState::new(*framing);
+        let mut out = Vec::new();
+        for chunk in [c1, c2] {
+            let (o, _) = st.push(chunk.as_bytes(), "s", &store);
+            out.extend_from_slice(&o);
+        }
+        let (o, _) = st.push(b"", "s", &store);
+        out.extend_from_slice(&o);
+        let s = String::from_utf8_lossy(&out).to_string();
+        if s.contains(a) || s.contains(b) || s.contains(&tok) {
+            leaks.push(*name);
+            println!("❌ {name}\n     {}", s.replace('\n', "⏎"));
+        } else {
+            println!("✅ {name}\n     {}", s.replace('\n', "⏎"));
+        }
+    }
+    assert!(leaks.is_empty(), "未登记增量字段泄漏半截占位符: {leaks:?}");
+}
+
+/// D4：终止事件（`finish_reason` / `message_stop` 等）必须**在终止帧之前**
+/// 把滞留的残片补发出去。
+///
+/// 回归：`terminal_prefixes` 早期只用于给 `restore_channel` 传 `final_channel`，
+/// 补发只在 `[DONE]` 与流末触发 —— 而客户端普遍在 `finish_reason` 处就结束解析、
+/// 停止读取，一旦提前断开，`push(b"")` 永不执行，被扣住的尾巴**彻底丢失**。
+#[test]
+fn terminal_event_flushes_pending_before_finish_reason() {
+    let (store, tok) = setup();
+    // `{}` 的结尾 `}` 会被 partial_rx 当作可能的残片扣留 → arguments 先被置空
+    let start = format!(
+        "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"tool_calls\":[{{\"index\":0,\"id\":\"c1\",\"type\":\"function\",\"function\":{{\"name\":\"f\",\"arguments\":\"{}\"}}}}]}}}}]}}\n\n",
+        "{}"
+    );
+    let finish =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n";
+
+    let mut st = StreamState::new(Framing::Sse);
+    let mut out = String::new();
+    for chunk in [start.as_str(), finish] {
+        let (o, _) = st.push(chunk.as_bytes(), "s", &store);
+        out.push_str(&String::from_utf8_lossy(&o));
+    }
+    println!("{}", out.replace('\n', "⏎"));
+
+    let finish_pos = out
+        .find("\"finish_reason\":\"tool_calls\"")
+        .expect("应有终止帧");
+    let args_pos = out
+        .find("\"arguments\":\"{}\"")
+        .expect("参数必须在终止帧之前下发");
+    assert!(
+        args_pos < finish_pos,
+        "半截参数补发必须排在终止帧之前，否则 agent 在 finish_reason 处组装 tool_call 时拿到空参数:\n{out}"
+    );
+    assert!(!out.contains(&tok));
+}
+
+/// D5/C1：裸形态（无花括号）残片也必须扣留。
+///
+/// 回归：`partial_rx` 早期只认以花括号开头的残片，而宽松遍是认 `LABEL_suffix`
+/// 裸形态的 —— 拆两半时两半都被直接下发，且永远拼不回。
+#[test]
+fn braceless_partial_token_is_held_and_restored() {
+    let (store, tok) = setup();
+    let bare = tok.trim_matches('{').trim_matches('}'); // TERM_xxxxxx
+    let (a, b) = bare.split_at(bare.len() - 3);
+    let ev1 = format!(
+        "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"电话 {a}\"}}}}]}}\n\n"
+    );
+    let ev2 =
+        format!("data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"{b}\"}}}}]}}\n\n");
+
+    let mut st = StreamState::new(Framing::Sse);
+    let mut out = String::new();
+    for chunk in [ev1.as_str(), ev2.as_str()] {
+        let (o, _) = st.push(chunk.as_bytes(), "s", &store);
+        out.push_str(&String::from_utf8_lossy(&o));
+    }
+    let (o, _) = st.push(b"", "s", &store);
+    out.push_str(&String::from_utf8_lossy(&o));
+    println!("{}", out.replace('\n', "⏎"));
+    assert!(!out.contains(a), "裸形态前半截泄漏: {out}");
+    assert!(out.contains("13800138000"), "裸形态占位符必须还原: {out}");
+}
+
+/// R2：跨 chunk 被切开的 UTF-8 多字节字符不能被替换字符打坏。
+///
+/// 回归：早期对每个 chunk 独立 `from_utf8_lossy`，3 字节汉字被切开时两半各变成
+/// 一个 U+FFFD，正文出现**永久乱码**。
+#[test]
+fn split_multibyte_utf8_survives_chunk_boundary() {
+    let (store, _tok) = setup();
+    // 事件里含中文（原生 UTF-8，serde_json 不转义），在“中”字中间切开
+    let text =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"汉字测试\"}}]}\n\n".to_string();
+    let bytes = text.as_bytes();
+    let mid = bytes
+        .windows(3)
+        .position(|w| w == "汉".as_bytes())
+        .expect("fixture 应含中文字符")
+        + 1; // 汉字中间
+
+    let mut st = StreamState::new(Framing::Sse);
+    let mut out = Vec::new();
+    for part in [&bytes[..mid], &bytes[mid..]] {
+        let (o, _) = st.push(part, "s", &store);
+        out.extend_from_slice(&o);
+    }
+    let (o, _) = st.push(b"", "s", &store);
+    out.extend_from_slice(&o);
+    let s = String::from_utf8_lossy(&out).to_string();
+    println!("{}", s.replace('\n', "⏎"));
+    assert!(!s.contains('\u{FFFD}'), "跨 chunk 汉字被打成替换字符: {s}");
+    assert!(s.contains("汉字测试"), "正文必须完整保留: {s}");
+}
+
+/// D4 补遗：`terminal_prefixes` 返回 `None` 的终止事件
+///（`message_stop` / `response.completed` 等）必须收尾**全部**通道。
+///
+/// 回归：初版 `flush_on_terminal` 用 `?` 把 `None` 当“非终止事件”直接
+/// 跳过，恰好漏掉最常见的一类终止路径（客户端在
+/// response.completed 处就停止读取 → `push(b"")` 永不执行 → 残片彻底丢失）。
+#[test]
+fn terminal_event_flushes_held_fragment_without_stream_end() {
+    let (store, tok) = setup();
+    let half = tok.len() / 2;
+    let a = &tok[..half];
+    // 只喂到 response.completed。**不**调 `push(b"")`，
+    // 模拟客户端在终止事件后立即停止读取。
+    let events = [
+        format!("data: {{\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"电话 {a}\"}}\n\n"),
+        "data: {\"type\":\"response.completed\",\"response\":{\"output\":[]}}\n\n".to_string(),
+    ];
+    let mut st = StreamState::new(Framing::Sse);
+    let mut out = String::new();
+    for e in &events {
+        let (o, _) = st.push(e.as_bytes(), "s", &store);
+        out.push_str(&String::from_utf8_lossy(&o));
+    }
+    println!("{}", out.replace('\n', "⏎"));
+    // 半截 token 无法还原，但**必须被补发**（而不是等流末）。
+    assert!(
+        out.contains(a),
+        "终止事件必须把滞留残片补发出去，否则客户端提前断开就永久丢失: {out}"
+    );
+    // 且不得残留 pending（避免流末再补一次，造成重复）
+    let left = store.get("s").map(|s| s.pending.len()).unwrap_or(0);
+    assert_eq!(left, 0, "补发后 pending 应为空");
+}
+
+/// NDJSON 流式的 `done:true` 必须当场收尾全部通道（不能等流末 `push(b"")`）。
+#[test]
+fn ndjson_done_true_flushes_without_stream_end() {
+    let (store, tok) = setup();
+    let a = &tok[..tok.len() / 2];
+    let lines = [
+        format!("{{\"message\":{{\"content\":\"电话 {a}\"}},\"done\":false}}\n"),
+        "{\"message\":{\"content\":\"\"},\"done\":true}\n".to_string(),
+    ];
+    let mut st = StreamState::new(Framing::Ndjson);
+    let mut out = String::new();
+    for l in &lines {
+        let (o, _) = st.push(l.as_bytes(), "s", &store);
+        out.push_str(&String::from_utf8_lossy(&o));
+    }
+    println!("{}", out.replace('\n', "⏎"));
+    assert!(out.contains(a), "done:true 必须补发残片: {out}");
+    assert_eq!(
+        store.get("s").map(|s| s.pending.len()).unwrap_or(0),
+        0,
+        "补发后 pending 应为空"
+    );
+}

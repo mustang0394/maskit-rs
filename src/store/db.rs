@@ -404,6 +404,26 @@ impl EventStore {
         })
     }
 
+    /// 构造「还原方向内存未命中 → 回查 SQLite」的兜底钩子（token → 原文）。
+    ///
+    /// 与 [`EventStore::make_lookup_hook`] 对称，共用同一个只读连接：还原方向
+    /// 的未命中同属低频（只在 LRU 淘汰 / TTL 过期后出现），但不能没有 ——
+    /// 否则库里留着未过期的映射，客户端却会收到裸占位符。
+    pub fn make_rev_lookup_hook(self: &std::sync::Arc<Self>) -> crate::mask::engine::RevLookupHook {
+        let path = self.path.clone();
+        let conn = std::sync::Mutex::new(open_read(&path).ok());
+        std::sync::Arc::new(move |token: &str| {
+            let mut guard = conn.lock().ok()?;
+            let conn = guard.as_mut()?;
+            conn.query_row(
+                "SELECT orig, label FROM placeholder_map WHERE token = ?1 AND expires_at > ?2 LIMIT 1",
+                params![token, crate::store::events::now_secs()],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )
+            .ok()
+        })
+    }
+
     /// 读回未过期的映射（启动时恢复内存表）。
     pub fn load_mappings(&self, limit: usize) -> Vec<(String, String, String)> {
         let Ok(conn) = open_read(&self.path) else {

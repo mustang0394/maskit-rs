@@ -105,6 +105,9 @@ fn main() {
     // 会让并发测试互相把钩子指向别人的库。
     if let Some(es) = &event_store {
         maskit_rs::mask::session::STORE.set_lookup_hook(es.make_lookup_hook());
+        // 还原方向的对称兜底：token → 原文。缺了它，LRU 淘汰 / TTL 过期后
+        // 「脱敏照常、还原查不到」，裸占位符会下发给客户端。
+        maskit_rs::mask::engine::set_rev_lookup_hook(es.make_rev_lookup_hook());
         // `load_mappings` 是 `created_at DESC`（最新优先），与 `warmup_from_events`
         // 期望的输入顺序一致（内部会翻回「旧→新」写入，保证超容量淘汰时先删最旧）。
         let warm = es.load_mappings(maskit_rs::mask::session::RECENT_MAX);

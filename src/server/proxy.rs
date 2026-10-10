@@ -37,6 +37,23 @@ pub struct Pipeline {
     pub custom: std::sync::Arc<CustomWords>,
 }
 
+/// 强制上游以未压缩形态回响应（`accept-encoding: identity`）。
+///
+/// 为什么必须**无条件**注入（不能只看流式）：
+/// 响应侧 `restorable()` 对任何非 identity 的 `content-encoding` 直接返回 false，
+/// 于是 gzip 响应会**整段透传、完全不还原** —— 占位符原样交给客户端，
+/// 且既不产生 RESTORE 事件也不计 `unresolved`（统计上看不见的静默漏）。
+/// 早期只在「body 含 `"stream":true`」时注入，非流式 JSON 全靠客户端头
+/// 碰运气（客户端普遍自带 `accept-encoding: gzip`）。
+///
+/// 本网关在本地 hop-by-hop，压缩收益远小于「占位符泄漏」的代价。
+pub fn force_identity_encoding(headers: &mut HeaderMap) {
+    headers.insert(
+        "accept-encoding",
+        axum::http::HeaderValue::from_static("identity"),
+    );
+}
+
 /// 事件构建辅助。
 #[allow(clippy::too_many_arguments)]
 fn emit(
@@ -204,9 +221,10 @@ pub async fn handler(State(state): State<SharedState>, req: Request) -> Response
                 ..Default::default()
             },
         );
-        // 流式请求声明 identity（对齐 Python：避免压缩导致流式退化）
+        // 脱敏暂停也强制 identity：即便本跳不还原，也不能让下游拿到 gzip
+        // （客户端解压后看到的仍是占位符，且与本网关处理策略不一致）。
         let mut headers = parts.headers.clone();
-        inject_identity_for_stream(&mut headers, &body_bytes);
+        force_identity_encoding(&mut headers);
         return forward_raw(&state, &method_str, &parts.uri, &headers, body_bytes).await;
     }
 
@@ -480,7 +498,7 @@ pub async fn handler(State(state): State<SharedState>, req: Request) -> Response
 
     // 转发（脱敏后的 body）+ 响应侧还原
     let mut headers = parts.headers.clone();
-    inject_identity_for_stream(&mut headers, &body_bytes);
+    force_identity_encoding(&mut headers);
     let out_body = Bytes::from(masked.text.clone().into_bytes());
     // 事件日志 dialog：从**原始**请求体抽对话文本（用户消息）。
     // 这是用户实际发出去的明文，与 items[].original 合起来构成可核对的对照。
@@ -506,25 +524,6 @@ fn extract_dialog_from_raw(raw: &[u8]) -> String {
             let t = String::from_utf8_lossy(raw);
             t.chars().take(512).collect()
         })
-}
-
-/// 流式请求声明 identity（对齐 Python：压缩会让流式接管退化）。
-fn inject_identity_for_stream(headers: &mut HeaderMap, body: &[u8]) {
-    let ct = headers
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    if !is_json_ct(ct) {
-        return;
-    }
-    // 请求体含 "stream":true → 声明 identity
-    let text = String::from_utf8_lossy(body);
-    if text.contains("\"stream\"") && text.contains("true") {
-        headers.insert(
-            "accept-encoding",
-            axum::http::HeaderValue::from_static("identity"),
-        );
-    }
 }
 
 /// 会话键：`<SHA-256(client_ip + 首个 user 内容) 前 8 字节 hex>` + 每请求唯一后缀。
@@ -896,20 +895,17 @@ mod tests {
     }
 
     #[test]
-    fn identity_injection_only_for_stream_json() {
+    fn identity_is_forced_on_pipeline_requests() {
+        // 任何走脱敏管线的请求都必须声明 identity：否则 gzip 响应会被
+        // `response::restorable` 判为不可还原而整段透传（占位符泄漏）。
         let mut h = HeaderMap::new();
         h.insert("content-type", "application/json".parse().unwrap());
-        inject_identity_for_stream(&mut h, br#"{"stream":true}"#);
+        h.insert("accept-encoding", "gzip, br".parse().unwrap());
+        force_identity_encoding(&mut h);
         assert_eq!(h.get("accept-encoding").unwrap(), "identity");
-        // 非流式不动
+        // 无 content-type 也照样注入（非 JSON 请求同样可能带占位符）
         let mut h2 = HeaderMap::new();
-        h2.insert("content-type", "application/json".parse().unwrap());
-        inject_identity_for_stream(&mut h2, br#"{"stream":false}"#);
-        assert!(h2.get("accept-encoding").is_none());
-        // 非 JSON 不动
-        let mut h3 = HeaderMap::new();
-        h3.insert("content-type", "multipart/form-data".parse().unwrap());
-        inject_identity_for_stream(&mut h3, b"binary");
-        assert!(h3.get("accept-encoding").is_none());
+        force_identity_encoding(&mut h2);
+        assert_eq!(h2.get("accept-encoding").unwrap(), "identity");
     }
 }

@@ -293,13 +293,54 @@ pub fn restore_tree(
         ),
         Value::Object(map) => {
             let mut out = Map::new();
+            // 预扫**全部同级键**：还原后的键若与任何一个原键同名，必须让位。
+            //
+            // 模型可能回显出 `{"{{PHONE_xx}}": 1, "13800138000": 2}` 这种
+            // 「占位符键 + 同一原文的字面键」并存的对象；也可能撞上一个含 `_` 的
+            // 普通键（如 `user_name`）。单趟插入时，被撞的键无论排在前面还是后面
+            // 都会让另一项被 `insert` **静默覆盖**（丢数据）。
+            //
+            // 早期版本只收集「不含 `_` / `{` 的字面键」，因此 `user_name` 这类键
+            // 撞名时仍会丢数据（次序依赖）——改为全量同级键后闭合。
+            let sibling_keys: std::collections::HashSet<&str> =
+                map.keys().map(String::as_str).collect();
             for (k, v) in map {
                 let escape = super::exemptions::json_str_keys().contains(k.as_str());
                 let restored = match v {
                     Value::String(s) => Value::String(restore_final(s, sid, escape, store, stats)),
                     other => restore_tree(other, sid, store, stats, depth + 1),
                 };
-                out.insert(k.clone(), restored);
+                // 键名同样要还原。
+                //
+                // 正向 `mask_tree`/`mask_body` 会脱敏键名（`protected_key_names()`
+                // 之外一律扫描），因此键位置完全可能被替换成占位符；还原侧早期只
+                // 处理值，于是 `{"{{TERM_xxx}}": "v"}` 这类键位占位符**原样下发
+                // 且不计入 `unresolved`**（统计上看不见的静默漏）。
+                //
+                // 判据用「含 `_` 或 `{`」做廉价预筛，与 `restore_final` 内部的早退
+                // 同义，只是省一次函数调用；协议键名（`max_tokens` 等）不含占位符
+                // 所需的 6 位后缀，不会被误改。
+                //
+                // 撞名时不覆盖：宁可保留未还原的占位符键（可见、且统计里体现），
+                // 也不丢数据。
+                //
+                // 代价：若撞上的那个同级键自己也是占位符（会被还原成别的名字），
+                // 这里会过于谨慎地保留占位符 —— 极罕且仅少还原一个键名，
+                // 优于丢数据。
+                let new_key = if k.contains('_') || k.contains('{') {
+                    let restored_key = restore_final(k, sid, false, store, stats);
+                    if restored_key != *k
+                        && (out.contains_key(restored_key.as_str())
+                            || sibling_keys.contains(restored_key.as_str()))
+                    {
+                        k.clone()
+                    } else {
+                        restored_key
+                    }
+                } else {
+                    k.clone()
+                };
+                out.insert(new_key, restored);
             }
             Value::Object(out)
         }

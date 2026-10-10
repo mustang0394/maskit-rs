@@ -34,6 +34,48 @@ fn response_channel(data: &Value, kind: &str) -> String {
     }
 }
 
+/// 通用增量通道前缀：`c{idx}.x{字段名}` / `a{blk}.x{字段名}` / `o.message.x{字段名}`。
+///
+/// 各家中转的增量字段名远比三大协议文档多（`delta.tool_input`、
+/// `response.custom_tool_call_input.delta` 等）。早期实现只登记白名单字段，
+/// 未登记的字段落入「逐事件整树兜底」—— 而那条路径**没有跨事件缓冲**：
+/// 完整占位符能还原，被上游拆成两半的则两半都还原不了，
+/// 客户端（agent）直接拿到 `{{TERM_bc` 这样的残片。
+///
+/// 这里给已知的增量**容器**里的每个字符串字段都发一个通用通道，
+/// 于是它们都能享受 `restore_channel` 的扣留/拼接能力。
+pub const GENERIC_CHANNEL_PREFIX: char = 'x';
+
+/// 已知的 OpenAI Chat `delta` 字段（这些已有专门通道，不再发通用通道）。
+const CHAT_KNOWN_DELTA_FIELDS: &[&str] = &[
+    "content",
+    "reasoning_content",
+    "reasoning",
+    "reasoning_details",
+    "tool_calls",
+    "function_call",
+    // 非文本结构字段：不需要还原，也不该为它们建扣留通道
+    "role",
+    "type",
+    "index",
+];
+
+/// 已知的 Anthropic `content_block_delta.delta` 字段。
+const ANTHROPIC_KNOWN_DELTA_FIELDS: &[&str] = &["text", "thinking", "partial_json", "type"];
+
+/// 已知的 Responses 增量事件类型（它们已有 `r{oi}.{ci}.{kind}` 专门通道）。
+const RESPONSES_KNOWN_DELTA_TYPES: &[&str] = &[
+    "response.output_text.delta",
+    "response.reasoning_summary_text.delta",
+    "response.reasoning_text.delta",
+    "response.function_call_arguments.delta",
+];
+
+/// 通道名是否属于通用增量通道（`set_slot` 据此回写原字段名）。
+pub fn is_generic_field(field: &str) -> Option<&str> {
+    field.strip_prefix(GENERIC_CHANNEL_PREFIX)
+}
+
 /// 列出 SSE 事件里的增量文本槽位。
 pub fn text_slots(data: &Value) -> Vec<Slot> {
     let mut slots = Vec::new();
@@ -87,6 +129,20 @@ pub fn text_slots(data: &Value) -> Vec<Slot> {
                 {
                     slots.push((format!("c{idx}.fcall"), args.to_string(), true));
                 }
+                // 通用兜底：`delta` 容器里其余字符串字段也当成增量通道
+                // （否则它们没有跨事件扣留能力，见 `GENERIC_CHANNEL_PREFIX`）。
+                for (k, v) in d {
+                    if CHAT_KNOWN_DELTA_FIELDS.contains(&k.as_str()) {
+                        continue;
+                    }
+                    if let Some(s) = v.as_str() {
+                        slots.push((
+                            format!("c{idx}.{GENERIC_CHANNEL_PREFIX}{k}"),
+                            s.to_string(),
+                            false,
+                        ));
+                    }
+                }
             }
             if let Some(s) = c.get("text").and_then(Value::as_str) {
                 slots.push((format!("c{idx}.text"), s.to_string(), false));
@@ -106,6 +162,19 @@ pub fn text_slots(data: &Value) -> Vec<Slot> {
             }
             if let Some(s) = d.get("partial_json").and_then(Value::as_str) {
                 slots.push((format!("a{blk}.pj"), s.to_string(), true));
+            }
+            // 通用兜底：其余字符串字段（如中转自创的 `input_json`/`tool_input`）。
+            for (k, v) in d {
+                if ANTHROPIC_KNOWN_DELTA_FIELDS.contains(&k.as_str()) {
+                    continue;
+                }
+                if let Some(s) = v.as_str() {
+                    slots.push((
+                        format!("a{blk}.{GENERIC_CHANNEL_PREFIX}{k}"),
+                        s.to_string(),
+                        false,
+                    ));
+                }
             }
         }
     }
@@ -128,6 +197,24 @@ pub fn text_slots(data: &Value) -> Vec<Slot> {
         if let Some(s) = obj.get("delta").and_then(Value::as_str) {
             slots.push((response_channel(data, "args"), s.to_string(), true));
         }
+    } else if !etype.is_empty()
+        && etype.ends_with(".delta")
+        && !RESPONSES_KNOWN_DELTA_TYPES.contains(&etype)
+    {
+        // 未登记但形状相同的 Responses 增量事件（如
+        // `response.custom_tool_call_input.delta`、`response.tool_input.delta`）：
+        // 载荷同样是顶层 `delta` 字符串，给它发一个通用通道。
+        // 通道名带上事件类型，避免不同事件的残片互相拼接。
+        if let Some(s) = obj.get("delta").and_then(Value::as_str) {
+            slots.push((
+                format!(
+                    "{}.{GENERIC_CHANNEL_PREFIX}{etype}",
+                    response_channel(data, "gen")
+                ),
+                s.to_string(),
+                etype.contains("arguments") || etype.contains("tool"),
+            ));
+        }
     }
     // Ollama NDJSON 增量（用 "done" 判别）
     if obj.contains_key("done") {
@@ -139,6 +226,18 @@ pub fn text_slots(data: &Value) -> Vec<Slot> {
             // 必须走槽位，否则跨 chunk 的半截占位符会原样下发。
             if let Some(s) = msg.get("thinking").and_then(Value::as_str) {
                 slots.push(("o.message.thinking".into(), s.to_string(), false));
+            }
+            for (k, v) in msg {
+                if k == "content" || k == "thinking" || k == "role" || k == "tool_calls" {
+                    continue;
+                }
+                if let Some(s) = v.as_str() {
+                    slots.push((
+                        format!("o.message.{GENERIC_CHANNEL_PREFIX}{k}"),
+                        s.to_string(),
+                        false,
+                    ));
+                }
             }
         }
         if let Some(s) = obj.get("response").and_then(Value::as_str) {
@@ -158,6 +257,11 @@ pub fn terminal_prefixes(data: &Value) -> Option<Vec<String>> {
         return Some(vec![]);
     };
     let t = obj.get("type").and_then(Value::as_str).unwrap_or("");
+    // Ollama NDJSON：`done: true` 是本流唯一的终止信号，全部通道收尾。
+    // 缺这条时 pending 只能等流末 `push(b"")`，客户端提前断开就会丢残片。
+    if obj.get("done").and_then(Value::as_bool).unwrap_or(false) {
+        return None;
+    }
     match t {
         "message_stop"
         | "message_delta"
@@ -285,6 +389,16 @@ pub fn set_slot(data: &mut Value, channel: &str, text: &str) {
                             }
                         }
                     }
+                    // 通用增量通道：`x{原字段名}` → 按原字段名回写（见 `GENERIC_CHANNEL_PREFIX`）。
+                    // 必须排在 `rd`/`tool` 前缀分支之后（它们更具体）。
+                    f if is_generic_field(f).is_some() => {
+                        let Some(name) = is_generic_field(f) else {
+                            return;
+                        };
+                        if let Some(d) = c.get_mut("delta").and_then(Value::as_object_mut) {
+                            d.insert(name.into(), Value::String(text.into()));
+                        }
+                    }
                     _ => {}
                 }
                 return;
@@ -292,10 +406,15 @@ pub fn set_slot(data: &mut Value, channel: &str, text: &str) {
         }
         return;
     }
-    // a{blk}.text / think / pj
+    // a{blk}.text / think / pj（以及通用通道 `x{原字段名}`）
     if let Some(rest) = channel.strip_prefix('a') {
         if let Some((_blk, field)) = rest.split_once('.') {
             if let Some(d) = data.get_mut("delta").and_then(Value::as_object_mut) {
+                // 通用通道：`xfoo` → 原字段名 `foo`
+                if let Some(name) = is_generic_field(field) {
+                    d.insert(name.into(), Value::String(text.into()));
+                    return;
+                }
                 let key = match field {
                     "think" => "thinking",
                     "pj" => "partial_json",
@@ -315,14 +434,11 @@ pub fn set_slot(data: &mut Value, channel: &str, text: &str) {
         }
         return;
     }
-    // o.message.content / o.message.thinking / o.response / o.thinking
-    if channel == "o.message.content" {
+    // o.message.content / o.message.thinking / o.message.x{字段} / o.response / o.thinking
+    if let Some(rest) = channel.strip_prefix("o.message.") {
         if let Some(msg) = data.get_mut("message").and_then(Value::as_object_mut) {
-            msg.insert("content".into(), Value::String(text.into()));
-        }
-    } else if channel == "o.message.thinking" {
-        if let Some(msg) = data.get_mut("message").and_then(Value::as_object_mut) {
-            msg.insert("thinking".into(), Value::String(text.into()));
+            let key = is_generic_field(rest).unwrap_or(rest);
+            msg.insert(key.into(), Value::String(text.into()));
         }
     } else if channel == "o.response" {
         if let Some(o) = data.as_object_mut() {
@@ -339,6 +455,52 @@ pub fn set_slot(data: &mut Value, channel: &str, text: &str) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn unregistered_delta_fields_get_generic_channels() {
+        // D3/C6：未登记的增量字段也必须拿到独立通道，
+        // 否则它们落入无跨事件缓冲的整树兜底，拆两半就永远拼不回。
+        let chat = json!({"choices": [{"index": 0, "delta": {"tool_input": "abc"}}]});
+        let slots = text_slots(&chat);
+        assert_eq!(slots.len(), 1);
+        assert_eq!(slots[0].0, "c0.xtool_input");
+        // 能回写到原字段
+        let mut d = chat.clone();
+        set_slot(&mut d, &slots[0].0, "xyz");
+        assert_eq!(d["choices"][0]["delta"]["tool_input"], "xyz");
+        // 非文本结构字段不建通道
+        let clean = json!({"choices": [{"index": 0, "delta": {"role": "assistant"}}]});
+        assert!(text_slots(&clean).is_empty());
+    }
+
+    #[test]
+    fn unregistered_responses_delta_type_gets_generic_channel() {
+        let ev = json!({
+            "type": "response.custom_tool_call_input.delta",
+            "output_index": 0,
+            "delta": "{\"p\""
+        });
+        let slots = text_slots(&ev);
+        assert_eq!(slots.len(), 1);
+        assert!(slots[0]
+            .0
+            .contains("xresponse.custom_tool_call_input.delta"));
+        assert!(slots[0].2, "tool/arguments 类增量应按 JSON 转义还原");
+        let mut d = ev.clone();
+        set_slot(&mut d, &slots[0].0, "restored");
+        assert_eq!(d["delta"], "restored");
+    }
+
+    #[test]
+    fn ollama_done_true_is_terminal() {
+        let done = json!({"message": {"content": "x"}, "done": true});
+        assert!(
+            terminal_prefixes(&done).is_none(),
+            "done:true 应收尾全部通道"
+        );
+        let more = json!({"message": {"content": "x"}, "done": false});
+        assert_eq!(terminal_prefixes(&more), Some(vec![]));
+    }
 
     #[test]
     fn openai_chat_slots() {

@@ -24,6 +24,8 @@ pub struct StreamState {
     pub framing: Framing,
     /// 未凑齐分隔符的缓冲
     pub buf: String,
+    /// 不完整的 UTF-8 尾部字节（跨 chunk 被切开的字符）
+    pub utf8_tail: Vec<u8>,
     /// 收集的还原后文本（供审计/响应扫描；上限 256KB）
     pub kept: String,
     pub keep_max: usize,
@@ -40,9 +42,48 @@ impl StreamState {
         Self {
             framing,
             buf: String::new(),
+            utf8_tail: Vec::new(),
             kept: String::new(),
             keep_max: 256 * 1024,
         }
+    }
+
+    /// 把一块字节解码成字符串，**保留尾部不完整的 UTF-8 序列**到下一块。
+    ///
+    /// 回归：早期对每个 chunk 独立 `from_utf8_lossy(data)`。上游 JSON 载荷里是
+    /// 原生 UTF-8（`serde_json` 不转义非 ASCII），一个 3 字节汉字被 TCP / HTTP
+    /// chunk 边界劈成两半时，两半各变成一个 `U+FFFD` —— 还原后的正文出现
+    /// **永久乱码**，与本网关的占位符无关，任何还原遍都救不回。
+    ///
+    /// 这里只拼字节、不丢字节：前缀用 `from_utf8_lossy` 解（真·非法字节仍按
+    /// 替换字符处理，语义不变），尾部 1-3 字节的不完整序列留待下一块。
+    fn decode_chunk(&mut self, data: &[u8]) -> String {
+        let mut bytes: Vec<u8> = std::mem::take(&mut self.utf8_tail);
+        bytes.extend_from_slice(data);
+        let mut cut = bytes.len();
+        // 从末尾回退最多 3 字节，找不完整序列的起点（UTF-8 最长 4 字节）
+        for back in 1..=3usize.min(bytes.len()) {
+            let i = bytes.len() - back;
+            let b = bytes[i];
+            if b & 0x80 == 0 {
+                break; // ASCII：本字节完整，前面不会是被截断的序列
+            }
+            let need = if b >> 5 == 0b110 {
+                2
+            } else if b >> 4 == 0b1110 {
+                3
+            } else if b >> 3 == 0b11110 {
+                4
+            } else {
+                continue; // 续字节（10xxxxxx）：继续向前找
+            };
+            if bytes.len() - i < need {
+                cut = i; // 本序列还差字节 → 扣到下一块
+            }
+            break;
+        }
+        self.utf8_tail = bytes[cut..].to_vec();
+        String::from_utf8_lossy(&bytes[..cut]).to_string()
     }
 
     /// 处理一块数据，返回应当下发的字节（可能为空）。
@@ -55,7 +96,13 @@ impl StreamState {
         store: &SessionStore,
     ) -> (Vec<u8>, RestoreStats) {
         let mut stats = RestoreStats::default();
-        let text = String::from_utf8_lossy(data).to_string();
+        // 流末（`data` 空）时把残留的不完整字节按替换字符吐出去，不留挂账。
+        let text = if data.is_empty() && !self.utf8_tail.is_empty() {
+            let tail = std::mem::take(&mut self.utf8_tail);
+            String::from_utf8_lossy(&tail).to_string()
+        } else {
+            self.decode_chunk(data)
+        };
         self.buf.push_str(&text.replace("\r\n", "\n"));
 
         let mut out = String::new();
@@ -160,6 +207,20 @@ pub fn restore_sse_event(
                 out_lines.push(line.to_string());
                 continue;
             }
+            // 终止事件之前的滞留补发（见下方 `terminal` 处理说明）：必须在
+            // 本事件文本之前吐出，否则客户端在终止事件处就结束解析，残片丢失。
+            if !final_frame {
+                if let Some(prepend) = flush_on_terminal(&data, sid, store, Framing::Sse, stats) {
+                    out_lines.push(String::new());
+                    out_lines.extend(
+                        prepend
+                            .trim_end_matches('\n')
+                            .split('\n')
+                            .map(str::to_string),
+                    );
+                    out_lines.push(String::new());
+                }
+            }
             // 槽位还原
             let terminal = slots::terminal_prefixes(&data);
             let mut restored = data.clone();
@@ -238,6 +299,56 @@ pub fn restore_sse_event(
     out_lines.join("\n")
 }
 
+/// 终止事件（message_stop / response.completed / content_block_stop / finish_reason）
+/// 到达时，先把各通道滞留的半截占位符补发出去。
+///
+/// 为什么必须在**终止事件本身之前**吐出：`flush_pending` 早期只在 `[DONE]` 载荷与
+/// 流末（`push(b"")`）触发，而客户端普遍在 `finish_reason` / `message_stop` 处就
+/// 结束解析、停止读取 —— 一旦它提前断开，`push(b"")` 永不执行，被扣住的尾巴
+/// **彻底丢失**（不是「晚到」，是没了）。
+///
+/// 只在本事件确实是终止事件时触发。返回应当插在本事件之前的补发文本。
+///
+/// `terminal_prefixes` 的**三态**必须严格区分(这里踩过两次坑):
+///
+/// * `None`         → **全部通道**收尾(`message_stop` / `message_delta` /
+///   `response.completed|incomplete|failed`)
+/// * `Some(vec![])` → 本事件**不终止任何通道**(普通 delta 事件)
+/// * `Some([..])`   → 只终止列出的通道
+///
+/// 早期用 `?` 把 `None` 当「非终止」跳过,恰漏掉最常见的一类终止路径;
+/// 改成 `is_empty()` 又把 `Some(vec![])` 错当「全部」,导致每个普通 delta
+/// 都把残片提前吐出去。两者都错。
+fn flush_on_terminal(
+    data: &serde_json::Value,
+    sid: &str,
+    store: &SessionStore,
+    framing: Framing,
+    stats: &mut RestoreStats,
+) -> Option<String> {
+    let (prefixes, all) = match slots::terminal_prefixes(data) {
+        None => (Vec::new(), true),
+        Some(list) if list.is_empty() => return None,
+        Some(list) => (list, false),
+    };
+    let matches = |ch: &str| all || prefixes.iter().any(|p| ch.starts_with(p.as_str()));
+    let has_pending = store
+        .get(sid)
+        .map(|s| s.pending.keys().any(|ch| matches(ch)))
+        .unwrap_or(false);
+    if !has_pending {
+        return None;
+    }
+    // `flush_pending_matching` 的空前缀列表语义 = 全部通道
+    let scope: &[String] = if all { &[] } else { &prefixes };
+    let tail = flush_pending_matching(sid, store, framing, stats, scope);
+    if tail.is_empty() {
+        None
+    } else {
+        Some(tail)
+    }
+}
+
 /// 还原 NDJSON 单行。
 pub fn restore_ndjson_line(
     line: &str,
@@ -257,6 +368,7 @@ pub fn restore_ndjson_line(
         return line.to_string();
     }
     let mut restored = obj.clone();
+    let mut restored_before = String::new();
     let slot_list = slots::text_slots(&restored);
     if !slot_list.is_empty() {
         for (channel, text, escape) in &slot_list {
@@ -275,6 +387,16 @@ pub fn restore_ndjson_line(
                 stats.samples.push(s);
             }
         }
+        // 终止/帧末:先把滞留的残片补发到本行之前(见 `flush_on_terminal` 说明)
+        //
+        // 不按 `final_frame` 门控:NDJSON 流式路径下 `final_frame` 通常为 false，
+        // 而 Ollama 的 `done:true` 就是这一流的终止行 —— 漏了它就只能等
+        // `push(b"")`，客户端提前断开就丢残片。非终止行会被 `flush_on_terminal`
+        // 自身短路返回（`terminal_prefixes` 返回 `Some(vec![])`）。
+        if let Some(pre) = flush_on_terminal(&obj, sid, store, Framing::Ndjson, stats) {
+            restored_before.push_str(pre.trim_end_matches('\n'));
+            restored_before.push('\n');
+        }
         if let Some(mut s) = store.get_mut(sid) {
             for (channel, _, _) in &slot_list {
                 if s.pending.contains_key(channel) {
@@ -285,7 +407,11 @@ pub fn restore_ndjson_line(
                 }
             }
         }
-        return serde_json::to_string(&restored).unwrap_or_else(|_| line.to_string());
+        return format!(
+            "{}{}",
+            restored_before,
+            serde_json::to_string(&restored).unwrap_or_else(|_| line.to_string())
+        );
     }
     let mut st = RestoreStats::default();
     let tree_restored = crate::mask::tree::restore_tree(&restored, sid, store, &mut st, 0);
@@ -348,6 +474,23 @@ pub fn flush_pending(
     framing: Framing,
     stats: &mut RestoreStats,
 ) -> String {
+    flush_pending_matching(sid, store, framing, stats, &[])
+}
+
+/// 只补发**匹配给定通道前缀**的滞留通道（`prefixes` 为空 = 全部）。
+///
+/// 终止事件（`content_block_stop` 等）只需收尾自己那一段，不能把其它仍在
+/// 生成中的通道一起提前吐出去 —— 那会让后续事件的文本错位。
+pub fn flush_pending_matching(
+    sid: &str,
+    store: &SessionStore,
+    framing: Framing,
+    stats: &mut RestoreStats,
+    prefixes: &[String],
+) -> String {
+    let matches = |channel: &str| {
+        prefixes.is_empty() || prefixes.iter().any(|p| channel.starts_with(p.as_str()))
+    };
     let Some(s) = store.get(sid) else {
         return String::new();
     };
@@ -357,11 +500,16 @@ pub fn flush_pending(
     let pending: Vec<(String, String)> = s
         .pending
         .iter()
+        .filter(|(k, _)| matches(k))
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
+    if pending.is_empty() {
+        return String::new();
+    }
     let tmpl: std::collections::HashMap<String, String> = s
         .flush_tmpl
         .iter()
+        .filter(|(k, _)| matches(k))
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
     drop(s);
