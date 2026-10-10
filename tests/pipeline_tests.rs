@@ -587,12 +587,7 @@ async fn hot_update_added_custom_word_gets_deterministic_token() {
     h.state.rebuild_runtime();
 
     // 热更新后必须立即可反向查：custom_fwd/custom_rev 已播种
-    let seeded = h
-        .state
-        .sessions
-        .custom_fwd
-        .get("ltdsj")
-        .map(|r| r.clone());
+    let seeded = h.state.sessions.custom_fwd.get("ltdsj").map(|r| r.clone());
     assert!(
         seeded.is_some(),
         "热更新新增词必须立即进入永久映射（custom_fwd）"
