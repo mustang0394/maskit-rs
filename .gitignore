@@ -20,6 +20,7 @@ core
 *.tmp
 *.orig
 *.rej
+/backups/
 
 # 编辑器
 .idea/

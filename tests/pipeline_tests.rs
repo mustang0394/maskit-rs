@@ -559,6 +559,74 @@ async fn e2e_mask_and_restore_nonstream() {
     assert!(restore.is_some(), "响应侧必须发 RESTORE 事件");
 }
 
+/// 回归：启动后**热更新新增**自定义词（分组 WORK + 词 ltdsj），
+/// 占位符必须是**确定性**映射（{{WORK_nqttjx}}），且端到端还原正常。
+///
+/// 曾缺播种：`rebuild_runtime` 只重建了 `CustomWords` 却没调用 `register_words`，
+/// 新词只能拿到**随机**后缀占位符（用户实测看到的 `{{WORK_kpddxb}}` 正是随机形态）——
+/// 跨重启不稳定，agent 长会话里历史消息的占位符可能还原不回来。
+#[tokio::test]
+async fn hot_update_added_custom_word_gets_deterministic_token() {
+    let h = Harness::new(true, false, true).await;
+
+    // 模拟控制台新增分组 WORK + 词 ltdsj（走 patch_segs + rebuild_runtime）
+    h.state
+        .config
+        .patch_segs(
+            &["mask".into(), "custom_words".into(), "ltdsj".into()],
+            serde_json::json!("WORK"),
+        )
+        .unwrap();
+    h.state
+        .config
+        .patch_segs(
+            &["mask".into(), "custom_word_groups".into()],
+            serde_json::json!(["WORK"]),
+        )
+        .unwrap();
+    h.state.rebuild_runtime();
+
+    // 热更新后必须立即可反向查：custom_fwd/custom_rev 已播种
+    let seeded = h
+        .state
+        .sessions
+        .custom_fwd
+        .get("ltdsj")
+        .map(|r| r.clone());
+    assert!(
+        seeded.is_some(),
+        "热更新新增词必须立即进入永久映射（custom_fwd）"
+    );
+    let token = seeded.unwrap();
+    // 确定性后缀（与 Python `_deterministic_suffix` 同源）
+    assert_eq!(
+        token, "{{WORK_nqttjx}}",
+        "ltdsj 的确定性占位符应为 {{WORK_nqttjx}}，实际 {token}"
+    );
+
+    // 端到端：请求侧 mask + 响应侧还原（SSE 回显）
+    let body = r#"{"model":"gpt-4o","stream":true,
+        "messages":[{"role":"user","content":"当前工作目录 /home/me/ltdsj-test"}]}"#;
+    let (status, resp) = h
+        .send("POST", "/v1/chat/completions", "application/json", body)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    // 上行必须是确定性占位符（而非随机）
+    let up = String::from_utf8_lossy(&h.mock.last_body().unwrap()).to_string();
+    assert!(
+        up.contains("{{WORK_nqttjx}}-test"),
+        "上行应为确定性占位符 {{WORK_nqttjx}}-test，实际：{up}"
+    );
+    assert!(!up.contains("ltdsj-test"), "原文不得上行：{up}");
+    // 客户端收到还原后的原文
+    let text = String::from_utf8_lossy(&resp).to_string();
+    assert!(
+        text.contains("当前工作目录 /home/me/ltdsj-test"),
+        "响应必须还原出原文（实际：{text}"
+    );
+    assert!(!text.contains("{{WORK_"), "不得残留自定义词占位符：{text}");
+}
+
 /// 行 16：**凭据类原文明文入日志**（用户决定：不分类别，全部可看）。
 ///
 /// 原断言为「凭据原文永不落库」，已被 M18 的用户决策推翻；同时下方补了

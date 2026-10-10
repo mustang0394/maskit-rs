@@ -91,7 +91,13 @@ impl AppState {
     /// （真实冒烟实测：改配置后请求仍打到启动时的占位上游 → 502）。
     pub fn rebuild_runtime(&self) {
         let cfg = self.config.get();
-        *self.custom_words.write().unwrap() = Arc::new(CustomWords::build(&cfg));
+        let custom = Arc::new(CustomWords::build(&cfg));
+        // 配置热更新后必须重新播种自定义词映射：
+        // 新增/改名/删除的敏感词要同步进 custom_fwd/custom_rev（永久映射），
+        // 否则新词只能拿到**随机**占位符（跨重启不稳定，历史消息还原不回来）。
+        // 幂等：seed_custom_words 会保留未变词的旧映射、清理已删词。
+        custom.register_words(self.sessions);
+        *self.custom_words.write().unwrap() = custom;
         *self.cmdblock.write().unwrap() = Arc::new(crate::cmdblock::CmdBlockEngine::new(&cfg));
         if let Ok(new_upstream) = UpstreamClient::new(&cfg.upstream) {
             *self.upstream.write().unwrap() = Arc::new(new_upstream);
