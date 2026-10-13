@@ -6,6 +6,7 @@
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use maskit_rs::config::ConfigCenter;
+use maskit_rs::mask::session::SessionStore;
 use maskit_rs::server::{build_router, AppState};
 use maskit_rs::store::events::EventBus;
 use maskit_rs::upstream::UpstreamClient;
@@ -116,6 +117,12 @@ struct Harness {
     mock: MockUpstream,
     _mock_handle: tokio::task::JoinHandle<()>,
     _dir: tempfile::TempDir,
+    /// 本用例独占的会话存储（`Box::leak` 保证 `&'static`）。
+    ///
+    /// 为什么不用全局 `STORE`：`AppState::with_store` 会在 store 上
+    /// `register_words`，而该函数会**删除**不在本次 enabled 列表里的词 ——
+    /// 并发用例会互相删掉对方刚播种的自定义词（CI 实测 flaky）。
+    _store: &'static SessionStore,
 }
 
 impl Harness {
@@ -137,12 +144,14 @@ impl Harness {
 
         let upstream = Arc::new(UpstreamClient::new_or_placeholder(&center.get().upstream));
         let bus = EventBus::new();
-        let state = Arc::new(AppState::new(center, bus, upstream, None));
+        let store: &'static SessionStore = Box::leak(Box::new(SessionStore::new()));
+        let state = Arc::new(AppState::with_store(center, bus, upstream, None, store));
         Harness {
             state,
             mock,
             _mock_handle: handle,
             _dir: dir,
+            _store: store,
         }
     }
 
@@ -204,7 +213,14 @@ async fn matrix_no_upstream_configured() {
     let (center, _) = ConfigCenter::load_or_init(dir.path()).unwrap();
     let upstream = Arc::new(UpstreamClient::new_or_placeholder(&center.get().upstream));
     let bus = EventBus::new();
-    let state = Arc::new(AppState::new(center, bus.clone(), upstream, None));
+    let store: &'static SessionStore = Box::leak(Box::new(SessionStore::new()));
+    let state = Arc::new(AppState::with_store(
+        center,
+        bus.clone(),
+        upstream,
+        None,
+        store,
+    ));
     let app = build_router(state);
     let req = Request::builder()
         .method("POST")
@@ -699,7 +715,8 @@ async fn upstream_unreachable_reports_error() {
     let (center, _) = ConfigCenter::load_or_init(dir.path()).unwrap();
     let upstream = Arc::new(UpstreamClient::new_or_placeholder(&center.get().upstream));
     let bus = EventBus::new();
-    let state = Arc::new(AppState::new(center, bus, upstream, None));
+    let store: &'static SessionStore = Box::leak(Box::new(SessionStore::new()));
+    let state = Arc::new(AppState::with_store(center, bus, upstream, None, store));
     // 未配置上游 → 502
     let app = build_router(state);
     let req = Request::builder()
@@ -931,7 +948,8 @@ async fn unreachable_upstream_does_not_leak_sessions() {
     center.update(cfg);
     let upstream = Arc::new(UpstreamClient::new_or_placeholder(&center.get().upstream));
     let bus = EventBus::new();
-    let state = Arc::new(AppState::new(center, bus, upstream, None));
+    let store: &'static SessionStore = Box::leak(Box::new(SessionStore::new()));
+    let state = Arc::new(AppState::with_store(center, bus, upstream, None, store));
 
     // 全局 STORE 是进程共享的（同文件其它用例并发跑也会增删会话），
     // 因此用「相对基线不随请求数增长」判定，而不是绝对等于 0。
@@ -1032,7 +1050,14 @@ async fn gzip_response_is_decoded_then_restored() {
 
     let upstream = Arc::new(UpstreamClient::new_or_placeholder(&center.get().upstream));
     let bus = EventBus::new();
-    let state = Arc::new(AppState::new(center, bus.clone(), upstream, None));
+    let store: &'static SessionStore = Box::leak(Box::new(SessionStore::new()));
+    let state = Arc::new(AppState::with_store(
+        center,
+        bus.clone(),
+        upstream,
+        None,
+        store,
+    ));
     let app = build_router(state);
 
     let body = serde_json::json!({

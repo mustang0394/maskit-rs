@@ -706,16 +706,30 @@ impl SessionStore {
     }
 }
 
-/// 全局会话存储（进程唯一）。
+impl SessionStore {
+    /// 后缀占用检查（`new_token` 的 `taken` 回调：查 REV 表与后缀索引）。
+    ///
+    /// 为什么要按 **store 实例** 判定而不是全局：并发测试各自建 store 时，
+    /// 全局判定会把**别的用例**的 token/后缀当作已占用，导致同一原文在不同
+    /// 用例里拿到不同后缀（确定性映射断言随机失败）；生产环境只有一个 store，
+    /// 行为与原来一致。
+    pub fn token_taken(&self) -> impl Fn(&str, &str) -> bool + '_ {
+        move |token: &str, suffix: &str| {
+            self.recent_rev.contains_key(token)
+                || self.custom_rev.contains_key(token)
+                || self.recent_suffix.contains_key(suffix)
+        }
+    }
+}
+
+/// 全局会话存储(进程唯一)。
 pub static STORE: Lazy<SessionStore> = Lazy::new(SessionStore::new);
 
-/// 后缀占用检查（new_token 的 taken 回调：查 REV 表与后缀索引）。
+/// 全局 store 的后缀占用检查（保留给未注入 store 的调用方：`tree` 等）。
+///
+/// 新代码应优先用 [`SessionStore::token_taken`]，避免跨用例耦合。
 pub fn token_taken() -> impl Fn(&str, &str) -> bool {
-    |token: &str, suffix: &str| {
-        STORE.recent_rev.contains_key(token)
-            || STORE.custom_rev.contains_key(token)
-            || STORE.recent_suffix.contains_key(suffix)
-    }
+    STORE.token_taken()
 }
 
 #[cfg(test)]

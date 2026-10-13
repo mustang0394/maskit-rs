@@ -24,33 +24,57 @@ use crate::upstream::UpstreamClient;
 pub struct AppState {
     pub config: Arc<ConfigCenter>,
     pub bus: Arc<EventBus>,
-    /// 上游客户端（**配置变更时热重载**：改 upstream.target 无需重启）
+    /// 上游客户端(**配置变更时热重载**:改 upstream.target 无需重启)
     upstream: std::sync::RwLock<Arc<UpstreamClient>>,
-    /// 会话存储（进程唯一）
+    /// 会话存储。生产环境是进程唯一的全局 `STORE`;测试可注入各自实例。
+    ///
+    /// 回归(CI 实测,与 `main.rs` 里钩子那段同源的坑):早期这里硬编码
+    /// `&STORE`,而 `AppState::new` 会在其上 `register_words` —— 该函数会
+    /// **删除**不在本次 enabled 列表里的词。并发测试时,用例 A 刚播种的
+    /// `ltdsj` 会被用例 B 的 `Harness::new` 当「过期词」删掉,断言随机失败。
     pub sessions: &'static SessionStore,
-    /// SQLite 事件库（可选：打开失败时退化为仅内存 ring）
+    /// SQLite 事件库(可选:打开失败时退化为仅内存 ring)
     pub event_store: Option<Arc<crate::store::db::EventStore>>,
     /// 命令拦截引擎
     cmdblock: std::sync::RwLock<Arc<crate::cmdblock::CmdBlockEngine>>,
-    /// 自定义词/正则引擎（配置变更时重建）
+    /// 自定义词/正则引擎(配置变更时重建)
     custom_words: std::sync::RwLock<Arc<CustomWords>>,
 }
 
 impl AppState {
+    /// 用进程全局 `STORE` 构造(生产环境的唯一入口)。
     pub fn new(
         config: Arc<ConfigCenter>,
         bus: Arc<EventBus>,
         upstream: Arc<UpstreamClient>,
         event_store: Option<Arc<crate::store::db::EventStore>>,
     ) -> Self {
+        Self::with_store(
+            config,
+            bus,
+            upstream,
+            event_store,
+            &crate::mask::session::STORE,
+        )
+    }
+
+    /// 注入自定义会话存储(测试用:每个用例一份,避免全局副作用互串)。
+    pub fn with_store(
+        config: Arc<ConfigCenter>,
+        bus: Arc<EventBus>,
+        upstream: Arc<UpstreamClient>,
+        event_store: Option<Arc<crate::store::db::EventStore>>,
+        sessions: &'static SessionStore,
+    ) -> Self {
         let cfg = config.get();
         let custom = Arc::new(CustomWords::build(&cfg));
-        // 播种自定义词确定性占位符（跨重启稳定）
-        custom.register_words(&crate::mask::session::STORE);
+        // 播种自定义词确定性占位符(跨重启稳定)。注意：写的是**本实例的**
+        // store，不是全局 STORE —— 否则并发用例会互相删词。
+        custom.register_words(sessions);
         let cmdblock = Arc::new(crate::cmdblock::CmdBlockEngine::new(&cfg));
-        // 事件/审计落库收束到总线内部：钩子在**赋 id 之后**被调用，
-        // 从而保证库里 id 与内存 ring 一致（早先调用方自己 enqueue，
-        // 库里 id 恒为 0 → 列表能看、点开 404；流式 RESTORE 还完全没落库）。
+        // 事件/审计落库收束到总线内部:钩子在**赋 id 之后**被调用,
+        // 从而保证库里 id 与内存 ring 一致(早先调用方自己 enqueue,
+        // 库里 id 恒为 0 → 列表能看、点开 404;流式 RESTORE 还完全没落库)。
         if let Some(es) = &event_store {
             let e1 = es.clone();
             let e2 = es.clone();
@@ -63,7 +87,7 @@ impl AppState {
             config,
             bus,
             upstream: std::sync::RwLock::new(upstream),
-            sessions: &crate::mask::session::STORE,
+            sessions,
             event_store,
             custom_words: std::sync::RwLock::new(custom),
             cmdblock: std::sync::RwLock::new(cmdblock),

@@ -3,6 +3,7 @@
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use maskit_rs::config::ConfigCenter;
+use maskit_rs::mask::session::SessionStore;
 use maskit_rs::server::{build_router, AppState};
 use maskit_rs::store::db::EventStore;
 use maskit_rs::store::events::EventBus;
@@ -27,7 +28,8 @@ impl Harness {
         let upstream = Arc::new(UpstreamClient::new_or_placeholder(&center.get().upstream));
         let bus = EventBus::new();
         let store = EventStore::open(dir.path()).ok();
-        let state = Arc::new(AppState::new(center, bus, upstream, store));
+        let sessions: &'static SessionStore = Box::leak(Box::new(SessionStore::new()));
+        let state = Arc::new(AppState::with_store(center, bus, upstream, store, sessions));
         Harness {
             state,
             token,
@@ -46,7 +48,14 @@ impl Harness {
         let upstream = Arc::new(UpstreamClient::new_or_placeholder(&center.get().upstream));
         let bus = EventBus::new();
         let store = EventStore::open(dir.path()).unwrap();
-        let state = Arc::new(AppState::new(center, bus, upstream, Some(store)));
+        let sessions: &'static SessionStore = Box::leak(Box::new(SessionStore::new()));
+        let state = Arc::new(AppState::with_store(
+            center,
+            bus,
+            upstream,
+            Some(store),
+            sessions,
+        ));
         Harness {
             state,
             token,

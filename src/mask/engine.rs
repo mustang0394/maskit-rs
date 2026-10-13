@@ -15,7 +15,7 @@ use std::sync::Mutex;
 
 use super::placeholder;
 use super::rules::{self, RULES};
-use super::session::{token_taken, SessionStore};
+use super::session::SessionStore;
 use crate::config::{is_credential_label, Config};
 use aho_corasick::AhoCorasick;
 
@@ -447,7 +447,8 @@ impl<'a> MaskCtx<'a> {
         if text.is_empty() {
             return text.to_string();
         }
-        let taken = token_taken();
+        // 占用判定用**本实例的** store（与生产一致；测试注入不同 store 时互不干扰）。
+        let taken = self.store.token_taken();
         let mut out = text.to_string();
         // 本次 mask 调用命中的原文（用于 last_hits 登记，避免扫全量 fwd）
         let mut hit_acc: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -1142,6 +1143,7 @@ pub fn preview(orig: &str, label: &str) -> String {
 mod tests {
     use super::*;
     use crate::config::Config;
+    use crate::mask::session::token_taken;
 
     /// 全局钩子串行锁：本模块内多个用例会写同一个进程级 `REV_LOOKUP_HOOK`，
     /// 而 `cargo test` 默认**多线程并行** —— 不加锁就会互相覆盖。
