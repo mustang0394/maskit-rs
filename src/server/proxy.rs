@@ -9,6 +9,7 @@ use axum::extract::{Request, State};
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::response::Response;
 use bytes::Bytes;
+use hyper::body::Incoming;
 
 use crate::config::ConfigCenter;
 use crate::detect::{self, Protocol};
@@ -52,6 +53,59 @@ pub fn force_identity_encoding(headers: &mut HeaderMap) {
         "accept-encoding",
         axum::http::HeaderValue::from_static("identity"),
     );
+}
+
+/// 把已解码(或已聚合)响应体的还原结果下发。
+///
+/// 与流式/非流式分支共用同一套头部规则：
+///   * `content-length` 必须去掉(还原会改变长度，响应按 chunked 下发)；
+///   * `eff_enc` 有值时保留 `content-encoding`(解码失败/未解码)；为空时
+///     **必须剥掉**原头 —— 体已是明文，再声明 gzip 会让客户端解压失败。
+fn build_decoded_response(
+    status: StatusCode,
+    outcome: crate::server::response::ResponseOutcome,
+    resp_headers: &hyper::HeaderMap,
+    eff_enc: &str,
+) -> Response {
+    let mut out = Response::builder().status(if outcome.blocked {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        status
+    });
+    if outcome.blocked {
+        let body = serde_json::json!({
+            "error": {"code": "shield_command_blocked",
+                      "reason": "dangerous_command_in_response"}
+        })
+        .to_string();
+        let h = out.headers_mut().unwrap();
+        h.insert("content-type", "application/json".parse().unwrap());
+        return out.body(Body::from(body)).unwrap();
+    }
+    {
+        let h = out.headers_mut().unwrap();
+        for (name, v) in resp_headers.iter() {
+            let n = name.as_str();
+            if n.eq_ignore_ascii_case("content-length") {
+                continue;
+            }
+            // 体已解码为明文：不带 content-encoding（空 eff_enc）时剥头
+            if n.eq_ignore_ascii_case("content-encoding") && eff_enc.is_empty() {
+                continue;
+            }
+            h.insert(name.clone(), v.clone());
+        }
+    }
+    out.body(Body::from(outcome.body)).unwrap()
+}
+
+/// 解码路径的 token 用量落库（只统计数量）。
+fn emit_decoded_usage(state: &SharedState, model: &str, usage: &crate::store::usage::Usage) {
+    if !usage.is_empty() {
+        if let Some(es) = &state.event_store {
+            es.add_tokens(model, *usage);
+        }
+    }
 }
 
 /// 事件构建辅助。
@@ -693,24 +747,65 @@ async fn forward_inner(
     };
     match upstream.send(req).await {
         Ok(resp) => {
-            let status = resp.status();
-            let resp_headers = crate::upstream::http_client::forward_headers(resp.headers());
-            let ct = resp
+            // 用 Option 持有，body 只能被取一次（流式/整包/透传三选一）。
+            let mut resp = Some(resp);
+            let resp_ref = resp.as_ref().expect("刚赋值");
+            let status = resp_ref.status();
+            let resp_headers = crate::upstream::http_client::forward_headers(resp_ref.headers());
+            let ct = resp_ref
                 .headers()
                 .get("content-type")
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("")
                 .to_string();
-            let enc = resp
+            let enc = resp_ref
                 .headers()
                 .get("content-encoding")
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("")
                 .to_string();
 
+            // 未压缩时保留原始 body，供后续流式/整包/透传路径使用。
+            let mut pending_body: Option<Incoming> = None;
+
             // 有会话 + 响应可还原 → 走还原管线
             if let Some(sess) = session {
-                let can_restore = crate::server::response::restorable(&ct, &enc);
+                // 压缩体先解码再还原（见 `stream::decode`）。
+                //
+                // 回归：请求侧已注入 `accept-encoding: identity`，但上游不保证遵守
+                // （中转自行压缩 / 非标客户端）。未解码时 `restorable()` 只能返回
+                // false → 整段透传、占位符原样下发，且不产生 RESTORE 事件
+                // （restored/unresolved 全 0，静默泄漏）。
+                //
+                // 解码成功就**剥掉 content-encoding**（以明文下发）；
+                // 解码失败保持原样,退回「不可还原则透传」。
+                let (body_bytes, eff_enc): (Option<Bytes>, String) =
+                    if crate::stream::decode::is_decodable(&enc) {
+                        let raw_body = resp.take().expect("body 未被取过").into_body();
+                        match crate::stream::sse::aggregate_stream(raw_body).await {
+                            Ok(raw) => match crate::stream::decode::decode(&raw, &enc) {
+                                Ok(Some(plain)) => (Some(Bytes::from(plain)), String::new()),
+                                Ok(None) => (Some(raw), enc.clone()),
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "[decode] 压缩体解码失败({enc}): {e};按原样透传"
+                                    );
+                                    (Some(raw), enc.clone())
+                                }
+                            },
+                            Err(e) => {
+                                state.sessions.drop_session(&sess.sid);
+                                return error_response(
+                                    StatusCode::BAD_GATEWAY,
+                                    &format!("upstream_read_failed: {e}"),
+                                );
+                            }
+                        }
+                    } else {
+                        pending_body = Some(resp.take().expect("body 未被取过").into_body());
+                        (None, enc.clone())
+                    };
+                let can_restore = crate::server::response::restorable(&ct, &eff_enc);
                 if can_restore {
                     let meta = crate::server::response::StreamMeta {
                         host: uri.host().unwrap_or("").to_string(),
@@ -730,12 +825,22 @@ async fn forward_inner(
                     };
                     let cmdblock = state.cmdblock();
                     let store: &'static crate::mask::session::SessionStore = state.sessions;
+                    // 压缩体已聚合/已解码：一律走整包还原（不再是流式字节流）。
+                    // 非压缩体保留原流式路径（首字延迟更低）。
+                    if let Some(decoded) = body_bytes {
+                        let outcome = crate::server::response::process_and_emit(
+                            &decoded, &ct, &sess.sid, store, &cmdblock, &state.bus, &meta,
+                        );
+                        emit_decoded_usage(state, &sess.model, &outcome.usage);
+                        store.drop_session(&sess.sid);
+                        return build_decoded_response(status, outcome, &resp_headers, &eff_enc);
+                    }
                     if crate::server::response::is_streaming_response(&ct) {
                         let framing = crate::server::response::framing_of(&ct)
                             .unwrap_or(crate::stream::sse::Framing::Sse);
                         let bus = state.bus.clone();
                         let out_body = crate::server::response::stream_response(
-                            resp.into_body(),
+                            pending_body.take().expect("未压缩路径必有 body"),
                             framing,
                             sess.sid.clone(),
                             store,
@@ -748,7 +853,7 @@ async fn forward_inner(
                             let h = out.headers_mut().unwrap();
                             for (k, v) in resp_headers {
                                 if let Some(name) = k {
-                                    // 还原后长度变化：移除 content-length，改 chunked
+                                    // 还原后长度变化:移除 content-length,改 chunked
                                     if name.as_str().eq_ignore_ascii_case("content-length") {
                                         continue;
                                     }
@@ -758,16 +863,20 @@ async fn forward_inner(
                         }
                         return out.body(out_body).unwrap();
                     }
-                    // 非流式：聚合并还原
-                    match crate::stream::sse::aggregate_stream(resp.into_body()).await {
+                    // 非流式:聚合并还原
+                    match crate::stream::sse::aggregate_stream(
+                        pending_body.take().expect("未压缩路径必有 body"),
+                    )
+                    .await
+                    {
                         Ok(bytes) => {
                             let outcome = crate::server::response::process_and_emit(
                                 &bytes, &ct, &sess.sid, store, &cmdblock, &state.bus, &meta,
                             );
-                            // RESTORE / 审计事件的落库已收束到总线钩子（见 `AppState::new`），
-                            // 这里不再自己按 id 捡 ring 尾巴——那种写法既有竞态（并发请求
-                            // 会捡错事件），又因为事件 id 尚未赋定而落库 id 恒为 0。
-                            // token 用量落库（只统计数量）
+                            // RESTORE / 审计事件的落库已收束到总线钩子(见 `AppState::new`),
+                            // 这里不再自己按 id 捡 ring 尾巴——那种写法既有竞态(并发请求
+                            // 会捡错事件),又因为事件 id 尚未赋定而落库 id 恒为 0。
+                            // token 用量落库(只统计数量)
                             if !outcome.usage.is_empty() {
                                 if let Some(es) = &state.event_store {
                                     es.add_tokens(&sess.model, outcome.usage);
@@ -813,9 +922,25 @@ async fn forward_inner(
                 }
                 // 不可还原（压缩体等）：透传但清理会话
                 state.sessions.drop_session(&sess.sid);
+
+                // 已聚合的压缩体不能丢:把聚合字节原样回给客户端。
+                if let Some(raw) = body_bytes {
+                    let mut out = Response::builder().status(status);
+                    {
+                        let h = out.headers_mut().unwrap();
+                        for (name, v) in resp_headers.iter() {
+                            h.insert(name.clone(), v.clone());
+                        }
+                    }
+                    return out.body(Body::from(raw)).unwrap();
+                }
             }
 
-            let chunks = crate::stream::sse::aggregate_stream(resp.into_body()).await;
+            // 无会话(build_session 失败等)或不可还原路径:原样透传。
+            // body 可能已在解压分支被聚合取出,统一从 `pending_body` 取。
+            let raw_body =
+                pending_body.unwrap_or_else(|| resp.take().expect("body 未被取过").into_body());
+            let chunks = crate::stream::sse::aggregate_stream(raw_body).await;
             match chunks {
                 Ok(bytes) => {
                     let mut out = Response::builder().status(status);

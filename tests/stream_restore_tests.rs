@@ -646,3 +646,136 @@ fn ndjson_done_true_flushes_without_stream_end() {
         "补发后 pending 应为空"
     );
 }
+
+// ---------------------------------------------------------------------------
+// 回归:content-type 与体形态不一致时的还原(真机 Windows 路径场景)
+// ---------------------------------------------------------------------------
+
+/// 真机回归(Windows harness):目录名含自定义敏感词,模型/中转以**单反斜杠**
+/// 吐出 Windows 路径(`C:\work\ltdsj-cxzd`),`\w` 不是合法 JSON 转义 → 整个
+/// payload 成为非法 JSON。
+///
+/// 修复前 `process_whole` 的 JSON 分支 `Err(_) => text.clone()` **直接透传**,
+/// 一个占位符都不还原,且 `restored/unresolved` 均为 0(控制台记为
+/// `no_sensitive_data`)—— 占位符就这么静默下发到 harness。
+#[test]
+fn invalid_json_windows_path_still_restores() {
+    let (store, tok) = setup();
+    let body = format!(
+        "{{\"choices\":[{{\"message\":{{\"tool_calls\":[{{\"function\":{{\"name\":\"list\",\"arguments\":\"{{\\\"path\\\":\\\"C:\\work\\{tok}\\\"}}\"}}}}]}},\"finish_reason\":\"tool_calls\"}}]}}"
+    );
+    assert!(
+        serde_json::from_str::<serde_json::Value>(&body).is_err(),
+        "本用例构造的 payload 必须是非法 JSON(单反斜杠)"
+    );
+    let cmd = maskit_rs::cmdblock::CmdBlockEngine::new(&Default::default());
+    let out = maskit_rs::server::response::process_whole(
+        body.as_bytes(),
+        "application/json",
+        "s",
+        &store,
+        &cmd,
+    );
+    let s = String::from_utf8_lossy(&out.body).to_string();
+    assert!(
+        !s.contains("{{TERM_") && !s.contains("{{PHONE_"),
+        "占位符泄漏: {s}"
+    );
+    assert!(s.contains("13800138000"), "必须还原出原文: {s}");
+    assert!(out.restored > 0, "必须如实统计 restored(修复前恒为 0)");
+}
+
+/// content-type 只是**声明**,不能当事实用:
+///   * 声明 `application/json` 实为 SSE/NDJSON → 逐事件还原(保留槽位扣留)
+///   * 声明 `text/event-stream` 实为普通 JSON → 整树还原(修复前零还原)
+#[test]
+fn content_type_lying_still_restores() {
+    let (store, tok) = setup();
+    let cmd = maskit_rs::cmdblock::CmdBlockEngine::new(&Default::default());
+    let restore = |body: &str, ct: &str| {
+        let out =
+            maskit_rs::server::response::process_whole(body.as_bytes(), ct, "s", &store, &cmd);
+        String::from_utf8_lossy(&out.body).to_string()
+    };
+
+    // 1) 声明 json,实为 SSE(占位符跨事件拆开 → 必须靠槽位扣留)
+    let half = tok.len() / 2;
+    let (a, b) = tok.split_at(half);
+    let sse = format!(
+        "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"电话 {a}\"}}}}]}}\n\n\
+         data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"{b}\"}}}}]}}\n\n\
+         data: [DONE]\n\n"
+    );
+    let s1 = restore(&sse, "application/json");
+    assert!(!s1.contains("{{"), "谎报 json 的 SSE 泄漏: {s1}");
+    assert!(s1.contains("13800138000"), "谎报 json 的 SSE 未还原: {s1}");
+
+    // 2) 声明 json,实为 NDJSON
+    let nd = format!(
+        "{{\"message\":{{\"content\":\"电话 {tok}\"}},\"done\":false}}\n\
+         {{\"message\":{{\"content\":\"\"}},\"done\":true}}\n"
+    );
+    let s2 = restore(&nd, "application/json");
+    assert!(!s2.contains("{{"), "谎报 json 的 NDJSON 泄漏: {s2}");
+
+    // 3) 声明 event-stream,实为普通 JSON
+    let plain = format!("{{\"choices\":[{{\"message\":{{\"content\":\"电话 {tok}\"}}}}]}}");
+    let s3 = restore(&plain, "text/event-stream");
+    assert!(!s3.contains("{{"), "谎报 event-stream 的 JSON 泄漏: {s3}");
+    assert!(
+        s3.contains("13800138000"),
+        "谎报 event-stream 的 JSON 未还原: {s3}"
+    );
+
+    // 4) 声明 ndjson,实为非法 JSON 单行(半截 Windows 路径)
+    let bad = format!("{{\"path\":\"C:\\work\\{tok}\",\"done\":false}}");
+    let s4 = restore(&bad, "application/x-ndjson");
+    assert!(
+        !s4.contains("{{TERM_") && !s4.contains("{{PHONE_"),
+        "ndjson 非法行泄漏: {s4}"
+    );
+}
+
+/// 回归:content-type 撒谎的修复**不得**弄坏 SSE 的非 `data:` 行块。
+///
+/// `restore_sse_event` 新增了「块里无 `data:` 行 → 当普通 JSON/文本还原」的回退，
+/// 而 SSE 协议允许 `: 注释`、`id:`、`retry:`、`event:` 等字段行 —— 这些块必须
+/// **原样透传**，既不能被丢掉，也不能被当成 JSON 解析后重排版。
+#[test]
+fn sse_non_data_lines_pass_through() {
+    let (store, tok) = setup();
+    let cmd = maskit_rs::cmdblock::CmdBlockEngine::new(&Default::default());
+    let run = |body: &str| {
+        let o = maskit_rs::server::response::process_whole(
+            body.as_bytes(),
+            "text/event-stream",
+            "s",
+            &store,
+            &cmd,
+        );
+        String::from_utf8_lossy(&o.body).to_string()
+    };
+
+    // 心跳注释、id/retry 字段必须逐字保留
+    assert_eq!(run(": keep-alive"), ": keep-alive");
+    let idr = run("id: 42\nretry: 1000");
+    assert!(
+        idr.contains("id: 42") && idr.contains("retry: 1000"),
+        "{idr}"
+    );
+
+    // 同一响应里既有注释块、又有正常 data: 事件 → 占位符仍须还原、注释仍在
+    let mixed = format!(
+        ": ping\n\ndata: {{\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"电话 {tok}\"}}}}]}}\n\ndata: [DONE]\n\n"
+    );
+    let s = run(&mixed);
+    assert!(s.contains(": ping"), "注释块丢失: {s}");
+    assert!(!s.contains("{{"), "占位符未还原: {s}");
+    assert!(s.contains("13800138000"), "原文缺失: {s}");
+
+    // 幂等:重复还原不得改变内容(修复分支会 trim + 重新序列化,须确认不再改写)
+    let one = format!("{{\"choices\":[{{\"message\":{{\"content\":\"电话 {tok}\"}}}}]}}");
+    let once = run(&one);
+    let twice = run(&once);
+    assert_eq!(once, twice, "重复还原改变了内容");
+}

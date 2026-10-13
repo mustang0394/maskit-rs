@@ -76,7 +76,36 @@ pub fn framing_of(ct: &str) -> Option<Framing> {
     }
 }
 
-/// 处理整包响应（非流式路径）。
+/// 按**体内容**嗅探 framing（不信 content-type）。
+///
+/// 用途：JSON 解析失败时的回退 —— 上游/中转常常声明 `application/json`
+/// 却吐 SSE（`data: {...}` 逐事件）或 NDJSON，于是整个响应被当成「坏 JSON」
+/// 静默透传，占位符原样下发。行列式为：
+///   * 里面有 `data:` 开头的行 → SSE
+///   * 逐行都能解析成 JSON 对象 → NDJSON
+///   * 否则 → None（交给整段文本还原）
+fn sniff_framing(text: &str) -> Option<Framing> {
+    if text.lines().any(|l| l.trim_start().starts_with("data:")) {
+        return Some(Framing::Sse);
+    }
+    let mut seen = 0usize;
+    for l in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        seen += 1;
+        if serde_json::from_str::<serde_json::Value>(l).is_err() {
+            return None;
+        }
+        if seen >= 2 {
+            // 至少两行都能解析才当 NDJSON（单行容器无法区分）
+            return Some(Framing::Ndjson);
+        }
+    }
+    None
+}
+
+/// 处理整包响应(非流式路径)。
+///
+/// 关键约束：**已路由的流量绝不能让占位符原样出去**（与请求侧 `fail_closed`
+/// 同一哲学）。因此「体不合预期」时不能直接透传，而是一路回退到能还原为止。
 pub fn process_whole(
     body: &[u8],
     ct: &str,
@@ -88,21 +117,30 @@ pub fn process_whole(
     let text = String::from_utf8_lossy(body).to_string();
     let c = ct.to_ascii_lowercase();
     let mut blocked = false;
-    // token 用量从**上游原始响应**提取（还原不改数字，但原始体最可靠）
+    // token 用量从**上游原始响应**提取(还原不改数字,但原始体最可靠)
     let usage = crate::store::usage::extract_usage(&text);
 
     let restored_text = if c.contains("json") && !is_ndjson_ct(&c) {
-        // 整包 JSON：整树还原
+        // 整包 JSON:整树还原
         match serde_json::from_str::<serde_json::Value>(&text) {
             Ok(v) => {
                 let out = crate::mask::tree::restore_tree(&v, sid, store, &mut stats, 0);
-                // 命令拦截（非流式：通道由 JSON 键名判定，final=true）
+                // 命令拦截(非流式:通道由 JSON 键名判定,final=true)
                 let out = cmdblock.process_tree(out, sid, store, &mut blocked);
                 serde_json::to_string(&out).unwrap_or(text.clone())
             }
             Err(_) => {
-                // 非 JSON 体（或坏 JSON）：原样返回
-                text.clone()
+                // JSON 解析失败 —— **绝不能**原样透传。
+                //
+                // 回归（真机报告）：Windows 目录名 `C:\work\ltdsj-cxzd` 被模型/
+                // 中转以**单反斜杠**吐出（`C:\work\...`，`\w` 不是合法 JSON 转义），
+                // 整个 payload 就成了非法 JSON → 原代码走 `text.clone()` 直接透传，
+                // 一个占位符都不还原，且 `restored/unresolved` 都是 0（控制台显示
+                // `no_sensitive_data`，静默泄漏）。
+                //
+                // 这里按**体形态**回退：SSE/NDJSON 逐事件还原；否则对整段做
+                // 字节保真的文本还原（不解析 JSON，因此不会被转义问题卡住）。
+                restore_non_json_body(&text, sid, store, &mut stats, cmdblock, &mut blocked)
             }
         }
     } else if is_ndjson_ct(&c) {
@@ -170,6 +208,79 @@ pub fn process_whole(
         unresolved_samples: stats.samples,
         stream_actual: "whole",
         blocked,
+    }
+}
+
+/// 「体不合预期」时的回退还原（见 `process_whole` 的 `Err(_)` 分支）。
+///
+/// 三档回退，按信息量从多到少：
+///   1. 体是 SSE（含 `data:` 行）→ 逐事件走 `restore_sse_event`（保留槽位/扣留）
+///   2. 体是 NDJSON（逐行可解析）→ 逐行走 `restore_ndjson_line`
+///   3. 都不是 → 对整段做 `restore_final`（纯字节替换，不碰 JSON 结构）
+///
+/// 第 3 档是**保底**：即使 JSON 语法坏了（如 Windows 单反斜杠路径），
+/// 占位符本身仍是完整字符串，文本级还原照样能把它换回去。
+/// 唯一做不到的是「跨事件拆开的半截占位符」—— 那种情形得靠第 1/2 档的槽位扣留。
+fn restore_non_json_body(
+    text: &str,
+    sid: &str,
+    store: &SessionStore,
+    stats: &mut RestoreStats,
+    cmdblock: &crate::cmdblock::CmdBlockEngine,
+    blocked: &mut bool,
+) -> String {
+    match sniff_framing(text) {
+        Some(Framing::Sse) => {
+            let mut blocks = Vec::new();
+            for block in text.split("\n\n") {
+                blocks.push(crate::stream::sse::restore_sse_event(
+                    block, sid, store, stats, false,
+                ));
+            }
+            let mut joined = blocks.join("\n\n");
+            let tail = crate::stream::sse::flush_pending(sid, store, Framing::Sse, stats);
+            if !tail.is_empty() {
+                joined = format!("{}\n\n{}", joined.trim_end_matches('\n'), tail);
+            }
+            joined
+        }
+        Some(Framing::Ndjson) => {
+            let all: Vec<&str> = text.split('\n').collect();
+            let last = all
+                .iter()
+                .rposition(|l| !l.trim().is_empty())
+                .unwrap_or(all.len().saturating_sub(1));
+            let mut lines = Vec::new();
+            for (i, line) in all.iter().enumerate() {
+                lines.push(crate::stream::sse::restore_ndjson_line(
+                    line,
+                    sid,
+                    store,
+                    stats,
+                    i == last,
+                ));
+            }
+            let mut joined = lines.join("\n");
+            let tail = crate::stream::sse::flush_pending(sid, store, Framing::Ndjson, stats);
+            if !tail.is_empty() {
+                if !joined.ends_with('\n') {
+                    joined.push('\n');
+                }
+                joined.push_str(tail.trim_end_matches('\n'));
+                joined.push('\n');
+            }
+            joined
+        }
+        None => {
+            // 保底：整段文本还原。如果这段恰好是工具的 arguments（JSON 字符串
+            // 内部），还原后原文里的引号需要 JSON 转义才能保持外层结构合法 ——
+            // 但既然外层 JSON 已经坏了（未转义的单反斜杠），这里不再叠加转义，
+            // 以免反而把**好**的部分弄坏。命令拦截同样交出处理：
+            let out = crate::mask::engine::restore_final(text, sid, false, store, stats);
+            let (o, b) = cmdblock.process_stream_bytes(out.as_bytes(), sid, store, true);
+            *blocked = b;
+            String::from_utf8_lossy(&o).to_string()
+        }
     }
 }
 

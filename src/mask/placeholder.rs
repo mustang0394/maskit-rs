@@ -134,7 +134,7 @@ pub fn placeholder_rx() -> &'static Regex {
 pub fn braced_placeholder_rx() -> &'static Regex {
     static RX: Lazy<Regex> = Lazy::new(|| {
         Regex::new(&format!(
-            r"\{{\{{\s*([A-Za-z0-9_]{{1,12}})_({SUFFIX_PAT})\s*\}}\}}"
+            r"\{{\{{\s*([A-Za-z0-9_]{{1,12}})_((?i:{SUFFIX_PAT}))\s*\}}\}}"
         ))
         .unwrap()
     });
@@ -171,7 +171,7 @@ pub fn escaped_placeholder_rx() -> &'static Regex {
 pub fn loose_placeholder_rx() -> &'static Regex {
     static RX: Lazy<Regex> = Lazy::new(|| {
         Regex::new(&format!(
-            r"\{{{{1,2}}\s*([A-Za-z0-9_]{{1,12}}_{SUFFIX_PAT})\s*\}}{{0,2}}|([A-Z0-9]{{1,12}}_{SUFFIX_PAT})"
+            r"\{{{{1,2}}\s*([A-Za-z0-9_]{{1,12}}_(?i:{SUFFIX_PAT}))\s*\}}{{0,2}}|([A-Z0-9]{{1,12}}_(?i:{SUFFIX_PAT}))"
         ))
         .unwrap()
     });
@@ -312,6 +312,29 @@ mod tests {
         assert!(!braced_placeholder_rx().is_match("{{TERMfwggbs}}"));
         assert!(!any_braced_suffix_rx().is_match("{{TERMfwggbs}}"));
         assert!(!placeholder_rx().is_match("{{TERMfwggbs}}"));
+    }
+
+    /// 回归:后缀大小写不敏感。
+    ///
+    /// 模型常把占位符后缀写成大写(`{{PHONE_CQPPJV}}`),而 `canonicalize`
+    /// 本就会把后缀小写化、`escaped_placeholder_rx` 也早就有 `(?i)` ——
+    /// 但 `braced` / `loose` 两条缺了它,导致「纯大写后缀」形态三遍扫描全部
+    /// 错过,占位符**原样下发给客户端**(agent 拿到 `{{PHONE_CQPPJV}}`)。
+    /// 用作用域 `(?i:...)` 只放宽后缀,不动标签类。
+    #[test]
+    fn suffix_case_insensitive() {
+        // 双花括号形态
+        let c = braced_placeholder_rx()
+            .captures("{{PHONE_CQPPJV}}")
+            .expect("大写后缀必须被 braced 认到");
+        assert_eq!(&c[1], "PHONE");
+        assert_eq!(c[2].to_lowercase(), "cqppjv");
+        // 宽松形态:单层花括号 + 大写后缀
+        assert!(loose_placeholder_rx().is_match("{PHONE_CQPPJV}"));
+        // 宽松形态:裸 token + 大写后缀
+        assert!(loose_placeholder_rx().is_match("PHONE_CQPPJV"));
+        // 大小写混合
+        assert!(braced_placeholder_rx().is_match("{{TERM_BcDfGh}}"));
     }
 
     #[test]

@@ -957,3 +957,129 @@ async fn unreachable_upstream_does_not_leak_sessions() {
          —— sweep 不会回收 inflight 会话，这是永久泄漏"
     );
 }
+
+// ===========================================================================
+// 压缩体响应（回归：gzip 响应曾经整段透传、占位符静默泄漏）
+// ===========================================================================
+
+/// 起一个**返回 gzip 压缩响应**的 mock 上游：把收到的脱敏请求体里的占位符
+/// 原样放进响应（content / reasoning_content / tool_calls.arguments），再整体 gzip。
+///
+/// 这正是真机场景：请求侧虽已注入 `accept-encoding: identity`，但上游不遵守。
+async fn spawn_gzip_upstream() -> (String, tokio::task::JoinHandle<()>) {
+    use axum::routing::any;
+    let app = axum::Router::new().fallback(any(move |req: Request<Body>| async move {
+        let bytes = axum::body::to_bytes(req.into_body(), 64 * 1024 * 1024)
+            .await
+            .unwrap_or_default();
+        let text = String::from_utf8_lossy(&bytes).to_string();
+        // 从脱敏请求里抠出网关签发的占位符
+        let tok = maskit_rs::mask::placeholder::placeholder_rx()
+            .find(&text)
+            .map(|m| m.as_str().to_string())
+            .unwrap_or_else(|| "{{TERM_none00}}".to_string());
+        let resp = serde_json::json!({
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": format!("目录是 /root/{tok}-cxzd"),
+                    "reasoning_content": format!("用户在问 {tok}"),
+                    "tool_calls": [{
+                        "id": "call_1", "type": "function",
+                        "function": {"name": "list_dir",
+                                     "arguments": format!("{{\"path\":\"/root/{tok}-cxzd\"}}")}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        });
+        // gzip 压缩
+        use std::io::Write;
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(resp.to_string().as_bytes()).unwrap();
+        let gz = enc.finish().unwrap();
+        axum::response::Response::builder()
+            .status(200)
+            .header("content-type", "application/json")
+            .header("content-encoding", "gzip")
+            .body(Body::from(gz))
+            .unwrap()
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+    (format!("http://{addr}"), handle)
+}
+
+/// 回归（真机）：上游返回 **gzip 压缩**的响应时，必须解码 → 还原 → 以明文下发。
+///
+/// 修复前：`restorable()` 对非 identity 的 `content-encoding` 直接返回 false，
+/// 整个响应被当成「不可还原」整段透传 —— 占位符原样交给客户端，且不产生
+/// RESTORE 事件（`restored/unresolved` 全 0，统计上看不见）。
+#[tokio::test]
+async fn gzip_response_is_decoded_then_restored() {
+    let dir = tempfile::tempdir().unwrap();
+    let (center, _) = ConfigCenter::load_or_init(dir.path()).unwrap();
+    let (url, handle) = spawn_gzip_upstream().await;
+    let mut cfg = center.get();
+    cfg.upstream.target = url;
+    cfg.mask.custom_words.insert("ltdsj".into(), "TERM".into());
+    cfg.fail_closed = true;
+    center.update(cfg);
+
+    let upstream = Arc::new(UpstreamClient::new_or_placeholder(&center.get().upstream));
+    let bus = EventBus::new();
+    let state = Arc::new(AppState::new(center, bus.clone(), upstream, None));
+    let app = build_router(state);
+
+    let body = serde_json::json!({
+        "model": "gpt-4",
+        "messages": [{"role": "user", "content": "列出 /root/ltdsj-cxzd 里的文件"}]
+    })
+    .to_string();
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    let status = resp.status();
+    // 响应头不得再声明 gzip（体已是明文，否则客户端解压失败）
+    assert!(
+        resp.headers().get("content-encoding").is_none(),
+        "解码后必须剥掉 content-encoding，实际: {:?}",
+        resp.headers().get("content-encoding")
+    );
+    let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024 * 1024)
+        .await
+        .unwrap()
+        .to_vec();
+    let text = String::from_utf8_lossy(&bytes).to_string();
+    println!("gzip 响应还原结果: {text}");
+    assert_eq!(status, StatusCode::OK);
+    assert!(!text.contains("{{"), "gzip 响应里占位符未被还原: {text}");
+    assert!(text.contains("ltdsj"), "原文缺失: {text}");
+    // 三个位置都要还原：正文 / 思考 / 工具参数
+    assert_eq!(
+        text.matches("ltdsj-cxzd").count(),
+        2,
+        "content+arguments 都应还原: {text}"
+    );
+    assert!(text.contains("用户在问 ltdsj"), "思考内容应还原: {text}");
+
+    // RESTORE 事件必须如实统计（修复前 count/restored 为 0）
+    let ev = find_event(&bus, maskit_rs::store::events::EventType::Restore)
+        .expect("必须产生 RESTORE 事件");
+    assert_eq!(
+        ev.restore_status, "restored",
+        "restore_status={}",
+        ev.restore_status
+    );
+    assert!(ev.restored >= 2, "restored 计数: {}", ev.restored);
+    assert_eq!(ev.unresolved, 0, "不应有未还原项");
+    handle.abort();
+}

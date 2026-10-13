@@ -38,6 +38,9 @@ percent-encoding = "2"
 futures-util = "0.3"
 async-stream = "0.3"
 bytes = "1"
+flate2 = "1.1.10"
+brotli = "9.0.0"
+ruzstd = "0.9.1"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

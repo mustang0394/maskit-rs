@@ -180,6 +180,27 @@ pub fn restore_sse_event(
     stats: &mut RestoreStats,
     final_frame: bool,
 ) -> String {
+    // 块里一行 `data:` 都没有 → 这不是 SSE 事件，而是**声明 event-stream 却
+    // 吐普通 JSON/文本**的响应（中转常见）。
+    //
+    // 回归（真机实测）：`ct=text/event-stream` + 普通 JSON 体，原代码逐行都
+    // 不是 `data:` 前缀 → 每一行都原样拼回，**整个响应零还原**，占位符原样
+    // 下发（且 `restored/unresolved` 均为 0，静默泄漏）。
+    //
+    // 回退：能当整包 JSON 就整树还原，否则整段文本还原。
+    if !block.lines().any(|l| l.trim_start().starts_with("data:")) {
+        let t = block.trim();
+        if t.is_empty() {
+            return block.to_string();
+        }
+        return match serde_json::from_str::<serde_json::Value>(t) {
+            Ok(v) => {
+                serde_json::to_string(&crate::mask::tree::restore_tree(&v, sid, store, stats, 0))
+                    .unwrap_or_else(|_| block.to_string())
+            }
+            Err(_) => crate::mask::engine::restore_final(block, sid, false, store, stats),
+        };
+    }
     let mut out_lines: Vec<String> = Vec::new();
     for line in block.split('\n') {
         let stripped = line.trim_end_matches('\r');
@@ -362,7 +383,12 @@ pub fn restore_ndjson_line(
         return line.to_string();
     }
     let Ok(obj) = serde_json::from_str::<serde_json::Value>(stripped) else {
-        return line.to_string();
+        // 行不是合法 JSON：可能是 ndjson 容器里夹的非 JSON 行，也可能是
+        // 「声明 ndjson 却吐普通文本/半截 JSON」的中转体。
+        //
+        // 不能直接原样返回 —— 那会把该行里的占位符一并放行。改为整段文本
+        // 还原（字节保真，不碰 JSON 结构），排位与 `restore_sse_event` 的回退一致。
+        return crate::mask::engine::restore_final(line, sid, false, store, stats);
     };
     if !obj.is_object() {
         return line.to_string();
