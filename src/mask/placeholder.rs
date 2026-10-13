@@ -351,7 +351,16 @@ mod tests {
         }
     }
 
-    /// 正则必须是静态缓存（回归：每次调用重新编译会让热路径慢一个数量级）。
+    /// 正则必须是静态缓存(回归:每次调用重新编译会让热路径慢一个数量级)。
+    ///
+    /// 工判据分两层:
+    ///   1. **指针同一** —— 确定性证明缓存生效(不依赖计时)。
+    ///   2. **相对倍率** —— 对比「直接取缓存」与「现场编译 regex」的耗时。
+    ///
+    /// 为什么不用绝对阀值：早期断言「1 万次 < 200ms」在 debug 下本已接近上限，
+    /// 共享 CI runner 被抢占时实测漂到 **205ms** —— 与「未缓存」区间重叠，
+    /// 既会误报又不敢收紧。而缓存与现编的成本差是**三个数量级**
+    /// (release 实测：0.61ms vs 832ms / 万次)，用倍率判官对负载不敏感。
     #[test]
     fn regexes_are_cached() {
         let a = placeholder_rx() as *const Regex;
@@ -362,12 +371,31 @@ mod tests {
             loose_placeholder_rx() as *const Regex,
             loose_placeholder_rx() as *const Regex
         );
-        // 1000 次调用应远快于 1000 次编译（编译约 10µs 级 → 10ms）
-        let t0 = std::time::Instant::now();
-        for _ in 0..10_000 {
+
+        // ── 相对倍率：缓存 vs 现场编译 ──
+        const N: u32 = 2_000;
+        let t_cached = std::time::Instant::now();
+        for _ in 0..N {
             let _ = placeholder_rx().is_match("{{PHONE_bcdfgh}}");
         }
-        let ms = t0.elapsed().as_secs_f64() * 1000.0;
-        assert!(ms < 200.0, "1 万次占位符匹配耗时 {ms:.1}ms（正则未缓存？）");
+        let cached = t_cached.elapsed();
+
+        // 与 placeholder_rx 同形态的正则，现场编译 + 匹配
+        let pat = format!(r"\{{\{{\s*([A-Za-z0-9_]{{1,12}})_((?i:{SUFFIX_PAT}))\s*\}}\}}");
+        let t_compile = std::time::Instant::now();
+        for _ in 0..N {
+            let rx = Regex::new(&pat).unwrap();
+            let _ = rx.is_match("{{PHONE_bcdfgh}}");
+        }
+        let compiled = t_compile.elapsed();
+
+        // 因为缓存的单次成本接近空循环，极端抢占下 `cached` 可能极小，
+        // 倍率噪声会很大；因此只在「比较对象明显占优时才要求高倍率」。
+        let ratio = compiled.as_secs_f64() / cached.as_secs_f64().max(1e-9);
+        assert!(
+            ratio > 20.0,
+            "缓存应至少快 20 倍(实测 {ratio:.1}x：缓存 {cached:?} vs 现编 {compiled:?})\n\
+             —— 若接近 1x 说明正则未被缓存"
+        );
     }
 }

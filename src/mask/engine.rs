@@ -38,11 +38,24 @@ static REV_HOOK_READY: AtomicBool = AtomicBool::new(false);
 pub type RevLookupHook =
     std::sync::Arc<dyn Fn(&str) -> Option<(String, String)> + Send + Sync + 'static>;
 
-/// 注入还原方向钩子（`main` 在事件库就绪后调用）。
+/// 注入还原方向钩子(`main` 在事件库就绪后调用)。
 pub fn set_rev_lookup_hook(hook: RevLookupHook) {
     if let Ok(mut g) = REV_LOOKUP_HOOK.lock() {
         *g = Some(hook);
         REV_HOOK_READY.store(true, Ordering::Release);
+    }
+}
+
+/// 摘除还原方向钩子（供测试恢复全局状态）。
+///
+/// 钩子是**进程级**全局单例，而单个测试进程内多个用例如各装自己的钩子、
+/// 并行跑就会互相覆盖（实测：`plain_text_...` 的 `LEAKED` 钩子抢到
+/// `rev_lookup_falls_back_to_db_hook` 的读路径 → 后者断言失败）。
+/// 测试用 `RevHookGuard` 串行化 + 自动恢复。
+pub fn clear_rev_lookup_hook() {
+    if let Ok(mut g) = REV_LOOKUP_HOOK.lock() {
+        *g = None;
+        REV_HOOK_READY.store(false, Ordering::Release);
     }
 }
 
@@ -1130,6 +1143,38 @@ mod tests {
     use super::*;
     use crate::config::Config;
 
+    /// 全局钩子串行锁：本模块内多个用例会写同一个进程级 `REV_LOOKUP_HOOK`，
+    /// 而 `cargo test` 默认**多线程并行** —— 不加锁就会互相覆盖。
+    ///
+    /// 回归（CI 实测，非本地可稳定重现）：`plain_text_is_not_mistaken_for_token_in_db_fallback`
+    /// 装的 `LEAKED` 钩子抢到了 `rev_lookup_falls_back_to_db_hook` 的读路径，
+    /// 于是后者拿到 `"LEAKED"` 而不是占位符，断言失败。
+    static REV_HOOK_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// RAII：持锁期间独占全局钩子，Drop 时摘掉钩子并解锁。
+    ///
+    /// 为什么必须恢复(而不只是加锁):钩子会**泄露到同进程的其他测试**
+    /// (它们不持这把锁),残留的钩子会让无关用例意外还原成功。
+    struct RevHookGuard {
+        /// 仅为其 Drop 语义而持有(不需读取)。
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl RevHookGuard {
+        fn new() -> Self {
+            // 上一个用例若 panic,Mutex 会中毒;这里直接忽略毒标记继续。
+            let g = REV_HOOK_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            clear_rev_lookup_hook();
+            RevHookGuard { _lock: g }
+        }
+    }
+
+    impl Drop for RevHookGuard {
+        fn drop(&mut self) {
+            clear_rev_lookup_hook();
+        }
+    }
+
     fn test_ctx(custom_words: &[(&str, &str)]) -> (Config, SessionStore, CustomWords) {
         let mut cfg = Config::default();
         // 全部规则打开（对齐 Python setUp）
@@ -1546,6 +1591,7 @@ mod tests {
     /// 否则任意自造 sid 都能借全局反向跡归把占位符换回原文（越权读取）。
     #[test]
     fn rev_db_fallback_does_not_bypass_missing_session_gate() {
+        let _hook_guard = RevHookGuard::new();
         let parts = test_ctx(&[]);
         let masked = mask_with(&parts, "13800138000");
         // 钩子已接线且能命中
@@ -1571,6 +1617,7 @@ mod tests {
     /// 普通文本不得被误当占位符去查库并误还原。
     #[test]
     fn plain_text_is_not_mistaken_for_token_in_db_fallback() {
+        let _hook_guard = RevHookGuard::new();
         let parts = test_ctx(&[]);
         // 钩子对任何输入都返回同一原文（模拟狂热的 DB）
         set_rev_lookup_hook(std::sync::Arc::new(|_t: &str| {
@@ -1595,6 +1642,7 @@ mod tests {
     /// 未过期的映射——依然查不到，裸占位符会下发给 agent。
     #[test]
     fn rev_lookup_falls_back_to_db_hook() {
+        let _hook_guard = RevHookGuard::new();
         let parts = test_ctx(&[]);
         // 只脱敏号码本体：这样 `masked` 就是一个完整的占位符，
         // 便于模拟 DB 返回的‘token → 原文’。
