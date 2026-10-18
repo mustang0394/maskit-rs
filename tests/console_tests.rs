@@ -1028,7 +1028,11 @@ async fn log_detail_exposes_full_trace_ring() {
     let ev = events.first().expect("MASK 事件必须落库");
 
     let (code, v) = h
-        .json("GET", &format!("/console/api/logs/detail?id={}", ev.id), None)
+        .json(
+            "GET",
+            &format!("/console/api/logs/detail?id={}", ev.id),
+            None,
+        )
         .await;
     assert_eq!(code, StatusCode::OK);
     assert_eq!(v["trace_enabled"], serde_json::json!(true));
@@ -1039,7 +1043,10 @@ async fn log_detail_exposes_full_trace_ring() {
         "完整报文必须保留原文请求体：{tr}"
     );
     let masked = tr["req_masked"].as_str().unwrap_or("");
-    assert!(masked.contains("{{PHONE_"), "必须带发给上游的脱敏请求体：{masked}");
+    assert!(
+        masked.contains("{{PHONE_"),
+        "必须带发给上游的脱敏请求体：{masked}"
+    );
     assert!(!masked.contains("13800138000"), "脱敏请求体不得含原文");
     // 上游不可达时没有响应侧，但请求侧已完整
     assert!(tr["resp_raw"].as_str().unwrap_or("").is_empty());
@@ -1071,7 +1078,11 @@ async fn full_trace_is_disabled_when_credential_plaintext_off() {
     let (events, _) = es.fetch_events_page(10, 0, Some("MASK"), None);
     let ev = events.first().expect("MASK 事件必须落库");
     let (code, v) = h
-        .json("GET", &format!("/console/api/logs/detail?id={}", ev.id), None)
+        .json(
+            "GET",
+            &format!("/console/api/logs/detail?id={}", ev.id),
+            None,
+        )
         .await;
     assert_eq!(code, StatusCode::OK);
     assert_eq!(

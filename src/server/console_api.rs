@@ -311,13 +311,10 @@ pub async fn get_log_detail(
         }
         // 前端据此区分「功能未开」与「本条已超出保留窗口」。
         let cfg = state.config.get();
-        let enabled = cfg.full_trace_count > 0
-            && crate::config::log_keeps_credential_plaintext(&cfg);
+        let enabled =
+            cfg.full_trace_count > 0 && crate::config::log_keeps_credential_plaintext(&cfg);
         obj.insert("trace_enabled".into(), Value::Bool(enabled));
-        obj.insert(
-            "trace_keep_count".into(),
-            Value::from(cfg.full_trace_count),
-        );
+        obj.insert("trace_keep_count".into(), Value::from(cfg.full_trace_count));
     }
     json_response(StatusCode::OK, &v)
 }

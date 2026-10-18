@@ -609,8 +609,7 @@ pub fn process_and_emit(
     // 响应侧完整报文：上游原始响应（含占位符，排查未还原的关键证据）+ 还原后响应。
     if meta.trace_max_bytes > 0 {
         let max = meta.trace_max_bytes;
-        let (resp_raw, raw_tr) =
-            crate::store::trace::cap_body(&String::from_utf8_lossy(body), max);
+        let (resp_raw, raw_tr) = crate::store::trace::cap_body(&String::from_utf8_lossy(body), max);
         let (resp_out, out_tr) =
             crate::store::trace::cap_body(&String::from_utf8_lossy(&outcome.body), max);
         bus.put_trace(crate::store::trace::TraceBlob {

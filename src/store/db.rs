@@ -333,10 +333,8 @@ impl EventStore {
                 v.resp_out_bytes = secondary_bytes.max(0) as usize;
                 v.resp_truncated = truncated != 0;
                 if let Ok(e) = serde_json::from_str::<serde_json::Value>(&extra) {
-                    v.unresolved = e
-                        .get("unresolved")
-                        .and_then(|x| x.as_u64())
-                        .unwrap_or(0) as usize;
+                    v.unresolved =
+                        e.get("unresolved").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
                     v.unresolved_samples = e
                         .get("unresolved_samples")
                         .and_then(|x| x.as_array())
