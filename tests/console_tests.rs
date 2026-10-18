@@ -337,6 +337,88 @@ async fn embedded_ui_is_served() {
     assert_eq!(s4, StatusCode::NOT_FOUND);
 }
 
+/// 回归：内嵌 UI 的静态资源必须**破缓存 + 禁止「不校验就用缓存」**。
+///
+/// 症状（真机踩过）：升级二进制后 Web 端看不到新面板 —— `/console/app.js` 的 URL
+/// 升级前后完全一样，响应里又没有任何缓存头（无 `cache-control`/`etag`/
+/// `last-modified`），浏览器与中间代理就继续吃旧的 app.js，表现为
+/// 「后端明明是新的，页面上就是没有『完整报文』四栏」。
+///
+/// 这里固化四条保证：
+///   ① `/console` 里的资源引用带 `?v=<内容指纹>`；
+///   ② 指纹形态正确（8 位 hex，而不是写死的版本号 / 空串）；
+///   ③ 资源响应带 `cache-control: no-cache, must-revalidate`；
+///   ④ 带查询串的 URL 仍能取到真资源（查询串不得影响路由）。
+#[tokio::test]
+async fn embedded_assets_are_versioned_and_uncached() {
+    let h = Harness::new();
+
+    // ① / ②：HTML 引用带内容指纹
+    let (s, body) = h.req("GET", "/console", false, None).await;
+    assert_eq!(s, StatusCode::OK);
+    let html = String::from_utf8_lossy(&body).to_string();
+    assert!(
+        html.contains("/console/app.js?v="),
+        "app.js 引用必须带版本号（否则升级后拿不到新前端）：{html}"
+    );
+    assert!(
+        html.contains("/console/style.css?v="),
+        "style.css 引用必须带版本号：{html}"
+    );
+    let v = html
+        .split("/console/app.js?v=")
+        .nth(1)
+        .and_then(|r| r.split('"').next())
+        .unwrap_or("")
+        .to_string();
+    assert!(
+        v.len() == 8 && v.chars().all(|c| c.is_ascii_hexdigit()),
+        "内容指纹形态不对（应为 8 位 hex）：{v:?}"
+    );
+
+    // ③：资源响应带 no-cache
+    let app = build_router(h.state.clone());
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/console/app.js")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers()
+            .get("cache-control")
+            .and_then(|v| v.to_str().ok()),
+        Some("no-cache, must-revalidate"),
+        "内嵌资源必须禁止「不校验就直接用缓存」"
+    );
+
+    // ④：带 ?v= 仍能取到真资源，且详情页要有「摘要 ≠ 完整报文」的说明
+    let app2 = build_router(h.state.clone());
+    let resp2 = app2
+        .oneshot(
+            Request::builder()
+                .uri(format!("/console/app.js?v={v}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp2.status(), StatusCode::OK, "带 ?v= 的资源必须可取");
+    let js = axum::body::to_bytes(resp2.into_body(), 8 * 1024 * 1024)
+        .await
+        .unwrap_or_default();
+    let js = String::from_utf8_lossy(&js);
+    assert!(js.contains("/console/api"), "带查询串时必须仍是 app.js");
+    assert!(
+        js.contains("上方为摘要") && js.contains("完整报文 · 原始字节（诊断环）"),
+        "详情页必须说明 dialog 是摘要、完整报文在诊断环"
+    );
+}
+
 #[tokio::test]
 async fn exported_logs_never_contain_plaintext() {
     let h = Harness::new();

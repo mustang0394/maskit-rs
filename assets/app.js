@@ -1030,6 +1030,19 @@
       }
     }
 
+    // 上面那两个框只是**摘要**，不是完整报文：
+    //   * `dialog` / `masked_dialog` 是 extract_dialog_text() 从 JSON 里抽出的对话
+    //     文本（只认 content/text/input 等键），并在 DIALOG_MAX_CHARS=8000 处截断；
+    //   * 完整字节在下方诊断环（req_raw / req_masked）里。
+    // 不写这句时，用户看到「摘要被截断」很容易误判成「完整报文功能没生效」（真机踩过）。
+    const cutMark = '已截断';
+    if (orig.indexOf(cutMark) >= 0 || up.indexOf(cutMark) >= 0) {
+      parts.push('<div class="hint">上方为摘要（<code>dialog</code> / '
+        + '<code>masked_dialog</code>：抽取对话文本后超过 8000 字符即截断）；'
+        + '完整请求体 / 响应体见下方「完整报文 · 原始字节（诊断环）」'
+        + '（需 <code>full_trace_count &gt; 0</code> 且 <code>mask.log_credential_plaintext=true</code>）。</div>');
+    }
+
     // 完整报文诊断环（最近 N 条）：原文请求 / 脱敏请求 / 上游原始响应 / 还原后响应。
     // 这是排查「脱敏了没还原」的关键证据：「上游原始响应」保留占位符原样。
     if (e.trace) {
