@@ -285,17 +285,41 @@ pub async fn get_log_detail(
     State(state): State<SharedState>,
     Query(q): Query<DetailQuery>,
 ) -> Response {
-    if let Some(ev) = state.bus.by_id(q.id) {
-        return json_response(StatusCode::OK, &ev);
-    }
-    // 内存 ring 只有 2000 条：更早的事件必须回 SQLite 兜底。
-    // 否则列表里能看到的行点开后 404（主从详情布局下这是硬伤）。
-    if let Some(es) = &state.event_store {
-        if let Some(ev) = es.fetch_event_by_id(q.id) {
-            return json_response(StatusCode::OK, &ev);
+    let ev = state.bus.by_id(q.id).or_else(|| {
+        // 内存 ring 只有 2000 条：更早的事件必须回 SQLite 兜底。
+        // 否则列表里能看到的行点开后 404（主从详情布局下这是硬伤）。
+        state
+            .event_store
+            .as_ref()
+            .and_then(|es| es.fetch_event_by_id(q.id))
+    });
+    let Some(ev) = ev else {
+        return error_response(StatusCode::NOT_FOUND, "event_not_found");
+    };
+    let mut v = serde_json::to_value(&ev).unwrap_or(Value::Null);
+    if let Some(obj) = v.as_object_mut() {
+        // 完整报文诊断环：按 session_id 关联（MASK / RESTORE 共用同一 sid）。
+        // 未命中（未开 / 已淘汰 / 未走脱敏管线）就不附 trace 字段。
+        if !ev.session_id.is_empty() {
+            if let Some(es) = &state.event_store {
+                if let Some(t) = es.fetch_trace(&ev.session_id) {
+                    if let Ok(tv) = serde_json::to_value(&t) {
+                        obj.insert("trace".into(), tv);
+                    }
+                }
+            }
         }
+        // 前端据此区分「功能未开」与「本条已超出保留窗口」。
+        let cfg = state.config.get();
+        let enabled = cfg.full_trace_count > 0
+            && crate::config::log_keeps_credential_plaintext(&cfg);
+        obj.insert("trace_enabled".into(), Value::Bool(enabled));
+        obj.insert(
+            "trace_keep_count".into(),
+            Value::from(cfg.full_trace_count),
+        );
     }
-    error_response(StatusCode::NOT_FOUND, "event_not_found")
+    json_response(StatusCode::OK, &v)
 }
 
 pub async fn clear_logs(State(state): State<SharedState>) -> Response {

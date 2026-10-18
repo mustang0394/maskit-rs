@@ -160,6 +160,18 @@ const maskEvent = {
     ['accept', 'application/json'],
     ['accept', 'text/event-stream'],
   ],
+  // 完整报文诊断环（最近 N 条）：原文请求 / 脱敏请求 / 上游原始响应 / 还原后响应
+  trace: {
+    sid: 'abc-1f2e3d4c', ts: 1758600000.5, method: 'POST', path: '/v1/chat/completions',
+    protocol: 'chat_completions', model: 'gpt-4o', stream: false,
+    req_raw: '{"model":"gpt-4o","messages":[{"role":"user","content":"我的电话是13800138000"}]}',
+    req_masked: '{"model":"gpt-4o","messages":[{"role":"user","content":"我的电话是{{PHONE_bcdfgh}}"}]}',
+    req_bytes: 76, req_masked_bytes: 84, req_truncated: false,
+    resp_raw: '{"choices":[{"message":{"content":"已记录 {{PHONE_bcdfgh}}"}}]}',
+    resp_out: '{"choices":[{"message":{"content":"已记录 13800138000"}}]}',
+    resp_bytes: 61, resp_out_bytes: 62, resp_truncated: false,
+    unresolved: 0, unresolved_samples: [],
+  },
 };
 // 老事件：没有 masked_dialog，必须走「按命中明细推算」兜底
 const legacyEvent = {
@@ -340,6 +352,11 @@ const tick = (n = 6) => new Promise(async res => {
   check(detail.includes('class="tok"'), '日志详情：占位符未高亮');
   check(detail.includes('13800138000'), '日志详情：原文应可见');
   check(!detail.includes('>13800138000<') || detail.includes('发给上游'), '日志详情：结构异常');
+  // 完整报文诊断环：四栏必须渲染，且「上游原始响应」保留占位符原样
+  check(detail.includes('完整报文'), '日志详情：缺完整报文面板');
+  check(detail.includes('上游原始响应'), '日志详情：缺上游原始响应面板');
+  check(detail.includes('trRespRaw') && detail.includes('trRespOut'), '日志详情：完整报文四栏未齐全');
+  check(detail.includes('{{PHONE_bcdfgh}}'), '日志详情：上游原始响应应保留占位符');
   check(byId.get('logMeta').textContent.includes('共 3 条'), '日志页：缺总数');
 
   // 请求头面板：头名/值渲染、凭据打码标记、同名头不合并、列表行计数

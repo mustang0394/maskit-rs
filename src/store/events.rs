@@ -255,12 +255,16 @@ pub struct EventBus {
     /// RESTORE 事件根本没人落库。钩子只在赋 id **之后**被调用，天然对齐。
     event_hook: Mutex<Option<EventHook>>,
     audit_hook: Mutex<Option<AuditHook>>,
+    /// 完整报文诊断环落库钩子（装配层注入；未注入 → 丢弃）。
+    trace_hook: Mutex<Option<TraceHook>>,
 }
 
 /// 事件落库钩子。
 type EventHook = std::sync::Arc<dyn Fn(&Event) + Send + Sync + 'static>;
 /// 审计事件落库钩子。
 type AuditHook = std::sync::Arc<dyn Fn(&AuditEvent) + Send + Sync + 'static>;
+/// 完整报文落库钩子。
+type TraceHook = std::sync::Arc<dyn Fn(crate::store::trace::TraceBlob) + Send + Sync + 'static>;
 
 #[derive(Debug, Default, Clone, Serialize)]
 pub struct Counters {
@@ -285,6 +289,7 @@ impl EventBus {
             counters: Mutex::new(Counters::default()),
             event_hook: Mutex::new(None),
             audit_hook: Mutex::new(None),
+            trace_hook: Mutex::new(None),
         })
     }
 
@@ -292,6 +297,22 @@ impl EventBus {
     pub fn set_hooks(&self, event_hook: EventHook, audit_hook: AuditHook) {
         *self.event_hook.lock().unwrap() = Some(event_hook);
         *self.audit_hook.lock().unwrap() = Some(audit_hook);
+    }
+
+    /// 注入完整报文落库钩子（无事件库时不注入 → `put_trace` 变空操作）。
+    pub fn set_trace_hook(&self, trace_hook: TraceHook) {
+        *self.trace_hook.lock().unwrap() = Some(trace_hook);
+    }
+
+    /// 提交一组完整报文（非阻塞；无钩子则丢弃）。
+    ///
+    /// 与 `emit` 同样：先把锁释放再回调，避免钩子（会走 SQLite 入队）
+    /// 与总线锁相互阻塞。
+    pub fn put_trace(&self, t: crate::store::trace::TraceBlob) {
+        let hook = self.trace_hook.lock().unwrap().clone();
+        if let Some(h) = hook {
+            h(t);
+        }
     }
 
     /// 发射事件（非阻塞；ring 满则丢最老），返回**已赋 id/ts** 的事件。
@@ -460,6 +481,7 @@ impl Default for EventBus {
             counters: Mutex::new(Counters::default()),
             event_hook: Mutex::new(None),
             audit_hook: Mutex::new(None),
+            trace_hook: Mutex::new(None),
         }
     }
 }

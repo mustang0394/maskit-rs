@@ -321,9 +321,29 @@ pub fn stream_response(
         let mut usage_total = crate::store::usage::Usage::default();
         let mut s = body;
         let mut blocked = false;
+        // 完整报文诊断环：累积上游原始响应 + 下发给客户端的还原后响应。
+        // 两边各自封顶（`trace_max`），超出后仍继续计数 `*_total`，但不再追加内容。
+        let trace_max = meta.trace_max_bytes;
+        let mut trace_raw: Vec<u8> = Vec::new();
+        let mut trace_out: Vec<u8> = Vec::new();
+        let mut trace_raw_total = 0usize;
+        let mut trace_out_total = 0usize;
+        let mut trace_truncated = false;
         while let Some(frame) = s.frame().await {
             let Ok(f) = frame else { break };
             let Some(data) = f.data_ref() else { continue };
+            if trace_max > 0 {
+                trace_raw_total += data.len();
+                if trace_raw.len() < trace_max {
+                    let n = (trace_max - trace_raw.len()).min(data.len());
+                    trace_raw.extend_from_slice(&data[..n]);
+                    if n < data.len() {
+                        trace_truncated = true;
+                    }
+                } else {
+                    trace_truncated = true;
+                }
+            }
             let (out, stats) = state.push(data, &sid, store);
             // 逐块采集 usage（流末 usage 只出现在最后几块，不受文本留存上限影响）
             if !out.is_empty() {
@@ -341,6 +361,18 @@ pub fn stream_response(
             } else {
                 Vec::new()
             };
+            if trace_max > 0 && !out.is_empty() {
+                trace_out_total += out.len();
+                if trace_out.len() < trace_max {
+                    let n = (trace_max - trace_out.len()).min(out.len());
+                    trace_out.extend_from_slice(&out[..n]);
+                    if n < out.len() {
+                        trace_truncated = true;
+                    }
+                } else {
+                    trace_truncated = true;
+                }
+            }
             if !out.is_empty() {
                 yield Ok::<Bytes, std::io::Error>(Bytes::from(out));
             }
@@ -352,6 +384,18 @@ pub fn stream_response(
         stats_total.degraded += stats.degraded;
         if !tail.is_empty() && !blocked {
             let (o, _) = cmdblock.process_stream_bytes(&tail, &sid, store, true);
+            if trace_max > 0 && !o.is_empty() {
+                trace_out_total += o.len();
+                if trace_out.len() < trace_max {
+                    let n = (trace_max - trace_out.len()).min(o.len());
+                    trace_out.extend_from_slice(&o[..n]);
+                    if n < o.len() {
+                        trace_truncated = true;
+                    }
+                } else {
+                    trace_truncated = true;
+                }
+            }
             if !o.is_empty() {
                 yield Ok(Bytes::from(o));
             }
@@ -362,6 +406,30 @@ pub fn stream_response(
         let mut rmeta = meta.clone();
         rmeta.resp_dialog = dialog_for_log(&state.kept, meta.keep_plaintext, &meta.secret_prefixes);
         emit_restore(&bus, &sid, &rmeta, &stats_total, store, blocked, "stream");
+
+        // 完整报文（响应侧）：上游原始 SSE/NDJSON 字节 + 还原后下发字节。
+        if trace_max > 0 {
+            bus.put_trace(crate::store::trace::TraceBlob {
+                sid: sid.clone(),
+                kind: crate::store::trace::TraceKind::Resp,
+                ts: crate::store::events::now_secs(),
+                method: meta.method.clone(),
+                path: meta.path.clone(),
+                protocol: meta.protocol.clone(),
+                model: meta.model.clone(),
+                stream: true,
+                primary_body: String::from_utf8_lossy(&trace_raw).to_string(),
+                secondary_body: String::from_utf8_lossy(&trace_out).to_string(),
+                primary_bytes: trace_raw_total,
+                secondary_bytes: trace_out_total,
+                truncated: trace_truncated,
+                extra: serde_json::json!({
+                    "unresolved": stats_total.unresolved,
+                    "unresolved_samples": stats_total.samples.iter().take(5).cloned().collect::<Vec<_>>(),
+                }),
+                keep: meta.trace_keep,
+            });
+        }
 
         if let Some(hook) = USAGE_HOOK.get() {
             hook(&meta.model, &usage_total);
@@ -393,6 +461,10 @@ pub struct StreamMeta {
     /// 当前生效的密钥前缀（构造时从配置快照）。日志清洗必须用真实配置，
     /// 不能用写死的默认值 —— 否则控制台里加的前缀会在日志里漏明文。
     pub secret_prefixes: Vec<String>,
+    /// 完整报文诊断环：单侧字节上限（0 = 关闭）。关闭时不采集，`put_trace` 不被调用。
+    pub trace_max_bytes: usize,
+    /// 完整报文诊断环：保留最近多少组（写线程淘汰用）。
+    pub trace_keep: usize,
     /// 客户端请求头（随 RESTORE 事件落库，与同请求的 MASK 事件同一份）。
     pub request_headers: Vec<(String, String)>,
 }
@@ -534,6 +606,34 @@ pub fn process_and_emit(
         samples: outcome.unresolved_samples.clone(),
     };
     emit_restore(bus, sid, meta, &stats, store, outcome.blocked, "whole");
+    // 响应侧完整报文：上游原始响应（含占位符，排查未还原的关键证据）+ 还原后响应。
+    if meta.trace_max_bytes > 0 {
+        let max = meta.trace_max_bytes;
+        let (resp_raw, raw_tr) =
+            crate::store::trace::cap_body(&String::from_utf8_lossy(body), max);
+        let (resp_out, out_tr) =
+            crate::store::trace::cap_body(&String::from_utf8_lossy(&outcome.body), max);
+        bus.put_trace(crate::store::trace::TraceBlob {
+            sid: sid.to_string(),
+            kind: crate::store::trace::TraceKind::Resp,
+            ts: crate::store::events::now_secs(),
+            method: meta.method.clone(),
+            path: meta.path.clone(),
+            protocol: meta.protocol.clone(),
+            model: meta.model.clone(),
+            stream: false,
+            primary_body: resp_raw,
+            secondary_body: resp_out,
+            primary_bytes: body.len(),
+            secondary_bytes: outcome.body.len(),
+            truncated: raw_tr || out_tr,
+            extra: serde_json::json!({
+                "unresolved": outcome.unresolved,
+                "unresolved_samples": outcome.unresolved_samples,
+            }),
+            keep: meta.trace_keep,
+        });
+    }
     // 响应侧 PII 扫描 + 审计
     let text = String::from_utf8_lossy(&outcome.body).to_string();
     crate::audit::on_response(bus, sid, store, &text, meta);

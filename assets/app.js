@@ -945,6 +945,25 @@
       </button>`;
   }
 
+  /**
+   * 完整报文面板：标题（含字节数 / 截断标记）+ 复制按钮 + 高亮后的 pre。
+   * `highlight` 会顺带把 `{{LABEL_xxxxxx}}` 占位符标出来 —— 排查未还原时
+   * 一眼就能看到上游响应里哪些占位符没被换回。
+   */
+  function tracePanel(id, title, titleCls, text, meta) {
+    const m = meta || {};
+    const size = m.bytes ? ` · ${fmtBytes(m.bytes)}` : '';
+    const cut = m.truncated ? ' · <span class="warn-text">已截断</span>' : '';
+    const body = text ? highlight(text, m.needles || []) : '<span class="hint">（空）</span>';
+    return `<div class="cmp2-col">
+      <div class="cmp2-head">
+        <span class="cmp2-title ${titleCls}">${esc(title)}${size}${cut}</span>
+        <button class="btn btn-sm copy-btn" data-copy-target="${id}" ${text ? '' : 'disabled'}>复制</button>
+      </div>
+      <pre class="cmp2-pre" id="${id}">${body}</pre>
+    </div>`;
+  }
+
   function logDetailHtml(e) {
     const type = String(e.type || '');
     const items = e.items || [];
@@ -1009,6 +1028,34 @@
         parts.push(`<div class="detail-section"><div class="detail-title">${esc(title)}</div>
           <pre class="cmp2-pre">${highlight(orig, needles)}</pre></div>`);
       }
+    }
+
+    // 完整报文诊断环（最近 N 条）：原文请求 / 脱敏请求 / 上游原始响应 / 还原后响应。
+    // 这是排查「脱敏了没还原」的关键证据：「上游原始响应」保留占位符原样。
+    if (e.trace) {
+      const tr = e.trace;
+      parts.push(`<div class="detail-section">
+        <div class="detail-title">完整报文 · 原始字节（诊断环）</div>
+        <div class="cmp2">
+          ${tracePanel('trReqRaw', '原始请求（客户端发出）', 'cmp2-title-orig', tr.req_raw, { needles, bytes: tr.req_bytes, truncated: tr.req_truncated })}
+          ${tracePanel('trReqMasked', '发给上游（已脱敏）', 'cmp2-title-up', tr.req_masked, { bytes: tr.req_masked_bytes, truncated: tr.req_truncated })}
+        </div>
+        <div class="cmp2" style="margin-top:10px">
+          ${tracePanel('trRespRaw', '上游原始响应（占位符原样）', 'cmp2-title-up', tr.resp_raw, { bytes: tr.resp_bytes, truncated: tr.resp_truncated })}
+          ${tracePanel('trRespOut', '返回客户端（还原后）', 'cmp2-title-back', tr.resp_out, { bytes: tr.resp_out_bytes, truncated: tr.resp_truncated })}
+        </div>
+        ${tr.unresolved
+          ? `<div class="note warn">未还原 ${tr.unresolved} 处${(tr.unresolved_samples || []).length
+              ? '：<span class="mono">' + tr.unresolved_samples.map(esc).join('、') + '</span>' : ''}
+              —— 对照左侧「上游原始响应」可判断是占位符被改写、跨块截断，还是映射缺失。</div>`
+          : ''}
+        ${(tr.req_truncated || tr.resp_truncated)
+          ? '<div class="hint">部分报文超过 <code>full_trace_max_bytes</code>，已在字节边界截断。</div>' : ''}
+      </div>`);
+    } else if (e.trace_enabled === false) {
+      parts.push('<div class="note">完整报文诊断环未启用：需要 <code>full_trace_count &gt; 0</code> 且 <code>mask.log_credential_plaintext=true</code>。</div>');
+    } else if (e.sid) {
+      parts.push(`<div class="hint">该请求不在完整报文保留窗口内（仅保留最近 ${esc(e.trace_keep_count || 0)} 条），或未走脱敏管线。</div>`);
     }
 
     // 请求头（客户端实际发送的全部头；凭据类值受 mask.log_credential_plaintext 控制）
@@ -1127,6 +1174,13 @@
       el.setAttribute('aria-selected', on ? 'true' : 'false');
     });
     showLogDetail(id);
+  });
+  // 完整报文面板的「复制」按钮（详情为重绘 innerHTML，用委托避免重绑）
+  $('logDetail').addEventListener('click', ev => {
+    const btn = ev.target.closest('.copy-btn');
+    if (!btn || btn.disabled) return;
+    const pre = document.getElementById(btn.dataset.copyTarget);
+    if (pre) copyFrom(pre, btn);
   });
   $('logType').addEventListener('change', () => {
     log.type = $('logType').value; log.offset = 0; log.sel = null;

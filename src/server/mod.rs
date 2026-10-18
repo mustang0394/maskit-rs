@@ -78,10 +78,14 @@ impl AppState {
         if let Some(es) = &event_store {
             let e1 = es.clone();
             let e2 = es.clone();
+            let e3 = es.clone();
             bus.set_hooks(
                 Arc::new(move |ev: &crate::store::events::Event| e1.enqueue(ev.clone())),
                 Arc::new(move |ev: &crate::store::events::AuditEvent| e2.enqueue_audit(ev.clone())),
             );
+            // 完整报文诊断环：只有注入钩子后 `put_trace` 才会真正落库；
+            // 无事件库（纯内存降级）时自动丢弃，不影响代理。
+            bus.set_trace_hook(Arc::new(move |t| e3.enqueue_trace(t)));
         }
         Self {
             config,

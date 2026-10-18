@@ -389,6 +389,23 @@ pub struct Config {
     pub stream_response: bool,
     #[serde(default = "default_retention")]
     pub log_retention_days: u32,
+    /// 完整报文诊断环：保留最近 N 条请求的**完整**请求体/响应体（0 = 关闭）。
+    ///
+    /// 与 `events` 表里的 `dialog`（抽取后的对话文本、8000 字符截断）不同，
+    /// 这里存的是原始字节形态，用来排查「脱敏了没还原」这类问题 ——
+    /// 必须能看到上游回来的占位符原样。只保留最近 N 条，超出即淘汰
+    /// （`trace_blobs` 表按 sid 保留 N 组）。
+    ///
+    /// ⚠️ 仅当 `mask.log_credential_plaintext=true` 时生效：完整报文里含凭据明文，
+    /// 关掉凭据明文开关时一并关闭，避免绕过红线。
+    #[serde(default = "default_full_trace_count")]
+    pub full_trace_count: usize,
+    /// 完整报文**单侧**字节上限（超出按字符边界截断并在详情页标注）。
+    ///
+    /// 请求体上限默认 32MiB，若原样驻留 20 条会把内存/磁盘打爆，
+    /// 故对每条请求的每一侧（原文/脱敏/上游响应/还原后）单独封顶。
+    #[serde(default = "default_full_trace_max_bytes")]
+    pub full_trace_max_bytes: usize,
     /// Web 控制台令牌（不限长度，原样生效；空则启动时生成 24 位随机值并写入日志）
     #[serde(default)]
     pub panel_token: String,
@@ -399,6 +416,14 @@ pub struct Config {
 
 fn default_retention() -> u32 {
     7
+}
+
+fn default_full_trace_count() -> usize {
+    20
+}
+
+fn default_full_trace_max_bytes() -> usize {
+    1024 * 1024
 }
 
 impl Default for Config {
@@ -413,6 +438,8 @@ impl Default for Config {
             response_scan: true,
             stream_response: true,
             log_retention_days: default_retention(),
+            full_trace_count: default_full_trace_count(),
+            full_trace_max_bytes: default_full_trace_max_bytes(),
             panel_token: String::new(),
             paused: false,
         }
@@ -460,6 +487,16 @@ impl Config {
                 "mask.max_body_bytes 超过 128MiB 上限，已截断到 128MiB".into(),
             ));
         }
+        if self.full_trace_count > 200 {
+            warnings.push(ConfigWarning(
+                "full_trace_count 超过 200 上限，已截断到 200".into(),
+            ));
+        }
+        if self.full_trace_max_bytes < 4096 {
+            warnings.push(ConfigWarning(
+                "full_trace_max_bytes 小于 4KiB，已抬到 4KiB（过小会截掉大部分报文）".into(),
+            ));
+        }
         warnings
     }
 
@@ -497,6 +534,12 @@ impl Config {
         }
         if c.mask.mapping_ttl == 0 {
             c.mask.mapping_ttl = 24 * 3600;
+        }
+        // 完整报文诊断环：条数封顶 200，单侧上限夹在 [4KiB, 32MiB]。
+        // 0 是合法的「关闭」，不参与抬升。
+        c.full_trace_count = c.full_trace_count.min(200);
+        if c.full_trace_count > 0 {
+            c.full_trace_max_bytes = c.full_trace_max_bytes.clamp(4096, 32 * 1024 * 1024);
         }
         // panel_token 不做长度限制：用户设什么就是什么（仅空值才交给启动逻辑生成）。
         c.panel_token = c.panel_token.trim().to_string();

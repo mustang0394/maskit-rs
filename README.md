@@ -90,6 +90,7 @@ MASKIT_RS_DATA_DIR=/var/lib/maskit-rs ./target/release/maskit-rs
 - **token 用量统计**：按模型统计输入/输出 token（`/api/stats/today`、`/api/stats/models`）。**只统计数量，不做价格/费用计算**
 - **事件与统计**：SQLite（事件表与 Python 版同 schema，可互读写；Rust 版另增一张 `placeholder_map` 映射表，见下）、每日聚合、保留期清理
 - **控制台**：单文件原生 JS（无构建步骤）。日志/审计/敏感词均为**主从双栏**；日志详情并排对照「原文（客户端发出）」与「发给上游（已脱敏）」（`masked_dialog`），并展示本次请求的**全部请求头**（保序、同名头不合并），支持全文搜索、类型过滤、分页、自动刷新；页面状态写入 URL hash（`/console#logs` 可直达、刷新不丢页）
+  - **完整报文（诊断环）**：详情页底部四栏展示最近 N 条请求的**原始字节** —— 原始请求 / 发给上游（已脱敏）/ 上游原始响应（占位符原样）/ 返回客户端（还原后），各栏可一键复制。这是排查「脱敏了没还原」的关键证据：`dialog` 只是抽取后的对话文本，看不到上游回来的占位符原样；「上游原始响应」里被改写、截断的 `{{LABEL_xxxxxx}}` 会被高亮标出。见配置 `full_trace_count`
   - **请求头日志**：`events[].request_headers`，为 `[[name, value], …]`（保序 + 保留同名重复头，如多个 `accept`）。头名统一转小写。凭据类（`authorization` / `cookie` / `x-api-key` 等）的值按 `mask.log_credential_plaintext` 决定是否显示为 `***`；导出（`/api/logs/export`）**恒剔除**该字段。为防客户端用超大/超多头撑爆事件库，上限为 100 个、单值 2048 字符、合计 16KiB，超限截断并附 `x-shield-truncated` 标记
 - **凭据明文落盘（按设计）**：脱敏命中的映射表 `placeholder_map` 会无条件记录**所有**分类（含凭据类）的 `占位符 → 原文`，用于进程重启后还原历史对话里的占位符。
   因此「凭据类原文永不落库」**只对 `events` 表成立**（受 `mask.log_credential_plaintext` 控制），不适用于映射表；`config.json` 里的原始敏感词同理。**备份数据目录必须加密。**
@@ -150,6 +151,8 @@ maskit-rs/
 | `audit.*` | 审计开关、严重度门槛（**无主动探针**，只做被动检测） |
 | `panel_token` | 控制台令牌（不限制长度，原样生效；留空自动生成 24 位随机值） |
 | `mask.log_credential_plaintext` | **`events` 表**是否保留凭据类**明文原文**（默认 `true`）。为 `false` 时只存 sha256 摘要与打码预览。⚠️ 注意：此项**不影响** `placeholder_map` 映射表——它按设计始终存原文 |
+| `full_trace_count` | **完整报文诊断环**保留最近几条（默认 `20`，`0` = 关闭）。存原始请求体 / 脱敏后请求体 / 上游原始响应 / 还原后响应到 `trace_blobs` 表，超出即淘汰。仅当 `mask.log_credential_plaintext=true` 时生效 |
+| `full_trace_max_bytes` | 完整报文**单侧**字节上限（默认 1MiB，夹在 4KiB–32MiB）。超出按 UTF-8 字符边界截断并标注 |
 
 ---
 
@@ -158,6 +161,7 @@ maskit-rs/
 - 默认只监听 `127.0.0.1`。要让局域网访问，改 `server.bind` 为 `0.0.0.0` 并**务必设置强令牌**。
 - 管理 API 有 Bearer 令牌鉴权 + Origin 校验（拒绝跨站写操作）+ 安全响应头。
 - 事件日志（`events` 表）按 `mask.log_credential_plaintext` 决定是否保留凭据明文；设为 `false` 后导出与日志明细均不含凭据原文。
+- **完整报文诊断环** `trace_blobs` 表存最近 `full_trace_count` 条请求的原始/脱敏/上游响应/还原后报文（含原始敏感明文）。它**同样受 `mask.log_credential_plaintext` 控制**：该开关为 `false` 时整环关闭（不落库）；导出（`/api/logs/export`）不含该表。默认 20 条 × 单侧 1MiB。
 - 占位符映射表 `placeholder_map`（`<数据目录>/shield-events.sqlite3` 内）**按设计存全部原文（含凭据）**，用于重启后还原历史占位符；按 `mask.mapping_ttl` 过期清理。**数据目录的备份必须加密。**
 - 事件库路径：`<数据目录>/shield-events.sqlite3`。备份该文件即可备份历史统计与占位符映射。
 
@@ -188,7 +192,7 @@ cargo clippy --all-targets -- -D warnings
 
 ## 与 Python 版共存
 
-两者 `events` 表 schema 相同，可读写同一个 `shield-events.sqlite3`（但**不要同时运行**写同一个库）。Rust 版另外会建一张 `placeholder_map` 表（占位符映射持久化，见「安全须知」），Python 版不认识也不使用它——共存时它只是多出来的表，不影响 Python 侧读事件。
+两者 `events` 表 schema 相同，可读写同一个 `shield-events.sqlite3`（但**不要同时运行**写同一个库）。Rust 版另外会建 `placeholder_map`（占位符映射持久化）与 `trace_blobs`（完整报文诊断环）两张表，Python 版不认识也不使用它们——共存时它们只是多出来的表，不影响 Python 侧读事件。
 配置格式不同，Python 版的 `config.json` 不能直接复用；自定义词表/规则开关需要在控制台重新配置，或从旧 `config.json` 手动拷贝 `sensitive` / `sensitive_word_disabled` / `builtin_rules` 三项。
 
 ---

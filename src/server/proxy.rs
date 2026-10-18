@@ -403,9 +403,10 @@ pub async fn handler(State(state): State<SharedState>, req: Request) -> Response
     let sid = make_session_id(&parts.headers, &parsed.value);
     let store = state.sessions;
     store.new_session(&sid);
+    let stream_req = detect::is_stream_request(Some(&parsed.value));
     if let Some(mut s) = store.get_mut(&sid) {
         s.model = model.clone();
-        s.stream_mode = if detect::is_stream_request(Some(&parsed.value)) {
+        s.stream_mode = if stream_req {
             "stream".into()
         } else {
             "non_stream".into()
@@ -537,6 +538,32 @@ pub async fn handler(State(state): State<SharedState>, req: Request) -> Response
     }
     // 落库交给总线内部的钩子（赋 id 之后），这里只负责发事件
     state.bus.emit(ev);
+
+    // 完整报文诊断环（请求侧）：保留最近 N 条，且**凭据明文开关关闭时不存**
+    // （完整报文必然含 API Key 等明文，不能绕过 `log_credential_plaintext` 红线）。
+    if keep_plaintext && cfg_now.full_trace_count > 0 {
+        let max = cfg_now.full_trace_max_bytes;
+        let (req_raw, raw_tr) =
+            crate::store::trace::cap_body(&String::from_utf8_lossy(&body_bytes), max);
+        let (req_masked, masked_tr) = crate::store::trace::cap_body(&masked.text, max);
+        state.bus.put_trace(crate::store::trace::TraceBlob {
+            sid: sid.clone(),
+            kind: crate::store::trace::TraceKind::Req,
+            ts: crate::store::events::now_secs(),
+            method: method_str.clone(),
+            path: path.clone(),
+            protocol: protocol.as_str().to_string(),
+            model: model.clone(),
+            stream: stream_req,
+            primary_body: req_raw,
+            secondary_body: req_masked,
+            primary_bytes: body_bytes.len(),
+            secondary_bytes: masked.text.len(),
+            truncated: raw_tr || masked_tr,
+            extra: serde_json::Value::Null,
+            keep: cfg_now.full_trace_count,
+        });
+    }
 
     // 映射落盘（随机后缀 → 原文）：保证进程重启后历史占位符仍可还原。
     // **必须无条件 drain**：否则事件库不可用时该集合永不回收，会泄漏。
@@ -807,6 +834,15 @@ async fn forward_inner(
                     };
                 let can_restore = crate::server::response::restorable(&ct, &eff_enc);
                 if can_restore {
+                    let cfg_meta = state.config.get();
+                    let keep_plaintext = crate::config::log_keeps_credential_plaintext(&cfg_meta);
+                    // 完整报文诊断环：凭据明文开关关闭时一并关闭（完整报文含凭据明文）
+                    let (trace_max_bytes, trace_keep) =
+                        if keep_plaintext && cfg_meta.full_trace_count > 0 {
+                            (cfg_meta.full_trace_max_bytes, cfg_meta.full_trace_count)
+                        } else {
+                            (0, 0)
+                        };
                     let meta = crate::server::response::StreamMeta {
                         host: uri.host().unwrap_or("").to_string(),
                         method: method.to_string(),
@@ -817,10 +853,10 @@ async fn forward_inner(
                         req_bytes: sess.req_bytes,
                         req_dialog: sess.req_dialog.clone(),
                         resp_dialog: String::new(), // 流式由响应侧回填
-                        keep_plaintext: crate::config::log_keeps_credential_plaintext(
-                            &state.config.get(),
-                        ),
-                        secret_prefixes: state.config.get().mask.secret_prefixes.clone(),
+                        keep_plaintext,
+                        secret_prefixes: cfg_meta.mask.secret_prefixes.clone(),
+                        trace_max_bytes,
+                        trace_keep,
                         request_headers: sess.request_headers.clone(),
                     };
                     let cmdblock = state.cmdblock();

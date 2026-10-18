@@ -14,6 +14,7 @@ use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 
 use crate::store::events::{AuditEvent, Event};
+use crate::store::trace::{TraceBlob, TraceView};
 
 /// 事件队列上限（对齐 `EVENT_QUEUE_MAX` = 5000）。
 pub const EVENT_QUEUE_MAX: usize = 5000;
@@ -36,6 +37,9 @@ pub struct WriterStats {
     pub dead_letters: u64,
     pub batches: u64,
     pub alive: bool,
+    /// 完整报文诊断环：已落盘组数 / 队列满被丢弃组数
+    pub traces_written: u64,
+    pub traces_dropped: u64,
 }
 
 enum StoreMsg {
@@ -44,6 +48,8 @@ enum StoreMsg {
     Prune(i64),
     /// 占位符映射批量落盘（token, orig, label, ttl_secs）
     Mappings(Vec<(String, String, String, u64)>),
+    /// 完整报文（诊断环）单组落盘
+    Trace(Box<TraceBlob>),
     /// 清理过期映射
     PruneMappings,
     /// 同步屏障：写线程处理到此消息时，先把之前累积的批次落盘再回复。
@@ -115,6 +121,21 @@ impl EventStore {
         if self.tx.try_send(StoreMsg::Audit(Box::new(ev))).is_err() {
             if let Ok(mut s) = self.stats.lock() {
                 s.dropped += 1;
+            }
+        }
+    }
+
+    /// 入队一组完整报文（非阻塞；队列满则丢弃并计数）。
+    ///
+    /// 丢的是**诊断信息**而不是代理主流程：队列满说明写线程跟不上，
+    /// 此时宁可少几条完整报文，也不能让 `try_send` 失败波及正常事件落库。
+    pub fn enqueue_trace(&self, t: TraceBlob) {
+        match self.tx.try_send(StoreMsg::Trace(Box::new(t))) {
+            Ok(()) => {}
+            Err(_) => {
+                if let Ok(mut s) = self.stats.lock() {
+                    s.traces_dropped += 1;
+                }
             }
         }
     }
@@ -225,6 +246,112 @@ impl EventStore {
         serde_json::from_str(&payload).ok()
     }
 
+    /// 按 sid 取一组完整报文（req + resp 两行合并）。
+    ///
+    /// 未命中（诊断环未开 / 已淘汰 / 该 sid 没走脱敏管线）返回 `None`。
+    pub fn fetch_trace(&self, sid: &str) -> Option<TraceView> {
+        if sid.is_empty() {
+            return None;
+        }
+        let conn = open_read(&self.path).ok()?;
+        // `ORDER BY kind`：'req' < 'resp'（前者是后者的前缀），保证 ts/方法等
+        // 元信息取自请求侧（响应侧可能前功尽弃，但请求事实不变）。
+        let mut stmt = conn
+            .prepare(
+                "SELECT kind, ts, method, path, protocol, model, stream, \
+                 primary_body, secondary_body, primary_bytes, secondary_bytes, truncated, extra \
+                 FROM trace_blobs WHERE sid = ?1 ORDER BY kind",
+            )
+            .ok()?;
+        let rows = stmt
+            .query_map(params![sid], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, f64>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, String>(5)?,
+                    r.get::<_, i64>(6)?,
+                    r.get::<_, String>(7)?,
+                    r.get::<_, String>(8)?,
+                    r.get::<_, i64>(9)?,
+                    r.get::<_, i64>(10)?,
+                    r.get::<_, i64>(11)?,
+                    r.get::<_, String>(12)?,
+                ))
+            })
+            .ok()?;
+        let mut view: Option<TraceView> = None;
+        for row in rows.filter_map(|r| r.ok()) {
+            let (
+                kind,
+                ts,
+                method,
+                path,
+                protocol,
+                model,
+                stream,
+                primary,
+                secondary,
+                primary_bytes,
+                secondary_bytes,
+                truncated,
+                extra,
+            ) = row;
+            let v = view.get_or_insert_with(|| TraceView {
+                sid: sid.to_string(),
+                ts,
+                method,
+                path,
+                protocol,
+                model,
+                stream: stream != 0,
+                req_raw: String::new(),
+                req_masked: String::new(),
+                req_bytes: 0,
+                req_masked_bytes: 0,
+                req_truncated: false,
+                resp_raw: String::new(),
+                resp_out: String::new(),
+                resp_bytes: 0,
+                resp_out_bytes: 0,
+                resp_truncated: false,
+                unresolved: 0,
+                unresolved_samples: vec![],
+            });
+            if kind == "req" {
+                v.req_raw = primary;
+                v.req_masked = secondary;
+                v.req_bytes = primary_bytes.max(0) as usize;
+                v.req_masked_bytes = secondary_bytes.max(0) as usize;
+                v.req_truncated = truncated != 0;
+            } else {
+                v.resp_raw = primary;
+                v.resp_out = secondary;
+                v.resp_bytes = primary_bytes.max(0) as usize;
+                v.resp_out_bytes = secondary_bytes.max(0) as usize;
+                v.resp_truncated = truncated != 0;
+                if let Ok(e) = serde_json::from_str::<serde_json::Value>(&extra) {
+                    v.unresolved = e
+                        .get("unresolved")
+                        .and_then(|x| x.as_u64())
+                        .unwrap_or(0) as usize;
+                    v.unresolved_samples = e
+                        .get("unresolved_samples")
+                        .and_then(|x| x.as_array())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|s| s.as_str().map(str::to_string))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                }
+            }
+        }
+        view
+    }
+
     /// 读审计事件。
     pub fn fetch_audits(&self, limit: usize) -> Vec<AuditEvent> {
         let Ok(conn) = open_read(&self.path) else {
@@ -247,6 +374,7 @@ impl EventStore {
         let conn = open_read(&self.path)?;
         conn.execute_batch(
             "DELETE FROM events; DELETE FROM daily_words; \
+             DELETE FROM trace_blobs; \
              DELETE FROM sqlite_sequence WHERE name='events';",
         )?;
         Ok(())
@@ -657,6 +785,30 @@ CREATE TABLE IF NOT EXISTS placeholder_map (
 );
 CREATE INDEX IF NOT EXISTS idx_pm_expires ON placeholder_map(expires_at);
 CREATE INDEX IF NOT EXISTS idx_pm_orig ON placeholder_map(orig);
+
+-- 完整报文诊断环：最近 N 组请求的原始/脱敏/上游响应/还原后报文。
+-- 与 events 分表（报文体积大，且这里是**有界环**而非历史归档）。
+-- 写线程每次 upsert 后按「最近 N 个 sid」淘汰；Python 版不认识此表。
+CREATE TABLE IF NOT EXISTS trace_blobs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    sid TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    ts REAL NOT NULL,
+    method TEXT NOT NULL DEFAULT '',
+    path TEXT NOT NULL DEFAULT '',
+    protocol TEXT NOT NULL DEFAULT '',
+    model TEXT NOT NULL DEFAULT '',
+    stream INTEGER NOT NULL DEFAULT 0,
+    primary_body TEXT NOT NULL DEFAULT '',
+    secondary_body TEXT NOT NULL DEFAULT '',
+    primary_bytes INTEGER NOT NULL DEFAULT 0,
+    secondary_bytes INTEGER NOT NULL DEFAULT 0,
+    truncated INTEGER NOT NULL DEFAULT 0,
+    extra TEXT NOT NULL DEFAULT '',
+    UNIQUE(sid, kind)
+);
+CREATE INDEX IF NOT EXISTS idx_trace_ts ON trace_blobs(ts);
+CREATE INDEX IF NOT EXISTS idx_trace_sid ON trace_blobs(sid);
 "#,
     )?;
     Ok(())
@@ -834,6 +986,16 @@ fn flush_batch(
                             failed += 1;
                         }
                     }
+                    StoreMsg::Trace(t) => {
+                        if write_trace(&tx, t).is_ok() {
+                            written += 1;
+                            if let Ok(mut s) = stats.lock() {
+                                s.traces_written += 1;
+                            }
+                        } else {
+                            failed += 1;
+                        }
+                    }
                     StoreMsg::Prune(days) => {
                         let _ = prune_events(&tx, *days);
                     }
@@ -948,6 +1110,48 @@ fn write_event(conn: &Connection, ev: &Event) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// 落盘一组完整报文，并按「最近 keep 个 sid」淘汰旧组。
+///
+/// 用 UPSERT：请求侧先写 kind=req，响应侧回来补 kind=resp，同一 sid 各自一行。
+/// 淘汰按 sid 分组（MAX(id) 即最近活动时间），同一请求的两行永远同生共死。
+fn write_trace(conn: &Connection, t: &TraceBlob) -> rusqlite::Result<()> {
+    let extra = serde_json::to_string(&t.extra).unwrap_or_default();
+    conn.execute(
+        "INSERT INTO trace_blobs (sid, kind, ts, method, path, protocol, model, stream, \
+         primary_body, secondary_body, primary_bytes, secondary_bytes, truncated, extra) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) \
+         ON CONFLICT(sid, kind) DO UPDATE SET \
+         ts=excluded.ts, method=excluded.method, path=excluded.path, \
+         protocol=excluded.protocol, model=excluded.model, stream=excluded.stream, \
+         primary_body=excluded.primary_body, secondary_body=excluded.secondary_body, \
+         primary_bytes=excluded.primary_bytes, secondary_bytes=excluded.secondary_bytes, \
+         truncated=excluded.truncated, extra=excluded.extra",
+        params![
+            t.sid,
+            t.kind.as_str(),
+            t.ts,
+            t.method,
+            t.path,
+            t.protocol,
+            t.model,
+            t.stream as i64,
+            t.primary_body,
+            t.secondary_body,
+            t.primary_bytes as i64,
+            t.secondary_bytes as i64,
+            t.truncated as i64,
+            extra
+        ],
+    )?;
+    let keep = t.keep.max(1) as i64;
+    conn.execute(
+        "DELETE FROM trace_blobs WHERE sid NOT IN ( \
+           SELECT sid FROM trace_blobs GROUP BY sid ORDER BY MAX(id) DESC LIMIT ?1)",
+        params![keep],
+    )?;
+    Ok(())
+}
+
 fn write_audit(conn: &Connection, ev: &AuditEvent) -> rusqlite::Result<()> {
     let payload = serde_json::to_string(ev).unwrap_or_default();
     conn.execute(
@@ -975,6 +1179,8 @@ fn prune_events(conn: &Connection, retention_days: i64) -> rusqlite::Result<usiz
     let cutoff = crate::store::events::now_secs() - (retention_days as f64) * 86400.0;
     let n = conn.execute("DELETE FROM events WHERE ts < ?1", params![cutoff])?;
     let _ = conn.execute("DELETE FROM audit_events WHERE ts < ?1", params![cutoff]);
+    // 诊断环也按同一保留期清理（一般由「保留最近 N 条」先淘汰，这里是兜底）
+    let _ = conn.execute("DELETE FROM trace_blobs WHERE ts < ?1", params![cutoff]);
     Ok(n)
 }
 
@@ -1244,5 +1450,95 @@ mod tests {
         store.sync();
         let s = store.stats.lock().unwrap().clone();
         assert!(s.written > 0, "正常事件必须写入");
+    }
+
+    fn trace_blob(
+        sid: &str,
+        kind: crate::store::trace::TraceKind,
+        primary: &str,
+        secondary: &str,
+        keep: usize,
+    ) -> TraceBlob {
+        TraceBlob {
+            sid: sid.into(),
+            kind,
+            ts: crate::store::events::now_secs(),
+            method: "POST".into(),
+            path: "/v1/chat/completions".into(),
+            protocol: "chat_completions".into(),
+            model: "gpt-4o".into(),
+            stream: kind == crate::store::trace::TraceKind::Resp,
+            primary_body: primary.into(),
+            secondary_body: secondary.into(),
+            primary_bytes: primary.len(),
+            secondary_bytes: secondary.len(),
+            truncated: false,
+            extra: serde_json::json!({}),
+            keep,
+        }
+    }
+
+    /// 请求/响应两行按 sid 合并，且「保留最近 N 组」按 sid 淘汰。
+    #[test]
+    fn trace_roundtrip_and_bounded_ring() {
+        use crate::store::trace::TraceKind;
+        let dir = tempfile::tempdir().unwrap();
+        let store = EventStore::open(dir.path()).unwrap();
+        // 4 个请求，keep=2 → 只剩最后 2 个 sid
+        for i in 0..4 {
+            let sid = format!("sid-{i}");
+            store.enqueue_trace(trace_blob(
+                &sid,
+                TraceKind::Req,
+                &format!("raw-{i}"),
+                &format!("masked-{i}"),
+                2,
+            ));
+        }
+        store.enqueue_trace(TraceBlob {
+            extra: serde_json::json!({
+                "unresolved": 1,
+                "unresolved_samples": ["{{PHONE_bcdfgh}}"]
+            }),
+            ..trace_blob("sid-3", TraceKind::Resp, "upstream-3", "restored-3", 2)
+        });
+        store.sync();
+
+        assert!(
+            store.fetch_trace("sid-0").is_none(),
+            "超出保留窗口的 sid 必须被淘汰"
+        );
+        assert!(store.fetch_trace("sid-1").is_none());
+        assert!(store.fetch_trace("sid-2").is_some(), "最近 2 组必须保留");
+        let v = store.fetch_trace("sid-3").expect("sid-3 应保留");
+        assert_eq!(v.req_raw, "raw-3");
+        assert_eq!(v.req_masked, "masked-3");
+        assert_eq!(v.resp_raw, "upstream-3", "必须能看到上游原始响应");
+        assert_eq!(v.resp_out, "restored-3");
+        assert_eq!(v.resp_bytes, "upstream-3".len());
+        assert_eq!(v.unresolved, 1);
+        assert_eq!(v.unresolved_samples, vec!["{{PHONE_bcdfgh}}"]);
+        // stream 属请求级事实，合并视图取请求侧（req 行为 false）
+        assert!(!v.stream);
+        assert_eq!(
+            store.stats.lock().unwrap().traces_written,
+            5,
+            "5 组写入都要计数"
+        );
+    }
+
+    #[test]
+    fn clear_events_also_clears_traces() {
+        use crate::store::trace::TraceKind;
+        let dir = tempfile::tempdir().unwrap();
+        let store = EventStore::open(dir.path()).unwrap();
+        store.enqueue_trace(trace_blob("s", TraceKind::Req, "a", "b", 20));
+        store.sync();
+        assert!(store.fetch_trace("s").is_some());
+        store.clear_events().unwrap();
+        assert!(
+            store.fetch_trace("s").is_none(),
+            "清空日志必须连完整报文一起清"
+        );
     }
 }

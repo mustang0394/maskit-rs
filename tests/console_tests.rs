@@ -1002,6 +1002,86 @@ async fn persisted_events_have_real_ids_and_masked_dialog() {
     assert_eq!(n3, 0, "本次请求没有 RESTORE 事件");
 }
 
+/// 完整报文诊断环：日志详情必须带「原文请求 / 脱敏请求」，且能看到上游响应侧。
+///
+/// 这是排查「脱敏了没还原」的关键证据：`dialog` 只是抽取后的对话文本，
+/// 看不到上游回来的占位符原样；`trace` 存的是原始字节。
+#[tokio::test]
+async fn log_detail_exposes_full_trace_ring() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::with_owned_dir(dir);
+    let (status, _) = h
+        .req(
+            "POST",
+            "/v1/chat/completions",
+            false,
+            Some(
+                r#"{"model":"gpt-4o","messages":[{"role":"user","content":"我的电话是13800138000"}]}"#,
+            ),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+
+    let es = h.state.event_store.as_ref().expect("自带事件库");
+    es.sync();
+    let (events, _) = es.fetch_events_page(10, 0, Some("MASK"), None);
+    let ev = events.first().expect("MASK 事件必须落库");
+
+    let (code, v) = h
+        .json("GET", &format!("/console/api/logs/detail?id={}", ev.id), None)
+        .await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(v["trace_enabled"], serde_json::json!(true));
+    let tr = &v["trace"];
+    assert!(tr.is_object(), "详情必须带 trace 字段：{v}");
+    assert!(
+        tr["req_raw"].as_str().unwrap_or("").contains("13800138000"),
+        "完整报文必须保留原文请求体：{tr}"
+    );
+    let masked = tr["req_masked"].as_str().unwrap_or("");
+    assert!(masked.contains("{{PHONE_"), "必须带发给上游的脱敏请求体：{masked}");
+    assert!(!masked.contains("13800138000"), "脱敏请求体不得含原文");
+    // 上游不可达时没有响应侧，但请求侧已完整
+    assert!(tr["resp_raw"].as_str().unwrap_or("").is_empty());
+}
+
+/// 凭据明文开关关闭时，完整报文诊断环必须**一并关闭**（完整报文含凭据明文）。
+#[tokio::test]
+async fn full_trace_is_disabled_when_credential_plaintext_off() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::with_owned_dir(dir);
+    let mut cfg = h.state.config.get();
+    cfg.mask.log_credential_plaintext = false;
+    h.state.config.update(cfg);
+
+    let (status, _) = h
+        .req(
+            "POST",
+            "/v1/chat/completions",
+            false,
+            Some(
+                r#"{"model":"gpt-4o","messages":[{"role":"user","content":"我的电话是13800138000"}]}"#,
+            ),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+
+    let es = h.state.event_store.as_ref().expect("自带事件库");
+    es.sync();
+    let (events, _) = es.fetch_events_page(10, 0, Some("MASK"), None);
+    let ev = events.first().expect("MASK 事件必须落库");
+    let (code, v) = h
+        .json("GET", &format!("/console/api/logs/detail?id={}", ev.id), None)
+        .await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(
+        v["trace_enabled"],
+        serde_json::json!(false),
+        "关掉凭据明文时必须报告诊断环未启用"
+    );
+    assert!(v.get("trace").is_none(), "不得保留完整报文：{v}");
+}
+
 /// 回归：审计事件 id 非 0，且每条 finding 只触发一次落库钩子。
 ///
 /// 此前是「每个请求结束后把 ring 里最近 20 条重新 enqueue」，于是同一条审计

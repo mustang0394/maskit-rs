@@ -120,6 +120,8 @@
   "response_scan": true,
   "stream_response": true,
   "log_retention_days": 7,
+  "full_trace_count": 20,
+  "full_trace_max_bytes": 1048576,
   "panel_token": "",
   "paused": false
 }
