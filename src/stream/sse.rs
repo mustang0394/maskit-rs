@@ -742,6 +742,41 @@ mod tests {
         let _ = out3;
     }
 
+    /// 回归（真机 trace 定位）：上游每个 delta 事件都带 `"finish_reason":""` 时，
+    /// 跨事件拆开的占位符仍必须靠 `pending` 扣留拼合还原。
+    ///
+    /// 真实 trace 里 `reasoning_content` 被切成 `" IP {{"` / `"IPPUBLIC_rnjn"` /
+    /// `"vs}} port 222"` 三截，旧实现把空串 `finish_reason` 判成终止 → 每截都进
+    /// `final_channel=true` 分支 → `pending` 永不写入 → 三截原样下发，
+    /// `restored/unresolved` 全 0（控制台 `no_sensitive_data`，静默泄漏）。
+    #[test]
+    fn empty_finish_reason_keeps_partial_holding() {
+        let parts = setup();
+        // 模拟脱敏侧签发：登记占位符 → 原文
+        {
+            let mut s = parts.1.get_mut("s").unwrap();
+            s.rev
+                .insert("{{IPPUBLIC_rnjnvs}}".into(), "123.253.227.9".into());
+        }
+        let mut st = StreamState::new(Framing::Sse);
+        let mut out = String::new();
+        for frag in [" IP {{", "IPPUBLIC_rnjn", "vs}} port 222"] {
+            let ev = format!(
+                "data: {}\n\n",
+                serde_json::json!({"choices": [{"index": 0,
+                    "delta": {"reasoning_content": frag},
+                    "finish_reason": ""}]})
+            );
+            let (o, _) = st.push(ev.as_bytes(), "s", &parts.1);
+            out.push_str(&String::from_utf8_lossy(&o));
+        }
+        assert!(
+            out.contains("123.253.227.9"),
+            "跨事件拆分的占位符必须还原：{out}"
+        );
+        assert!(!out.contains("IPPUBLIC_"), "不得残留任何占位符残片：{out}");
+    }
+
     #[test]
     fn sse_empty_midstream_produces_no_output() {
         let parts = setup();

@@ -281,14 +281,27 @@ pub fn terminal_prefixes(data: &Value) -> Option<Vec<String>> {
         }
         _ => {}
     }
-    // choices[].finish_reason 存在 → 该 choice 的全部通道结束
+    // choices[].finish_reason 存在且**非空** → 该 choice 的全部通道结束。
+    //
+    // ⚠️ 空串 `""` 必须当作「尚未结束」，不能只看 `!is_null()`。
+    //
+    // 回归（真机 trace 定位）：部分中转 / 自建实现（vLLM、one-api 系）在**每个**
+    // delta 事件里都发 `"finish_reason":""`（而不是 `null`），真正的结束信号只出现在
+    // 最后一帧（`"stop"` / `"tool_calls"`）。旧实现把 `""` 当成终止，于是**每个**
+    // delta 事件都让本 choice 的全部通道进入收尾态 → `restore_channel` 的
+    // `final_channel=true` 分支直接 `pending.remove()`，**跨事件扣留整体失效**：
+    // 被上游切成两/三截的占位符（`" IP {{"` + `"IPPUBLIC_rnjn"` + `"vs}} port 222"`）
+    // 每一截都过 `restore_final`、每一截都不完整 → 一个都拼不回，残片原样下发给
+    // 客户端，且 `restored/unresolved` 全 0（控制台显示 `no_sensitive_data`，静默泄漏）。
     let mut prefixes = Vec::new();
     if let Some(choices) = obj.get("choices").and_then(Value::as_array) {
         for (position, c) in choices.iter().enumerate() {
-            if c.get("finish_reason")
-                .map(|f| !f.is_null())
-                .unwrap_or(false)
-            {
+            let finished = match c.get("finish_reason") {
+                None | Some(Value::Null) => false,
+                Some(Value::String(s)) => !s.trim().is_empty(),
+                Some(_) => true,
+            };
+            if finished {
                 prefixes.push(format!("c{}.", choice_index(c, position)));
             }
         }
@@ -628,6 +641,37 @@ mod tests {
             terminal_prefixes(&json!({"choices": [{"delta": {}}]})),
             Some(vec![])
         );
+    }
+
+    /// 回归（真机 trace 定位）：`"finish_reason":""` 不是终止信号。
+    ///
+    /// 部分中转 / 自建实现（vLLM、one-api 系）在**每个** delta 事件里都用空串占位，
+    /// 只有最后一帧才是 `"stop"` / `"tool_calls"`。旧实现 `!is_null()` 把 `""` 判成
+    /// 终止，导致每个 delta 都让通道进入收尾态 → 半截占位符不再扣留（`pending`
+    /// 永不写入）→ 被拆开的占位符永久拼不回、残片直出客户端。
+    #[test]
+    fn empty_finish_reason_is_not_terminal() {
+        let delta = json!({"choices": [{"index": 0, "delta": {"reasoning_content": "x"},
+                                        "finish_reason": ""}]});
+        assert_eq!(
+            terminal_prefixes(&delta),
+            Some(vec![]),
+            "空串 finish_reason 是「尚未结束」，不得让通道提前收尾"
+        );
+        // 真正的终止帧（非空）仍必须收尾
+        for fr in ["stop", "tool_calls", "length"] {
+            let done = json!({"choices": [{"index": 0, "delta": {}, "finish_reason": fr}]});
+            assert_eq!(
+                terminal_prefixes(&done),
+                Some(vec!["c0.".to_string()]),
+                "{fr}"
+            );
+        }
+        // 空白串同样不算终止；null / 键缺失同理
+        for v in [json!(""), json!("  "), json!(null)] {
+            let ev = json!({"choices": [{"index": 0, "delta": {}, "finish_reason": v}]});
+            assert_eq!(terminal_prefixes(&ev), Some(vec![]), "{v}");
+        }
     }
 
     #[test]
