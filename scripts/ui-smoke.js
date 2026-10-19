@@ -238,6 +238,18 @@ const sandbox = {
   AbortController,
   crypto: { getRandomValues: a => { for (let i = 0; i < a.length; i++) a[i] = (i * 7 + 3) & 0xff; return a; } },
   navigator: { clipboard: { writeText: async () => {} } },
+  // matchMedia 桩：主题默认跟随系统深浅色（app.js 加载期就调用它）。
+  // matches=false → 系统浅色；同时给出 add/removeEventListener（及旧式
+  // addListener），这样将来监听系统主题切换也不会让冒烟测试崩掉。
+  matchMedia: q => ({
+    media: String(q || ''),
+    matches: false,
+    onchange: null,
+    addEventListener: () => {},
+    removeEventListener: () => {},
+    addListener: () => {},
+    removeListener: () => {},
+  }),
   confirm: () => true,
   setTimeout: (fn, ms) => setTimeout(fn, ms),
   clearTimeout: t => clearTimeout(t),
