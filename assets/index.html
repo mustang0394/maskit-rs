@@ -1,9 +1,18 @@
 <!doctype html>
-<html lang="zh-CN" data-theme="dark">
+<html lang="zh-CN">
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <meta name="color-scheme" content="dark light" />
+<script>
+  /* 首帧前确定主题：优先用户上次选择，否则跟随系统深浅色，避免闪屏 */
+  (function () {
+    var saved = null;
+    try { saved = localStorage.getItem('maskit_theme'); } catch (e) {}
+    var theme = saved || (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+    document.documentElement.setAttribute('data-theme', theme);
+  })();
+</script>
 <title>Maskit-RS 控制台</title>
 <link rel="stylesheet" href="/console/style.css" />
 </head>

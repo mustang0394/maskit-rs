@@ -9,15 +9,17 @@
   let TOKEN = localStorage.getItem(LS_TOKEN) || '';
 
   /* ==================== 主题 ==================== */
-  function applyTheme(theme) {
+  function applyTheme(theme, persist) {
     document.documentElement.setAttribute('data-theme', theme);
-    localStorage.setItem(LS_THEME, theme);
+    if (persist !== false) localStorage.setItem(LS_THEME, theme);
     const icon = document.getElementById('themeIcon');
     if (icon) icon.textContent = theme === 'dark' ? '☀' : '☾';
     const btn = document.getElementById('themeToggle');
     if (btn) btn.title = theme === 'dark' ? '切换到浅色主题' : '切换到深色主题';
   }
-  applyTheme(localStorage.getItem(LS_THEME) || 'dark');
+  /* 无用户选择时跟随系统主题（不固化），有选择则沿用 */
+  const savedTheme = localStorage.getItem(LS_THEME);
+  applyTheme(savedTheme || (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'), !!savedTheme);
 
   /* ==================== 基础工具 ==================== */
   function $(id) { return document.getElementById(id); }
