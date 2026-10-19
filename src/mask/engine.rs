@@ -16,7 +16,7 @@ use std::sync::Mutex;
 use super::placeholder;
 use super::rules::{self, RULES};
 use super::session::SessionStore;
-use crate::config::{is_credential_label, Config};
+use crate::config::{is_credential_label, BlobMode, Config};
 use aho_corasick::AhoCorasick;
 
 // ---------------------------------------------------------------------------
@@ -396,6 +396,50 @@ impl CustomWords {
 }
 
 // ---------------------------------------------------------------------------
+// 多模态 blob 策略镜像
+// ---------------------------------------------------------------------------
+
+/// 响应侧（`restore_final`）与无 Config 的调用点使用的策略镜像。
+///
+/// 为什么需要：还原链路（`restore_tree` → `restore_final`）没有 `Config` 参数，
+/// 若在 `restore_final` 里硬编码默认策略，`mask.multimodal_blob` 的 `off` /
+/// `data_uri` / 自定义阈值在响应侧就完全不生效 —— 与「off 完全退回旧行为」
+/// 的文档承诺矛盾。这里用三个原子量与 `ConfigCenter` 同步（热更新即时生效，
+/// 热路径零锁）。
+static BLOB_ENABLED: AtomicBool = AtomicBool::new(true);
+static BLOB_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+static BLOB_MIN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(8192);
+
+/// 由 `ConfigCenter` 在加载/热更新时调用。
+pub fn set_blob_policy(c: &crate::config::MultimodalBlobConfig) {
+    BLOB_ENABLED.store(c.enabled, Ordering::Release);
+    let mode = match c.mode {
+        BlobMode::Off => 0u8,
+        BlobMode::DataUri => 1u8,
+        BlobMode::Auto => 2u8,
+    };
+    BLOB_MODE.store(mode, Ordering::Release);
+    BLOB_MIN.store(
+        c.min_base64_bytes.clamp(1024, 8 * 1024 * 1024) as u64,
+        Ordering::Release,
+    );
+}
+
+/// 当前 blob 策略（原子读取，供响应侧使用）。
+pub fn current_blob_policy() -> super::blob::BlobPolicy {
+    let mode = match BLOB_MODE.load(Ordering::Acquire) {
+        0 => BlobMode::Off,
+        1 => BlobMode::DataUri,
+        _ => BlobMode::Auto,
+    };
+    super::blob::BlobPolicy {
+        enabled: BLOB_ENABLED.load(Ordering::Acquire),
+        mode,
+        min_base64_bytes: BLOB_MIN.load(Ordering::Acquire) as usize,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // mask
 // ---------------------------------------------------------------------------
 
@@ -412,6 +456,15 @@ pub struct MaskCtx<'a> {
     pub store: &'a SessionStore,
     pub sid: String,
     pub custom: &'a CustomWords,
+    /// 多模态/编码载荷跳过策略（C 方案外置之后的兜底：短 data URI、响应侧等）
+    pub blob: super::blob::BlobPolicy,
+    /// 本请求由 `blob::extract` 注入的 token 集合。
+    ///
+    /// `mask_tree` 会**原样跳过**这些字符串：token 只含 `[a-z0-9-]`，若被
+    /// 多字符自定义词（无边界匹配）或未来新增规则命中，`reinject` 就找不到
+    /// token，会把半成品发给上游。集合由 handler 注入，客户端无法预知
+    /// 随机 nonce，因此不存在「伪造 token 绕过扫描」的入口。
+    blob_tokens: std::collections::HashSet<String>,
     /// 前缀规则正则：**构造时预编译一次**。
     /// 早期在每个字符串叶子都重算（join 前缀数组 + 取锁 + clone），
     /// 实测 3000 条消息的请求里这一项就占 10ms。
@@ -431,8 +484,24 @@ impl<'a> MaskCtx<'a> {
             store,
             sid,
             custom,
+            blob: super::blob::BlobPolicy::from_config(&cfg.mask.multimodal_blob),
+            blob_tokens: std::collections::HashSet::new(),
             prefix_rx,
         }
+    }
+
+    /// 注入本请求外置的 blob token（防被自定义词/规则改写）。
+    pub fn with_blob_tokens<I>(mut self, tokens: I) -> Self
+    where
+        I: IntoIterator<Item = String>,
+    {
+        self.blob_tokens = tokens.into_iter().collect();
+        self
+    }
+
+    /// 是否为外置 token（前缀快速筛选 + 集合精确匹配）。
+    pub fn is_blob_token(&self, s: &str) -> bool {
+        !self.blob_tokens.is_empty() && s.starts_with("kmb-") && self.blob_tokens.contains(s)
     }
 
     /// 已在构造期编译好的前缀正则（clone 成本 = Arc 原子加）。
@@ -891,6 +960,14 @@ pub fn restore_final(
     store: &SessionStore,
     stats: &mut RestoreStats,
 ) -> String {
+    // 多模态/编码载荷：base64 里不可能有本网关签发的占位符，直接跳过还原。
+    // 这同时修掉一个性能坑：base64url 含 `_` 会绕过下面的早退，进三轮正则。
+    //
+    // 策略来自 `ConfigCenter` 同步的原子镜像（`set_blob_policy`），因此
+    // `mode=off` / `data_uri` / 自定义阈值在响应侧同样生效。
+    if super::blob::is_skippable_str(text, &current_blob_policy()) {
+        return text.to_string();
+    }
     if !text.contains('_') && !text.contains('{') {
         return text.to_string();
     }

@@ -18,6 +18,7 @@
 | D5 | 进度管理 | `PLAN.md`（本文件）+ `PROGRESS.md`（进度台账）落地在 `maskit-rs/`，每完成一个里程碑即时更新 |
 | **D6** | **fail-closed 语义**（v1.1 新增，取代 D3 中「非三大协议一律透传」） | **与 Python 版逐条对齐**：是否脱敏只由「是否落在已配置上游路由 + `fail_closed` + body 能否解析」决定，**与协议识别结果无关**。已路由 + `fail_closed=true`：非 JSON → 503；JSON 解析失败 → 400；body > 32MiB → 413；形态未知（含非对象根）→ 整棵脱敏并记 `unknown_shape`。仅当 `fail_closed=false` 或脱敏暂停（pause）时才透传，并记 `BYPASS` 事件。详见 §2.2 判定矩阵 |
 | **D7** | **零宽环视断言移植策略**（v1.1 新增） | `RULES` 含 **43 处零宽环视**（19×`(?<!`、21×`(?!`、3×`(?=`），`regex` crate 不支持且 `fancy-regex` 会引入回溯。**内置规则一律不引入回溯引擎**：环视下沉为「零宽断言校验器」（`BoundaryCheck`），与既有 `_card_ok/_idcard_ok/...` 同层，**匹配区间与 `value_group` 语义逐字节不变**。用户自定义正则例外：`regex` 编译失败才回退 `fancy-regex`，强制单规则预算熔断。详见 §4.4 |
+| **D8** | **多模态/编码载荷（base64）跳过**（v1.2 新增） | 大 base64 落在未豁免位置时会被规则引擎线性扫描（实测 1MB 随机 base64 5~10s；规则全关仍 7.8s，损耗在 `mask()` 的公共预筛/扫描路径）。**A+C 方案**：A 扩充路径豁免（`input_audio`/`input_file`/`video_url` 容器 + `media_value_keys` 兜住 Responses 的字符串形态）；C 在 JSON 解析**之前**按值形态（data URI / ≥8KiB 裸 base64）把值位置字符串替换成短 token，脱敏只处理小 body，转发前按原始字节拼回；B 的形态判定保留在 `mask_tree`/`restore_final` 作兜底。配置 `mask.multimodal_blob`（`off`/`data_uri`/`auto`）。**残余风险如实声明**：PII 文本先 base64 再塞进图片字段，本网关不识别 |
 
 ---
 

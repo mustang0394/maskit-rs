@@ -169,6 +169,67 @@ pub const ALL_BUILTIN_RULES: &[&str] = &[
     "USCC",
 ];
 
+/// 多模态 / 编码载荷（base64）跳过策略。
+///
+/// 背景：大 base64 字段若落在未豁免位置，会被规则引擎线性扫描 ——
+/// 1MB 随机 base64 实测 5~10 秒（本机容器配额下）。本策略按**值形态**
+/// （data URI / 大块裸 base64）识别并跳过，与字段名解耦，因此自定义/中转
+/// 字段也能覆盖。详见 `src/mask/blob.rs`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BlobMode {
+    /// 关闭（行为与改动前完全一致）
+    Off,
+    /// 只跳过 `data:...;base64,` 形态的 data URI
+    DataUri,
+    /// data URI + 大块裸 base64（默认）
+    #[default]
+    Auto,
+}
+
+/// 宽松反序列化：写错值（`"disabled"` / 大小写 / 带空格）时**退化为 auto**，
+/// 而不是让整份 `Config` 反序列化失败 —— 后者会让 `ConfigCenter` 回退默认值，
+/// 连 `upstream.target` / `panel_token` 一起丢掉。
+impl<'de> Deserialize<'de> for BlobMode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        Ok(match s.trim().to_ascii_lowercase().as_str() {
+            "off" | "none" | "disabled" | "false" => BlobMode::Off,
+            "data_uri" | "datauri" | "data-uri" => BlobMode::DataUri,
+            _ => BlobMode::Auto,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MultimodalBlobConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub mode: BlobMode,
+    /// 裸 base64 的最小长度阈值（字节）。低于此长度的字符串照常扫描；
+    /// data URI 不受此限。规整时夹在 [1KiB, 8MiB]。
+    #[serde(default = "default_blob_min_base64_bytes")]
+    pub min_base64_bytes: usize,
+}
+
+fn default_blob_min_base64_bytes() -> usize {
+    8192
+}
+
+impl Default for MultimodalBlobConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            mode: BlobMode::Auto,
+            min_base64_bytes: default_blob_min_base64_bytes(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MaskConfig {
     #[serde(default = "default_true")]
@@ -228,6 +289,9 @@ pub struct MaskConfig {
     /// 凭据类无论如何永不落库）
     #[serde(default = "default_true")]
     pub record_plaintext_words: bool,
+    /// 多模态 / 编码载荷（base64）跳过策略（C 方案：解析前外置 + 原字节拼回）
+    #[serde(default)]
+    pub multimodal_blob: MultimodalBlobConfig,
 }
 
 fn default_true() -> bool {
@@ -266,6 +330,7 @@ impl Default for MaskConfig {
             mapping_ttl: default_mapping_ttl(),
             ner_enabled: false,
             record_plaintext_words: true,
+            multimodal_blob: Default::default(),
         }
     }
 }
@@ -497,6 +562,21 @@ impl Config {
                 "full_trace_max_bytes 小于 4KiB，已抬到 4KiB（过小会截掉大部分报文）".into(),
             ));
         }
+        // 多模态 blob 阈值：太小会把普通长文本误判成 base64，太大则失去跳过意义。
+        // 与 `normalized()` 的 clamp 同口径（不因 mode=off 就跳过检查）。
+        if self.mask.multimodal_blob.enabled {
+            let m = self.mask.multimodal_blob.min_base64_bytes;
+            if m < 1024 {
+                warnings.push(ConfigWarning(
+                    "mask.multimodal_blob.min_base64_bytes 小于 1KiB，已抬到 1KiB".into(),
+                ));
+            }
+            if m > 8 * 1024 * 1024 {
+                warnings.push(ConfigWarning(
+                    "mask.multimodal_blob.min_base64_bytes 超过 8MiB 上限，已截断到 8MiB".into(),
+                ));
+            }
+        }
         warnings
     }
 
@@ -535,6 +615,12 @@ impl Config {
         if c.mask.mapping_ttl == 0 {
             c.mask.mapping_ttl = 24 * 3600;
         }
+        // 多模态 blob 阈值夹在 [1KiB, 8MiB]（与 `BlobPolicy::from_config` 同口径）。
+        c.mask.multimodal_blob.min_base64_bytes = c
+            .mask
+            .multimodal_blob
+            .min_base64_bytes
+            .clamp(1024, 8 * 1024 * 1024);
         // 完整报文诊断环：条数封顶 200，单侧上限夹在 [4KiB, 32MiB]。
         // 0 是合法的「关闭」，不参与抬升。
         c.full_trace_count = c.full_trace_count.min(200);
@@ -615,9 +701,11 @@ impl ConfigCenter {
             paused: AtomicBool::new(cfg.paused),
             max_body_bytes: AtomicU64::new(cfg.mask.max_body_bytes as u64),
             version: AtomicU64::new(1),
-            inner: RwLock::new(cfg),
+            inner: RwLock::new(cfg.clone()),
             data_dir: data_dir.to_path_buf(),
         });
+        // 启动时同步一次 blob 策略镜像（响应侧还原链路使用）。
+        crate::mask::engine::set_blob_policy(&cfg.mask.multimodal_blob);
         Ok((center, warnings))
     }
 
@@ -750,6 +838,8 @@ impl ConfigCenter {
         self.paused.store(cfg.paused, Ordering::Release);
         self.max_body_bytes
             .store(cfg.mask.max_body_bytes as u64, Ordering::Release);
+        // 响应侧还原链路没有 Config，靠这个原子镜像跟随热更新。
+        crate::mask::engine::set_blob_policy(&cfg.mask.multimodal_blob);
     }
 
     /// 热更新后需要重建的组件由订阅方通过 version 变化感知。

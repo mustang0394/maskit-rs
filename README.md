@@ -81,6 +81,7 @@ MASKIT_RS_DATA_DIR=/var/lib/maskit-rs ./target/release/maskit-rs
 - **自定义敏感词分组**：分组是独立实体（`mask.custom_word_groups` 有序声明 + `mask.custom_words` 的 `{词: 分组}`），可以**只有名字没有词**——先建组、再往组里加词，不必每次重打分组名；支持组内搜索、重命名、整组/逐词启用、整词匹配、批量粘贴；以 `re:` 开头的词按正则处理
 - **多轮一致性**：同一原文在 TTL 内复用同一占位符（`session_ttl`，默认 600s）
 - **路径感知脱敏**：协议位置字段（`role`/`model`/`id` 等）不动，业务区（工具参数）强制扫描
+- **多模态载荷跳过（A + C）**：协议位置（`image_url` / `source.data` / `inline_data.data`）照旧豁免；另外在 JSON 解析**之前**按值形态识别 data URI 与大块裸 base64（默认 ≥8KiB），替换成短 token，脱敏管线只处理小 body，转发前按原始字节拼回。覆盖 `input_audio` / `input_file` / `video_url` 以及自定义、中转字段。实测 1MB base64 的脱敏耗时从 5~10 秒降到百毫秒级。跳过只针对「编码载荷」，同请求里的文本字段照常扫描；事件 `message` 会标注 `blob_skipped=N bytes=M`
 - **流式还原**：SSE / NDJSON 逐事件还原，跨 chunk 的半截占位符扣留后拼合
   - 覆盖范围：Chat Completions（`delta.content` / `reasoning_content` / `reasoning` / `reasoning_details[]` / `tool_calls.arguments`）、Anthropic（`text` / `thinking` / `partial_json`）、Responses API（`output_text` / `reasoning_summary_text` / `function_call_arguments`）、Ollama NDJSON（`message.content` / `message.thinking` / 结构化 `tool_calls`）
   - 每个事件里**未被槽位接管的其余文本**也会走一次整树兜底还原 —— 各家中转的字段名远比协议文档多，逐个列举等于打地鼠
@@ -90,7 +91,7 @@ MASKIT_RS_DATA_DIR=/var/lib/maskit-rs ./target/release/maskit-rs
 - **token 用量统计**：按模型统计输入/输出 token（`/api/stats/today`、`/api/stats/models`）。**只统计数量，不做价格/费用计算**
 - **事件与统计**：SQLite（事件表与 Python 版同 schema，可互读写；Rust 版另增一张 `placeholder_map` 映射表，见下）、每日聚合、保留期清理
 - **控制台**：单文件原生 JS（无构建步骤）。日志/审计/敏感词均为**主从双栏**；日志详情并排对照「原文（客户端发出）」与「发给上游（已脱敏）」（`masked_dialog`），并展示本次请求的**全部请求头**（保序、同名头不合并），支持全文搜索、类型过滤、分页、自动刷新；页面状态写入 URL hash（`/console#logs` 可直达、刷新不丢页）
-  - **完整报文（诊断环）**：详情页底部四栏展示最近 N 条请求的**原始字节** —— 原始请求 / 发给上游（已脱敏）/ 上游原始响应（占位符原样）/ 返回客户端（还原后），各栏可一键复制。这是排查「脱敏了没还原」的关键证据：`dialog` 只是抽取后的对话文本，看不到上游回来的占位符原样；「上游原始响应」里被改写、截断的 `{{LABEL_xxxxxx}}` 会被高亮标出。见配置 `full_trace_count`
+  - **完整报文（诊断环）**：详情页底部四栏展示最近 N 条请求的**原始字节** —— 原始请求 / 发给上游（已脱敏）/ 上游原始响应（占位符原样）/ 返回客户端（还原后），各栏可一键复制。这是排查「脱敏了没还原」的关键证据：`dialog` 只是抽取后的对话文本，看不到上游回来的占位符原样；「上游原始响应」里被改写、截断的 `{{LABEL_xxxxxx}}` 会被高亮标出。见配置 `full_trace_count`。注意：多模态载荷外置后，「脱敏后报文」栏显示的是 token 形态（`kmb-…`），实际转发时已按原始字节拼回；「原始请求」栏仍是完整原始字节
   - **请求头日志**：`events[].request_headers`，为 `[[name, value], …]`（保序 + 保留同名重复头，如多个 `accept`）。头名统一转小写。凭据类（`authorization` / `cookie` / `x-api-key` 等）的值按 `mask.log_credential_plaintext` 决定是否显示为 `***`；导出（`/api/logs/export`）**恒剔除**该字段。为防客户端用超大/超多头撑爆事件库，上限为 100 个、单值 2048 字符、合计 16KiB，超限截断并附 `x-shield-truncated` 标记
 - **凭据明文落盘（按设计）**：脱敏命中的映射表 `placeholder_map` 会无条件记录**所有**分类（含凭据类）的 `占位符 → 原文`，用于进程重启后还原历史对话里的占位符。
   因此「凭据类原文永不落库」**只对 `events` 表成立**（受 `mask.log_credential_plaintext` 控制），不适用于映射表；`config.json` 里的原始敏感词同理。**备份数据目录必须加密。**
@@ -144,6 +145,7 @@ maskit-rs/
 | `mask.sensitive_word_whole` | 整词匹配开关（词两侧加边界；单字词自动带 CJK 边界） |
 | `mask.secret_prefixes` | 密钥前缀（默认 `sk-`、`ah-`） |
 | `mask.max_body_bytes` | 请求体上限（默认 32MiB，超出返回 413） |
+| `mask.multimodal_blob` | 多模态/编码载荷跳过策略，默认 `{"enabled":true,"mode":"auto","min_base64_bytes":8192}`。`mode`：`off`（完全关闭，行为与改动前一致）/ `data_uri`（只跳 `data:...;base64,` 形态；注意它**不看 data URI 里装的是不是文本**，不是「更保守」的档位）/ `auto`（data URI + 大块裸 base64）。解析前把值位置上的 blob 替换成短 token，转发前按原始字节拼回，规则引擎不再扫描它们。真正保守的选项只有 `off`。详见「多模态载荷跳过」 |
 | `mask.session_ttl` | 占位符复用窗口（秒，默认 600，仅决定内存复用表条目何时可回收） |
 | `mask.mapping_ttl` | 占位符映射落盘保留期（秒，默认 86400 = 24h）。过期行由后台维护任务清理；设为 `0` 时回落为 24h。需长期保留映射就把它设得足够大（如 `31536000` = 1 年） |
 | `fail_closed` | 已路由流量是否绝不放行未脱敏原文（默认 `true`） |
@@ -162,6 +164,7 @@ maskit-rs/
 - 管理 API 有 Bearer 令牌鉴权 + Origin 校验（拒绝跨站写操作）+ 安全响应头。
 - 事件日志（`events` 表）按 `mask.log_credential_plaintext` 决定是否保留凭据明文；设为 `false` 后导出与日志明细均不含凭据原文。
 - **完整报文诊断环** `trace_blobs` 表存最近 `full_trace_count` 条请求的原始/脱敏/上游响应/还原后报文（含原始敏感明文）。它**同样受 `mask.log_credential_plaintext` 控制**：该开关为 `false` 时整环关闭（不落库）；导出（`/api/logs/export`）不含该表。默认 20 条 × 单侧 1MiB。
+- **多模态载荷跳过是有意为之的例外**：data URI / 大块 base64 不做规则扫描（编码后的随机字符几乎不可能被规则命中，扫描它们只会带来秒级延迟）。残余风险如实声明：**把 PII 文本先 base64 再塞进图片字段，本网关不会识别**。真正保守的选项是 `mask.multimodal_blob.mode=off`（完全退回旧行为）；`data_uri` 只是把跳过范围收窄到 data URI 形态，并不区分其中内容。
 - 占位符映射表 `placeholder_map`（`<数据目录>/shield-events.sqlite3` 内）**按设计存全部原文（含凭据）**，用于重启后还原历史占位符；按 `mask.mapping_ttl` 过期清理。**数据目录的备份必须加密。**
 - 事件库路径：`<数据目录>/shield-events.sqlite3`。备份该文件即可备份历史统计与占位符映射。
 

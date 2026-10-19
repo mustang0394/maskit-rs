@@ -8,6 +8,7 @@
 //! - `tree`：mask_tree / restore_tree（M4）
 //! - `engine`：mask()/restore() 编排（M5）
 
+pub mod blob;
 pub mod engine;
 pub mod exemptions;
 pub mod placeholder;

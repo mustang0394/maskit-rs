@@ -104,9 +104,67 @@ pub fn protocol_parents() -> &'static HashSet<&'static str> {
             "input_image",
             "source",
             "file",
+            // 多模态 / 文件输入容器（Chat input_audio、Responses input_file、
+            // 部分中转的 video_url）。
+            //
+            // 注意：不把 `audio` / `video` 加进来 —— 该集合同时决定 `name` /
+            // `url` / `data` / `id` 的豁免，裸容器名会把 `{"video":{"name":"张三
+            // 的身份证.mp4"}}` 这类业务字段整片放行。Gemini 音频走
+            // `inline_data`（已覆盖），Chat 音频走 `input_audio`。
+            "input_audio",
+            "input_file",
+            "video_url",
         ]
         .into_iter()
         .collect()
+    });
+    &S
+}
+
+/// `media_value_keys` 允许的父容器：媒体/文件载荷键必须落在这些容器内。
+///
+/// 为什么必须收窄：本模块的判据是「业务区外按协议位置判定，**禁止裸字段名
+/// 豁免**」。若只按键名豁免，`{"customer":{"image_url":"张三的照片"}}`、
+/// `{"attachments":[{"video_url":"…?phone=138…"}]}` 这类业务 JSON 会从
+/// 「扫描」变成「豁免」，净增漏检面。
+pub fn media_value_parents() -> &'static HashSet<&'static str> {
+    static S: once_cell::sync::Lazy<HashSet<&'static str>> = once_cell::sync::Lazy::new(|| {
+        [
+            "content",
+            "contents",
+            "parts",
+            "message",
+            "messages",
+            "input",
+            "output",
+            "file",
+            "input_image",
+            "input_file",
+            "image_url",
+            "source",
+            "inline_data",
+            "tool_use",
+            "function",
+            "attachments",
+        ]
+        .into_iter()
+        .collect()
+    });
+    &S
+}
+
+/// 键名本身即语义明确的媒体/文件载荷键：**非业务区**下一律豁免，
+/// 不再要求父键命中 `protocol_parents`。
+///
+/// 为什么需要：Responses API 的 `input_image.image_url` 是**字符串直接挂在
+/// content 项下**（父键是 `content`，不是 `input_image`），仅靠“父键必须是
+/// 媒体容器”的判据会漏；`input_file.file_data` 同理。这些键名足够特定，
+/// 裸用不会误伤业务字段（业务区仍优先返回 false）。
+pub fn media_value_keys() -> &'static HashSet<&'static str> {
+    static S: once_cell::sync::Lazy<HashSet<&'static str>> = once_cell::sync::Lazy::new(|| {
+        ["image_url", "file_data", "video_url"]
+            .into_iter()
+            .collect()
     });
     &S
 }
@@ -261,6 +319,7 @@ pub fn protected_key_names() -> &'static HashSet<&'static str> {
             "functionCall",
             "inline_data",
             "image_url",
+            "file_data",
             "source",
             "anthropic_version",
             "thinking",
@@ -376,6 +435,17 @@ pub fn leaf_exempt(key: Option<&str>, parent: Option<&str>, in_business: bool) -
     if in_business {
         return false;
     }
+    // 媒体/文件载荷键：键名 + **已知媒体容器**双重判定。
+    // Responses 的 `input_image.image_url` / `input_file.file_data` 父键是
+    // `content`（字符串直挂内容项），靠父容器白名单覆盖；业务 JSON 里的
+    // 同名键（`customer.image_url`）父键不在白名单，仍照常扫描。
+    if media_value_keys().contains(key)
+        && parent
+            .map(|p| media_value_parents().contains(p))
+            .unwrap_or(false)
+    {
+        return true;
+    }
     if skip_scalar_keys().contains(key) {
         return true;
     }
@@ -455,6 +525,35 @@ mod tests {
         assert!(leaf_exempt(Some("id"), Some("message"), false));
         // 业务对象 id 不豁免
         assert!(!leaf_exempt(Some("id"), Some("customer"), false));
+    }
+
+    #[test]
+    fn multimodal_payload_positions_exempt() {
+        // Chat 音频输入：input_audio.data（父键在 protocol_parents 内）
+        assert!(leaf_exempt(Some("data"), Some("input_audio"), false));
+        // Responses 图片：input_image.image_url 是**字符串直挂 content 项下**
+        // （父键是 content），靠 media_value_keys 兜住
+        assert!(leaf_exempt(Some("image_url"), Some("content"), false));
+        // Responses 文件：input_file.file_data 同理
+        assert!(leaf_exempt(Some("file_data"), Some("content"), false));
+        assert!(leaf_exempt(Some("file_data"), Some("input_file"), false));
+        // 视频容器里的 url
+        assert!(leaf_exempt(Some("url"), Some("video_url"), false));
+        // 普通 http URL 也豁免（协议位置语义，避免签名参数被误改写）
+        assert!(leaf_exempt(Some("image_url"), Some("input_image"), false));
+        // video_url 作为字符串值时，父容器在 media_value_parents 内才豁免
+        assert!(leaf_exempt(Some("video_url"), Some("content"), false));
+        // 业务区仍然必须扫描
+        assert!(!leaf_exempt(Some("file_data"), Some("input"), true));
+        assert!(!leaf_exempt(Some("image_url"), Some("arguments"), true));
+        // 非协议位置的普通 url 不豁免（回归锁）
+        assert!(!leaf_exempt(Some("url"), Some("attachments"), false));
+        // 业务 JSON 里的同名字段不得被裸字段名豁免（S4 回归锁）
+        assert!(!leaf_exempt(Some("image_url"), Some("customer"), false));
+        assert!(!leaf_exempt(Some("file_data"), Some("customer"), false));
+        // audio/video 不再作为协议容器（避免 name/url/id 整片豁免）
+        assert!(!leaf_exempt(Some("name"), Some("video"), false));
+        assert!(!leaf_exempt(Some("url"), Some("audio"), false));
     }
 
     #[test]

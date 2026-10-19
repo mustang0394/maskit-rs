@@ -115,9 +115,47 @@ pub fn cap_body(text: &str, max_bytes: usize) -> (String, bool) {
     (out, true)
 }
 
+/// 按**字节**上限截断原始字节（避免先 `from_utf8_lossy` 全量复制）。
+///
+/// 语义与 `cap_body` 一致；多一个大 base64 请求时，省掉一次「先把 32MiB
+/// 全量转成 String、再截掉 31MiB」的浪费。
+pub fn cap_body_bytes(raw: &[u8], max_bytes: usize) -> (String, bool) {
+    if max_bytes == 0 || raw.len() <= max_bytes {
+        return (String::from_utf8_lossy(raw).to_string(), false);
+    }
+    let mut end = max_bytes;
+    // 回退到 UTF-8 字符边界（不切断多字节字符）
+    while end > 0 && (raw[end] & 0xC0) == 0x80 {
+        end -= 1;
+    }
+    let mut out = String::from_utf8_lossy(&raw[..end]).to_string();
+    out.push_str(&format!(
+        "\n…（已截断：原报文 {} 字节，此处保留前 {} 字节）",
+        raw.len(),
+        end
+    ));
+    (out, true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cap_bytes_keeps_short_body_untouched() {
+        let (s, t) = cap_body_bytes(b"hello", 1024);
+        assert_eq!(s, "hello");
+        assert!(!t);
+    }
+
+    #[test]
+    fn cap_bytes_never_splits_utf8() {
+        // 「啊」3 字节；上限 4 落在第二个字符中间，必须回退到 3。
+        let raw = "啊啊".as_bytes();
+        let (s, t) = cap_body_bytes(raw, 4);
+        assert!(t);
+        assert!(s.starts_with('啊'));
+    }
 
     #[test]
     fn cap_keeps_short_body_untouched() {

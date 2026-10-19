@@ -190,7 +190,20 @@ pub fn mask_tree(
     let in_business = path.iter().any(|k| business_keys().contains(k.as_str()));
     match obj {
         Value::String(s) => {
-            if super::exemptions::leaf_exempt(key, parent, in_business) {
+            // 本请求由 `blob::extract` 注入的 token 必须原样保留：它只含
+            // `[a-z0-9-]`，若被无边界自定义词命中，转发前就拼不回原始载荷。
+            if ctx.is_blob_token(s) {
+                return Ok(obj.clone());
+            }
+            // 路径豁免（协议位置）或值形态豁免（data URI / 大块裸 base64）。
+            // 后者是 C 方案的兜底层：解析前外置已移走绝大多数大载荷，这里覆盖
+            // 短 data URI、未知形态与响应侧字符串。
+            //
+            // 注意：形态豁免**优先于业务区**（in_business —— 编码载荷无论落在
+            // 工具参数还是普通字段，规则扫描都无收益），这是有意为之的例外。
+            if super::exemptions::leaf_exempt(key, parent, in_business)
+                || super::blob::is_skippable_str(s, &ctx.blob)
+            {
                 return Ok(obj.clone());
             }
             let out = ctx.mask(s);
@@ -1054,5 +1067,77 @@ mod tests {
         assert!(s.contains("\\u5f20"), "ensure_ascii=True 形态");
         let s2 = serialize_compact(&v, false);
         assert!(s2.contains("张三"), "ensure_ascii=False 形态");
+    }
+
+    #[test]
+    fn mask_body_skips_isomorphic_blobs_in_unexempted_fields() {
+        // B 的兜底层：即使没走 proxy 的外置（例如短 data URI、或直接调 mask_body），
+        // 未豁免字段上的 data URI / 大块裸 base64 也应按值形态跳过；
+        // 同一 body 里的文本 PII 仍必须脱敏。
+        let c = Ctx2::new(&[]);
+        let payload = "Ab1+Zx9/".repeat(2048); // 16KB，多字符类别
+        let raw = format!(
+            r#"{{"text":"手机 13800138000","attachments":[{{"name":"a.png","url":"data:image/png;base64,{payload}"}}],"blob":"{payload}"}}"#
+        );
+        let out = c.mask_body(raw.as_bytes());
+        let v: Value = serde_json::from_str(&out.text).unwrap();
+        assert_eq!(
+            v["attachments"][0]["url"],
+            format!("data:image/png;base64,{payload}"),
+            "data URI 必须原样保留"
+        );
+        assert_eq!(v["blob"], payload, "大块裸 base64 必须原样保留");
+        assert!(
+            !out.text.contains("13800138000"),
+            "文本 PII 仍必须脱敏: {}",
+            out.text
+        );
+    }
+
+    /// 短 data URI（低于 min_base64_bytes）也必须跳过：data URI 不看长度。
+    #[test]
+    fn mask_body_skips_short_data_uri() {
+        let c = Ctx2::new(&[]);
+        let raw = r#"{"attachments":[{"url":"data:image/png;base64,AAAA"}]}"#;
+        let out = c.mask_body(raw.as_bytes());
+        assert_eq!(out.text.as_bytes(), raw.as_bytes(), "短 data URI 零改写");
+    }
+
+    /// 重复键 + blob：`has_dup_keys=true` 会禁用 splice、走整棵重序列化，
+    /// token 化后的小 body 在这条路径上仍必须保持结构正确。
+    #[test]
+    fn mask_body_blob_with_duplicate_keys_roundtrips() {
+        let c = Ctx2::new(&[]);
+        let p1 = "Ab1+Zx9/".repeat(1024);
+        let p2 = "Zx9/Ab1+".repeat(1024);
+        let raw =
+            format!(r#"{{"a":"data:image/png;base64,{p1}","a":"data:image/png;base64,{p2}"}}"#);
+        let out = c.mask_body(raw.as_bytes());
+        assert!(out.reserialized, "重复键必须走重序列化");
+        let v: Value = serde_json::from_str(&out.text).unwrap();
+        assert_eq!(
+            v["a"],
+            format!("data:image/png;base64,{p2}"),
+            "重复键后者覆盖（与 Python 一致），且 blob 原样保留"
+        );
+    }
+
+    /// 外置 token 不得被无边界自定义词改写（否则 reinject 会失败）。
+    #[test]
+    fn blob_tokens_are_never_masked() {
+        let token = "kmb-deadbeefdeadbeefdeadbeefdeadbeef-000000";
+        let mut c = Ctx2::new(&[]);
+        c.cfg
+            .mask
+            .custom_words
+            .insert(token.to_string(), "WORD".into());
+        c.custom = CustomWords::build(&c.cfg);
+        let ctx = MaskCtx::new(&c.cfg, &c.store, "j".into(), &c.custom)
+            .with_blob_tokens(vec![token.to_string()]);
+        let v = json!({"x": token});
+        let mut changed = false;
+        let out = mask_tree(&v, &ctx, None, None, &mut Vec::new(), 0, &mut changed).unwrap();
+        assert_eq!(out["x"], token, "外置 token 不得被自定义词改写");
+        assert!(!changed);
     }
 }

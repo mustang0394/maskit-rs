@@ -48,6 +48,11 @@
     "mapping_ttl": 86400,
     "ner_enabled": false,
     "record_plaintext_words": true,
+    "multimodal_blob": {
+      "enabled": true,
+      "mode": "auto",
+      "min_base64_bytes": 8192
+    },
     "sensitive_disabled": [],
     "sensitive_word_disabled": {},
     "sensitive_word_whole": []

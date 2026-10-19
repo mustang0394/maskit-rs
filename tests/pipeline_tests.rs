@@ -1108,3 +1108,173 @@ async fn gzip_response_is_decoded_then_restored() {
     assert_eq!(ev.unresolved, 0, "不应有未还原项");
     handle.abort();
 }
+
+// ===========================================================================
+// 多模态 blob（C 方案：解析前外置 + 转发前拼回）
+// ===========================================================================
+
+/// 构造多类别、非 hex 的伪 base64；尾部带 `+13800138000+` ——
+/// 手机号两侧都是非 word 字符（`+`），若被扫描必然命中 PHONE 规则，
+/// 正好用来证明「blob 真的被跳过了」。
+fn blob_payload(len: usize) -> String {
+    let mut s = String::with_capacity(len + 32);
+    while s.len() < len {
+        s.push_str("Ab1+Zx9/");
+    }
+    s.push_str("+13800138000+");
+    s
+}
+
+/// C 方案核心断言：未豁免字段上的大 data URI 被外置后**逐字节拼回**，
+/// 同请求里的文本 PII 仍正常脱敏，事件标注跳过统计。
+#[tokio::test]
+async fn multimodal_blob_is_externalized_and_reinjected_byte_identical() {
+    let h = Harness::new(true, false, true).await;
+    let payload = blob_payload(16 * 1024);
+    let uri = format!("data:image/png;base64,{payload}");
+    let body = serde_json::json!({
+        "model": "gpt-4o",
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": format!("看图，我的手机 {SENTINEL_PHONE}")},
+                {"type": "image_url", "image_url": {"url": uri.clone()}}
+            ]
+        }],
+        // 自定义字段：路径豁免表覆盖不到，靠值形态判定（B 的判定被 C 复用）
+        "attachments": [{"name": "a.png", "url": uri.clone()}]
+    })
+    .to_string();
+
+    let (status, _) = h
+        .send("POST", "/v1/chat/completions", "application/json", &body)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let up = h.mock.last_body().expect("上游应收到请求");
+    let up_v: serde_json::Value = serde_json::from_slice(&up).expect("上游 body 必须是合法 JSON");
+
+    // 1) base64 逐字节保真（含其中形似手机号的数字串 —— 证明脱敏没碰它）
+    let img = up_v["messages"][0]["content"][1]["image_url"]["url"]
+        .as_str()
+        .expect("image_url.url");
+    assert_eq!(img, uri, "image_url 的 data URI 必须逐字节拼回");
+    let att = up_v["attachments"][0]["url"]
+        .as_str()
+        .expect("attachments.url");
+    assert_eq!(att, uri, "未豁免字段的 data URI 也必须逐字节拼回");
+
+    // 2) 同一请求里的文本 PII 仍被脱敏
+    let text = up_v["messages"][0]["content"][0]["text"]
+        .as_str()
+        .expect("text");
+    assert!(
+        !text.contains(SENTINEL_PHONE),
+        "文本里的手机号必须被脱敏: {text}"
+    );
+    assert!(text.contains("{{PHONE_"), "应替换为占位符: {text}");
+
+    // 3) 事件标注跳过的 blob 数量与字节数
+    let ev = find_event(h.bus(), maskit_rs::store::events::EventType::Mask).expect("MASK 事件");
+    assert!(
+        ev.message.contains("blob_skipped=2"),
+        "事件应标注 blob 跳过统计: {}",
+        ev.message
+    );
+    assert!(
+        ev.message.contains(&format!("bytes={}", uri.len() * 2)),
+        "事件字节数应等于两个 data URI 之和: {}",
+        ev.message
+    );
+}
+
+/// 开关关闭时：不外置、不标注，行为退回到改动前（路径豁免仍然生效）。
+#[tokio::test]
+async fn multimodal_blob_switch_off_restores_old_behavior() {
+    let h = Harness::new(true, false, true).await;
+    let mut cfg = h.state.config.get();
+    cfg.mask.multimodal_blob.enabled = false;
+    h.state.config.update(cfg);
+
+    let payload = blob_payload(16 * 1024);
+    let uri = format!("data:image/png;base64,{payload}");
+    let body = serde_json::json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "hi"},
+            {"type": "image_url", "image_url": {"url": uri.clone()}}
+        ]}]
+    })
+    .to_string();
+
+    let (status, _) = h
+        .send("POST", "/v1/chat/completions", "application/json", &body)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let up = h.mock.last_body().expect("上游应收到请求");
+    let up_v: serde_json::Value = serde_json::from_slice(&up).unwrap();
+    assert_eq!(
+        up_v["messages"][0]["content"][1]["image_url"]["url"]
+            .as_str()
+            .unwrap(),
+        uri,
+        "路径豁免仍然保证 image_url 不被改写"
+    );
+    let ev = find_event(h.bus(), maskit_rs::store::events::EventType::Mask).expect("MASK 事件");
+    assert!(
+        ev.message.is_empty(),
+        "关闭时不应出现 blob 统计: {}",
+        ev.message
+    );
+}
+
+/// `mode=data_uri`：只外置 data URI；裸 base64 仍走常规扫描（不外置）。
+#[tokio::test]
+async fn multimodal_blob_data_uri_mode_only_externalizes_data_uris() {
+    let h = Harness::new(true, false, true).await;
+    let mut cfg = h.state.config.get();
+    cfg.mask.multimodal_blob.mode = maskit_rs::config::BlobMode::DataUri;
+    h.state.config.update(cfg);
+
+    let payload = blob_payload(16 * 1024);
+    let uri = format!("data:image/png;base64,{payload}");
+    // 裸 base64（无 data: 前缀）：此模式下不应外置；内容不含可命中的 PII，
+    // 因此「被扫描」与「被外置」在字节上无法区分，靠事件计数断言。
+    let bare = "Ab1+Zx9/".repeat(2048);
+    let body = serde_json::json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "hi"},
+            {"type": "image_url", "image_url": {"url": uri.clone()}}
+        ]}],
+        "attachments": [{"name": "a.bin", "url": bare.clone()}]
+    })
+    .to_string();
+
+    let (status, _) = h
+        .send("POST", "/v1/chat/completions", "application/json", &body)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let up = h.mock.last_body().expect("上游应收到请求");
+    let up_v: serde_json::Value = serde_json::from_slice(&up).unwrap();
+    assert_eq!(
+        up_v["messages"][0]["content"][1]["image_url"]["url"]
+            .as_str()
+            .unwrap(),
+        uri,
+        "data URI 必须逐字节拼回"
+    );
+    assert_eq!(
+        up_v["attachments"][0]["url"].as_str().unwrap(),
+        bare,
+        "裸 base64 在 data_uri 模式下仍走常规扫描（内容不含 PII，字节不变）"
+    );
+    let ev = find_event(h.bus(), maskit_rs::store::events::EventType::Mask).expect("MASK 事件");
+    assert!(
+        ev.message.contains("blob_skipped=1"),
+        "data_uri 模式只应外置 1 个 data URI: {}",
+        ev.message
+    );
+}

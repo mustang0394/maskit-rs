@@ -331,8 +331,40 @@ pub async fn handler(State(state): State<SharedState>, req: Request) -> Response
         return forward_raw(&state, &method_str, &parts.uri, &parts.headers, body_bytes).await;
     }
 
+    // ── 多模态/编码载荷外置（C）：解析前把值位置上的 data URI / 大块 base64
+    //    替换成短 token，转发前再按原始字节拼回。
+    //
+    // 位置很关键：必须在 `load_json_pairs` **之前**。否则解析、重复键检测、
+    // dialog 抽取仍会为每个大 base64 分配/复制一次，C 的收益会少一半。
+    // 计时从「载荷扫描」开始：事件里的 `mask_ms` 应覆盖外置成本，否则
+    // README 的「5~10s → 百毫秒」无法从事件口径复核。
+    let mask_t0 = std::time::Instant::now();
+    let blob_cfg = cfg.mask.multimodal_blob.clone();
+    let blob_policy = crate::mask::blob::BlobPolicy::from_config(&blob_cfg);
+    // 32MiB body 的字节级扫描不能压在 tokio worker 线程上（spawn_blocking）。
+    // 只 clone 一个 `Bytes`（引用计数），零字节复制。
+    let body_for_extract = body_bytes.clone();
+    let extraction = tokio::task::spawn_blocking(move || {
+        crate::mask::blob::extract(&body_for_extract, &blob_policy)
+    })
+    .await
+    .ok()
+    .flatten();
+    let blob_count = extraction.as_ref().map(|e| e.blobs.len()).unwrap_or(0);
+    let blob_bytes = extraction.as_ref().map(|e| e.skipped_bytes).unwrap_or(0);
+    // 无 blob 时零复制；有 blob 时后续管线只处理小 body（转发前拼回）。
+    let eff_body: &[u8] = extraction
+        .as_ref()
+        .map(|e| e.body.as_slice())
+        .unwrap_or(body_bytes.as_ref());
+    let blob_note = if blob_count > 0 {
+        format!("blob_skipped={blob_count} bytes={blob_bytes}")
+    } else {
+        String::new()
+    };
+
     // ── 判定⑤：JSON 解析失败 ──
-    let text = String::from_utf8_lossy(&body_bytes).to_string();
+    let text = String::from_utf8_lossy(eff_body).to_string();
     let parsed = tree::load_json_pairs(&text);
     let Some(parsed) = parsed else {
         if fail_closed {
@@ -370,7 +402,14 @@ pub async fn handler(State(state): State<SharedState>, req: Request) -> Response
                 ..Default::default()
             },
         );
-        return forward_raw(&state, &method_str, &parts.uri, &parts.headers, body_bytes).await;
+        return forward_raw(
+            &state,
+            &method_str,
+            &parts.uri,
+            &parts.headers,
+            body_bytes.clone(),
+        )
+        .await;
     };
 
     // ── 判定⑦：协议探测（只选通道，不 gate 脱敏） ──
@@ -396,7 +435,14 @@ pub async fn handler(State(state): State<SharedState>, req: Request) -> Response
                 ..Default::default()
             },
         );
-        return forward_raw(&state, &method_str, &parts.uri, &parts.headers, body_bytes).await;
+        return forward_raw(
+            &state,
+            &method_str,
+            &parts.uri,
+            &parts.headers,
+            body_bytes.clone(),
+        )
+        .await;
     }
 
     // ── 走脱敏管线（spawn_blocking：CPU 密集不阻塞 IO 线程） ──
@@ -416,26 +462,45 @@ pub async fn handler(State(state): State<SharedState>, req: Request) -> Response
 
     let custom = state.custom_words();
     let config = state.config.clone();
-    let raw = body_bytes.clone();
+    let raw = eff_body.to_vec();
+    // 回退重跑用原始 body（token 被改写时用，极罕见；`Bytes::clone` 零复制）。
+    let orig_raw = body_bytes.clone();
     let sid2 = sid.clone();
     let unknown_shape = !is_llm_shape;
-    let mask_t0 = std::time::Instant::now();
+    let blob_tokens: Vec<String> = extraction
+        .as_ref()
+        .map(|e| e.blobs.iter().map(|b| b.token.clone()).collect())
+        .unwrap_or_default();
+    let extraction_task = extraction;
     let mask_result = tokio::task::spawn_blocking(move || {
         let cfg_ref = config.get();
-        let ctx = MaskCtx::new(&cfg_ref, store, sid2.clone(), &custom);
+        let ctx =
+            MaskCtx::new(&cfg_ref, store, sid2.clone(), &custom).with_blob_tokens(blob_tokens);
         // 事件日志 dialog：与遮蔽同一次解析里抽出**原始**对话文本，
         // 避免为了拿全文再解一遍 JSON。
         let dialog = extract_dialog_from_raw(&raw);
-        tree::mask_body(&raw, &ctx).map(|b| {
-            // 同样抽一份**脱敏后**的对话文本 = 真正发给上游的内容，
-            // 供控制台做「原文 / 发给上游」对照。
-            let masked_dialog = extract_dialog_from_raw(b.text.as_bytes());
-            (b, dialog, masked_dialog)
-        })
+        let masked = tree::mask_body(&raw, &ctx)?;
+        // 同样抽一份**脱敏后**的对话文本 = 真正发给上游的内容，
+        // 供控制台做「原文 / 发给上游」对照。
+        let masked_dialog = extract_dialog_from_raw(masked.text.as_bytes());
+        // 拼回外置载荷。若 token 在脱敏阶段被改写（自定义词恰好命中 nonce），
+        // 绝不能把残留 token 发给上游 —— 回退到「未外置」路径重跑一次
+        // （慢，但正确；触发条件极罕见）。
+        let final_text = match &extraction_task {
+            Some(e) => match crate::mask::blob::reinject_checked(&masked.text, &e.blobs) {
+                Some(t) => t,
+                None => {
+                    tracing::warn!("blob token 在脱敏后被改写，回退到未外置路径（本请求会变慢）");
+                    tree::mask_body(&orig_raw, &ctx)?.text
+                }
+            },
+            None => masked.text.clone(),
+        };
+        Ok::<_, String>((masked, dialog, masked_dialog, final_text))
     })
     .await;
 
-    let (masked, req_dialog, req_masked_dialog) = match mask_result {
+    let (masked, req_dialog, req_masked_dialog, final_text) = match mask_result {
         Ok(Ok(m)) => m,
         Ok(Err(e)) => {
             // ── 判定⑨：脱敏抛异常 → 503（与协议无关） ──
@@ -529,7 +594,7 @@ pub async fn handler(State(state): State<SharedState>, req: Request) -> Response
         unresolved: 0,
         unresolved_samples: vec![],
         unknown_shape,
-        message: String::new(),
+        message: blob_note.clone(),
         request_headers: log_headers.clone(),
         ..Default::default()
     };
@@ -543,8 +608,9 @@ pub async fn handler(State(state): State<SharedState>, req: Request) -> Response
     // （完整报文必然含 API Key 等明文，不能绕过 `log_credential_plaintext` 红线）。
     if keep_plaintext && cfg_now.full_trace_count > 0 {
         let max = cfg_now.full_trace_max_bytes;
-        let (req_raw, raw_tr) =
-            crate::store::trace::cap_body(&String::from_utf8_lossy(&body_bytes), max);
+        // 原始侧按字节截断（避免先把 32MiB 全量转 String 再截掉 31MiB）；
+        // 脱敏侧存 token 形态 —— 大 base64 前缀对排障没有信息量，token 更可读。
+        let (req_raw, raw_tr) = crate::store::trace::cap_body_bytes(&body_bytes, max);
         let (req_masked, masked_tr) = crate::store::trace::cap_body(&masked.text, max);
         state.bus.put_trace(crate::store::trace::TraceBlob {
             sid: sid.clone(),
@@ -580,7 +646,8 @@ pub async fn handler(State(state): State<SharedState>, req: Request) -> Response
     // 转发（脱敏后的 body）+ 响应侧还原
     let mut headers = parts.headers.clone();
     force_identity_encoding(&mut headers);
-    let out_body = Bytes::from(masked.text.clone().into_bytes());
+    // `final_text` = 脱敏结果 + 外置载荷已按原始字节拼回（见 spawn_blocking 内）。
+    let out_body = Bytes::from(final_text.into_bytes());
     // 事件日志 dialog：从**原始**请求体抽对话文本（用户消息）。
     // 这是用户实际发出去的明文，与 items[].original 合起来构成可核对的对照。
     let sess = RestoreSession {

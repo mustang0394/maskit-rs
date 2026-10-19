@@ -561,3 +561,53 @@ cargo test 2>&1 | grep -E "test result" | awk '{s+=}'   # 只累加 passed
 
 **教训**：验证脚本本身就是代码，也要测试。看到「通过数」不等于「没有失败」，
 必须看**失败数**。已改用 verify.sh，不再手写 awk 汇总。
+
+
+## M21：多模态/编码载荷跳过（D8，A+C）
+
+**问题**：`image_url` / `source.data` / `inline_data.data` 之外的 base64 字段
+（Responses 的 `input_image.image_url`、`input_file.file_data`、Chat
+`input_audio.data`、`video_url`、自定义字段）会被整段扫描。实测 1MB 随机 base64：
+未豁免 6~10s、已豁免 100~200ms；**关闭全部内置规则仍需 7.8s** —— 损耗在
+`mask()` 的公共预筛/扫描路径（`candidate_rule_indices` 的 RegexSet/AC），
+不是某条规则命中处理。32MiB 上限下会直接打满客户端超时。
+
+**实现**：
+
+1. `src/mask/blob.rs`（新增）：`BlobPolicy` + `classify_bytes`（data URI /
+   大块裸 base64：严格字符集 + ≥2 字符类别 + 排除纯 hex + `=` 只在尾部）；
+   `extract` 做字节级 JSON **值位置**扫描并 token 化（键名不替换、含反斜杠转义
+   的字符串保守跳过、非合法 UTF-8 放弃外置）；`reinject` 按原始字节拼回。
+2. `src/config.rs`：`mask.multimodal_blob`（`enabled` / `mode` = off|data_uri|auto /
+   `min_base64_bytes`，规整夹在 [1KiB, 8MiB]），向后兼容旧 config。
+3. `src/server/proxy.rs`：提取点放在 `load_json_pairs` **之前**（否则解析、重复键
+   检测、dialog 抽取仍会复制大字段）；转发前拼回；事件 `message` 标注
+   `blob_skipped=N bytes=M`；诊断环原始侧改用 `cap_body_bytes`。
+4. `src/mask/exemptions.rs`：`protocol_parents` 增加 `input_audio` / `input_file` /
+   `video_url` / `audio` / `video`；新增 `media_value_keys`（`image_url` /
+   `file_data` / `video_url`）兜住 Responses 的字符串形态。
+5. `src/mask/tree.rs` + `engine.rs`：`mask_tree` 与 `restore_final` 加形态兜底
+   （短 data URI 直接跳过；响应侧 base64url 含 `_` 不再进三轮正则）。
+
+**验证**：`cargo test` 全绿（新增 blob 单测 10 个、集成测试 2 个）；release 复测
+1MB base64 的自定义字段 7~8s → 约 100ms；上游收到的 base64 逐字节一致，
+同请求文本 PII 仍正常脱敏；`mode=off` 可完全退回旧行为。
+
+**只读评审后的修复（S1–S4）**：
+
+- **S1 token 前缀碰撞**：idx 固定 6 位零填充（等宽 token 互不为前缀），
+  并补「12 个媒体块逐字节往返」回归测试。
+- **S2 token 丢失 fail-open**：`MaskCtx::with_blob_tokens` 让 `mask_tree` 原样
+  跳过外置 token（无边界自定义词可能命中 nonce）；`reinject_checked` 失败时
+  回退到**原始 body** 重跑一次，绝不把残留 token 发给上游。
+- **S3 响应侧配置失效**：`ConfigCenter` 同步原子镜像 `set_blob_policy`，
+  `restore_final` 改读 `current_blob_policy()`，`off`/`data_uri`/阈值在响应侧
+  同样生效。
+- **S4 裸字段名豁免**：`media_value_keys` 增加 `media_value_parents` 父容器
+  白名单（`customer.image_url` 不再被豁免，补回归锁）；`audio`/`video` 从
+  `protocol_parents` 移除（避免 `name`/`url`/`id` 整片放行）。
+- 其他：`extract` 移入 `spawn_blocking`（不压 tokio worker）；`mask_ms` 覆盖
+  外置耗时；`BlobMode` 宽松反序列化（写错值退化为 auto，不再让整份 config
+  回退默认而丢掉上游地址/令牌）；base64 判定收紧为「≥3 类字符且含符号」
+  （排除 base62 长签名/拼接 ID）；data URI 探测窗口 256→1024 字节；
+  `mode=data_uri` 端到端测试（只外置 data URI）。
