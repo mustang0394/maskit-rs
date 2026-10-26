@@ -293,21 +293,16 @@ pub fn restore_sse_event(
                 // 不影响下发内容）。
                 let mut st = RestoreStats::default();
                 restored = crate::mask::tree::restore_tree(&restored, sid, store, &mut st, 0);
-                stats.restored += st.restored;
-                stats.degraded += st.degraded;
-                stats.unresolved += st.unresolved;
-                for s in st.samples {
-                    if stats.samples.len() < 5 && !stats.samples.contains(&s) {
-                        stats.samples.push(s);
-                    }
-                }
+                stats.merge(&st);
             } else {
-                // 非增量事件：整树还原
+                // 无文本槽位事件：整树兜底还原（含未识别的增量事件）。
+                //
+                // ⚠️ 必须连 `samples` 一起合并：早期这里只累加计数，于是
+                // 「未还原 3 处」在控制台只显示数字、看不到具体字符串
+                // （真机排查时无法判断是真泄漏还是密文误报）。
                 let mut st = RestoreStats::default();
                 restored = crate::mask::tree::restore_tree(&restored, sid, store, &mut st, 0);
-                stats.restored += st.restored;
-                stats.unresolved += st.unresolved;
-                stats.degraded += st.degraded;
+                stats.merge(&st);
             }
             out_lines.push(format!(
                 "data: {}",
@@ -405,14 +400,7 @@ pub fn restore_ndjson_line(
         // 一条 NDJSON 里可能同时带 content + thinking + 结构化 tool_calls。
         let mut st = RestoreStats::default();
         restored = crate::mask::tree::restore_tree(&restored, sid, store, &mut st, 0);
-        stats.restored += st.restored;
-        stats.degraded += st.degraded;
-        stats.unresolved += st.unresolved;
-        for s in st.samples {
-            if stats.samples.len() < 5 && !stats.samples.contains(&s) {
-                stats.samples.push(s);
-            }
-        }
+        stats.merge(&st);
         // 终止/帧末:先把滞留的残片补发到本行之前(见 `flush_on_terminal` 说明)
         //
         // 不按 `final_frame` 门控:NDJSON 流式路径下 `final_frame` 通常为 false，
@@ -441,9 +429,8 @@ pub fn restore_ndjson_line(
     }
     let mut st = RestoreStats::default();
     let tree_restored = crate::mask::tree::restore_tree(&restored, sid, store, &mut st, 0);
-    stats.restored += st.restored;
-    stats.unresolved += st.unresolved;
-    stats.degraded += st.degraded;
+    // 与槽位分支一致：样本必须一起合并（否则流式永远拿不到未还原样本）。
+    stats.merge(&st);
     let _ = restored;
     let _ = &mut restored;
     serde_json::to_string(&tree_restored).unwrap_or_else(|_| line.to_string())
@@ -775,6 +762,36 @@ mod tests {
             "跨事件拆分的占位符必须还原：{out}"
         );
         assert!(!out.contains("IPPUBLIC_"), "不得残留任何占位符残片：{out}");
+    }
+
+    /// 回归（真机）：**无文本槽位事件**（没有可识别增量槽位）里查不到映射的
+    /// 占位符，样本必须透传到 `stats`。
+    ///
+    /// 修复前该分支只累加 `restored/unresolved/degraded`，不合并
+    /// `st.samples`，于是控制台「未还原 N 处」看不到具体字符串。
+    ///
+    /// 持全局钩子锁：`restore_sse_event` 的整树兜底依赖「查不到映射」，
+    /// 而同进程 `mod tests` 里有用例会临时装「任何 token 都命中」的 DB 钩子，
+    /// 不串行化会偶发被误还原（CI flaky）。
+    #[test]
+    fn non_slot_event_samples_are_propagated() {
+        let _hook_guard = crate::mask::engine::RevHookGuard::new();
+        let parts = setup();
+        let event = format!(
+            "data: {}",
+            serde_json::json!({
+                "type": "response.in_progress",
+                "note": "幻占位符 {{TERM_zzzzzz}}"
+            })
+        );
+        let mut stats = RestoreStats::default();
+        let _ = restore_sse_event(&event, "s", &parts.1, &mut stats, false);
+        assert_eq!(stats.unresolved, 1);
+        assert_eq!(
+            stats.samples,
+            vec!["{{TERM_zzzzzz}}".to_string()],
+            "无槽位事件的未还原样本必须合并"
+        );
     }
 
     #[test]

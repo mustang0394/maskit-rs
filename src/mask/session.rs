@@ -523,6 +523,19 @@ impl SessionStore {
         Some(real)
     }
 
+    /// 后缀是否为本网关登记过（还原侧「裸形态」可信度判定用）。
+    ///
+    /// 与 [`Self::suffix_real_token`] 相比刻意更宽：只判断「本进程签发过这个
+    /// 6 位后缀」，不比对标签，也不排除反查结果就是该 token 本身
+    ///（`suffix_real_token` 遇到「同一 token」会返回 `None`，不能用于判定）。
+    /// 裸形态（模型剥掉花括号）查不到映射时靠它区分「我们签发过、但映射丢了」
+    /// 与「随机内容被宽松正则误判」。索引随 TTL/LRU 与映射同步淘汰；
+    /// `Ambiguous`（后缀撞车）同样视为登记过 —— 这是有意放宽（宁可少报假阳性），
+    /// 撞车概率是 1/19^6 量级，带来的误计可忽略。
+    pub fn suffix_known(&self, suffix: &str) -> bool {
+        !suffix.is_empty() && self.recent_suffix.contains_key(suffix)
+    }
+
     /// 占位符 → 原文（对齐 `_lookup`：本会话 → 复用表 → 自定义词 → 套娃解包）。
     pub fn lookup(&self, token: &str, sid: &str) -> Option<String> {
         let mut hit: Option<String> = None;

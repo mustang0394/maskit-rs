@@ -34,6 +34,22 @@ pub fn skip_subtree_keys() -> &'static HashSet<&'static str> {
     &S
 }
 
+/// **还原侧**整棵子树跳过的键：provider 加密的不透明内容。
+///
+/// 这些值是 provider（上游）生成的推理密文（base64url），不可能包含本网关
+/// 签发的占位符（base64 字母表里没有花括号），扫描它们纯属浪费；更糟的是
+/// 「宽松遍」会把密文里的随机片段当成被模型改写的占位符（真机：reasoning
+/// item 的 `encrypted_content` 中 `I9HB_dbJQZg` 被计入 `unresolved=3`，控制台
+/// 误报「未还原 3 处」）。修复方式就是整棵跳过，不还原、也不扫描。
+///
+/// 例外：`restore_tree` 仅在值里**不含 `{`** 时跳过 —— 密文里出现花括号说明
+/// 可能混入了待还原占位符，此时宁可继续正常还原，避免把占位符静默下发。
+pub fn restore_skip_subtree_keys() -> &'static HashSet<&'static str> {
+    static S: once_cell::sync::Lazy<HashSet<&'static str>> =
+        once_cell::sync::Lazy::new(|| ["encrypted_content"].into_iter().collect());
+    &S
+}
+
 /// role/type 仅在其协议容器内豁免。
 pub fn role_type_parents() -> &'static HashSet<&'static str> {
     static S: once_cell::sync::Lazy<HashSet<&'static str>> = once_cell::sync::Lazy::new(|| {

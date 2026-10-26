@@ -280,6 +280,19 @@ pub fn mask_tree(
 // restore_tree（对齐 Python `_restore_tree`）
 // ---------------------------------------------------------------------------
 
+/// 子树里是否出现 `{`（不透明密文按 base64url 字符集不该有花括号）。
+///
+/// 用于 `restore_skip_subtree_keys` 的例外判定：密文里出现花括号说明可能混入
+/// 了待还原占位符，此时不能整棵跳过，否则占位符会静默下发且统计为 0。
+fn value_contains_brace(v: &Value) -> bool {
+    match v {
+        Value::String(s) => s.contains('{'),
+        Value::Array(arr) => arr.iter().any(value_contains_brace),
+        Value::Object(map) => map.values().any(value_contains_brace),
+        _ => false,
+    }
+}
+
 /// 递归还原 JSON 树。返回 (还原后的值, 统计)。
 pub fn restore_tree(
     obj: &Value,
@@ -318,6 +331,19 @@ pub fn restore_tree(
             let sibling_keys: std::collections::HashSet<&str> =
                 map.keys().map(String::as_str).collect();
             for (k, v) in map {
+                // 不透明字段（provider 加密的推理内容等）整棵跳过：密文里不可能有
+                // 本网关占位符，扫描既浪费又会让宽松遍误报未还原（见
+                // `restore_skip_subtree_keys` 的说明）。键与值都原样保留
+                //（键名还原也一并跳过；协议键不含占位符，无影响）。
+                //
+                // 例外：值里出现 `{` 时不跳过 —— base64url 不含花括号，出现即
+                // 意味着可能混入了待还原占位符，宁可继续正常还原。
+                if super::exemptions::restore_skip_subtree_keys().contains(k.as_str())
+                    && !value_contains_brace(v)
+                {
+                    out.insert(k.clone(), v.clone());
+                    continue;
+                }
                 let escape = super::exemptions::json_str_keys().contains(k.as_str());
                 let restored = match v {
                     Value::String(s) => Value::String(restore_final(s, sid, escape, store, stats)),

@@ -59,6 +59,42 @@ pub fn clear_rev_lookup_hook() {
     }
 }
 
+/// 测试用：全局 REV 钩子串行锁（跨模块共享）。
+///
+/// 多个用例会写同一个进程级 `REV_LOOKUP_HOOK`，而 `cargo test` 默认**多线程
+/// 并行** —— 不加锁就会互相覆盖。锁放在模块作用域（而非 `mod tests` 内），
+/// 是为了让 `stream` 等**其它模块**里「依赖查不到映射」的用例也能持同一把锁：
+/// 否则它们会与装 `LEAKED` 钩子的用例并发执行，偶发被误还原（CI flaky）。
+#[cfg(test)]
+pub(crate) static REV_HOOK_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// 测试用 RAII guard：持锁期间独占全局钩子，Drop 时摘掉钩子并解锁。
+///
+/// 为什么必须恢复（而不只是加锁）：钩子会**泄露到同进程的其他测试**，
+/// 残留的钩子会让无关用例意外还原成功。
+#[cfg(test)]
+pub(crate) struct RevHookGuard {
+    /// 仅为其 Drop 语义而持有（不需读取）。
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl RevHookGuard {
+    pub(crate) fn new() -> Self {
+        // 上一个用例若 panic，Mutex 会中毒；这里直接忽略毒标记继续。
+        let g = REV_HOOK_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_rev_lookup_hook();
+        RevHookGuard { _lock: g }
+    }
+}
+
+#[cfg(test)]
+impl Drop for RevHookGuard {
+    fn drop(&mut self) {
+        clear_rev_lookup_hook();
+    }
+}
+
 fn rev_db_lookup(token: &str) -> Option<(String, String)> {
     if !REV_HOOK_READY.load(Ordering::Acquire) {
         return None;
@@ -952,6 +988,24 @@ pub struct RestoreStats {
     pub samples: Vec<String>,
 }
 
+impl RestoreStats {
+    /// 合并一次子还原的统计（流式逐帧 / 逐事件聚合用）。
+    ///
+    /// ⚠️ `samples` 必须一起合并：只累加计数的写法会让流式响应永远拿不到
+    /// 未还原样本，控制台只能显示「未还原 N 处」却看不到具体字符串 ——
+    /// 排查时无法区分真泄漏与幻占位符误报（真机踩过）。
+    pub fn merge(&mut self, other: &RestoreStats) {
+        self.restored += other.restored;
+        self.unresolved += other.unresolved;
+        self.degraded += other.degraded;
+        for s in &other.samples {
+            if self.samples.len() < 5 && !self.samples.contains(s) {
+                self.samples.push(s.clone());
+            }
+        }
+    }
+}
+
 /// 还原文本（对齐 Python restore() final=True 形态；流式扣留在 M7 stream 模块）。
 pub fn restore_final(
     text: &str,
@@ -1132,8 +1186,9 @@ fn restore_pass_escaped(
                 // 只对真·转义形态计数（含反斜杠）
                 if m0.as_str().contains('\\') {
                     stats.unresolved += 1;
-                    if stats.samples.len() < 5 {
-                        stats.samples.push(m0.as_str().to_string());
+                    let sample = m0.as_str().to_string();
+                    if stats.samples.len() < 5 && !stats.samples.contains(&sample) {
+                        stats.samples.push(sample);
                     }
                 }
                 out.push_str(m0.as_str());
@@ -1168,7 +1223,10 @@ fn restore_pass_loose(
             .unwrap_or_default();
         let canon = format!("{{{{{}}}}}", tok_body);
         let orig = lookup_with_db(store, &canon, sid);
-        let real = if orig.is_none() && whole.starts_with('{') {
+        // 后缀索引是内存里「本网关签发过这个 token」的旁证（会随 TTL/LRU 淘汰、
+        // 重启后依赖 warmup 回填）：裸形态（模型把花括号剥掉）也要能靠它救回
+        // 调，否则映射一旦过期就永久还原不回来。早期只在带 `{` 时才查索引。
+        let real = if orig.is_none() {
             store.suffix_real_token(&canon)
         } else {
             None
@@ -1184,7 +1242,22 @@ fn restore_pass_loose(
             None => {
                 // 前一字符是反斜杠 → 转义块内部片段，不重复计数
                 let prev_backslash = m0.start() > 0 && text[..m0.start()].ends_with('\\');
-                if !prev_backslash {
+                // 可信度门槛：只有「确实像本网关占位符」的命中才计入 unresolved。
+                //
+                // * 带花括号的残缺形态：花括号不在 base64 字母表里，随机
+                //   ID / 密文几乎不可能伪造，照常计入；
+                // * **裸形态**：必须能在全局后缀索引里查到本进程签发过该 token，
+                //   否则就是随机内容被宽松正则误判 —— 真机回归：responses 推理
+                //   密文 `encrypted_content` 里的 `I9HB_dbJQZg` 被当成占位符，
+                //   一个响应里重复 3 次 → 控制台误报「未还原 3 处」。
+                //
+                // 取舍：后缀索引随 TTL/LRU 与映射同步淘汰；淘汰之后，真实裸
+                // token 的漏还原也不再计数 —— 此时已无法与随机内容区分，宁可
+                // 不误报。旧版 Python 签发的 hex6 后缀不进索引
+                //（`suffix_indexable` 只收纯辅音），同理只在完整 lookup 命中时可见。
+                let credible = whole.starts_with('{')
+                    || store.suffix_known(&placeholder::token_suffix(&canon));
+                if !prev_backslash && credible {
                     stats.unresolved += 1;
                     if stats.samples.len() < 5 && !stats.samples.contains(&whole.to_string()) {
                         stats.samples.push(whole.to_string());
@@ -1221,38 +1294,6 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::mask::session::token_taken;
-
-    /// 全局钩子串行锁：本模块内多个用例会写同一个进程级 `REV_LOOKUP_HOOK`，
-    /// 而 `cargo test` 默认**多线程并行** —— 不加锁就会互相覆盖。
-    ///
-    /// 回归（CI 实测，非本地可稳定重现）：`plain_text_is_not_mistaken_for_token_in_db_fallback`
-    /// 装的 `LEAKED` 钩子抢到了 `rev_lookup_falls_back_to_db_hook` 的读路径，
-    /// 于是后者拿到 `"LEAKED"` 而不是占位符，断言失败。
-    static REV_HOOK_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// RAII：持锁期间独占全局钩子，Drop 时摘掉钩子并解锁。
-    ///
-    /// 为什么必须恢复(而不只是加锁):钩子会**泄露到同进程的其他测试**
-    /// (它们不持这把锁),残留的钩子会让无关用例意外还原成功。
-    struct RevHookGuard {
-        /// 仅为其 Drop 语义而持有(不需读取)。
-        _lock: std::sync::MutexGuard<'static, ()>,
-    }
-
-    impl RevHookGuard {
-        fn new() -> Self {
-            // 上一个用例若 panic,Mutex 会中毒;这里直接忽略毒标记继续。
-            let g = REV_HOOK_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            clear_rev_lookup_hook();
-            RevHookGuard { _lock: g }
-        }
-    }
-
-    impl Drop for RevHookGuard {
-        fn drop(&mut self) {
-            clear_rev_lookup_hook();
-        }
-    }
 
     fn test_ctx(custom_words: &[(&str, &str)]) -> (Config, SessionStore, CustomWords) {
         let mut cfg = Config::default();
@@ -1523,6 +1564,135 @@ mod tests {
         assert_eq!(out, "secret-value");
     }
 
+    /// 流式聚合回归：`RestoreStats::merge` 必须连样本一起合并。
+    ///
+    /// 修复前 sse.rs 非槽位分支 + response.rs 逐帧汇总只累加计数、不合并
+    /// `samples`，于是控制台「未还原 N 处」永远拿不到具体字符串。
+    #[test]
+    fn merge_accumulates_counts_and_samples() {
+        let mut a = RestoreStats {
+            restored: 1,
+            unresolved: 2,
+            degraded: 3,
+            samples: vec!["{{TERM_aaaaaa}}".into()],
+        };
+        let b = RestoreStats {
+            restored: 4,
+            unresolved: 5,
+            degraded: 6,
+            samples: vec!["{{TERM_aaaaaa}}".into(), "{{TERM_bbbbbb}}".into()],
+        };
+        a.merge(&b);
+        assert_eq!((a.restored, a.unresolved, a.degraded), (5, 7, 9));
+        assert_eq!(
+            a.samples,
+            vec!["{{TERM_aaaaaa}}".to_string(), "{{TERM_bbbbbb}}".to_string()],
+            "样本必须合并且去重"
+        );
+        // 上限 5（与事件/控制台展示口径一致）：超出部分丢弃，不得无限增长。
+        let mut big = RestoreStats::default();
+        big.merge(&RestoreStats {
+            samples: (0..7).map(|i| format!("{{{{TERM_aaaaa{i}}}}}")).collect(),
+            ..Default::default()
+        });
+        assert_eq!(big.samples.len(), 5, "样本上限必须是 5");
+    }
+
+    /// 真机回归：responses 推理密文 `encrypted_content` 里的随机片段会被
+    /// 宽松遍的**裸形态**正则命中，但它不是本网关签发的占位符（后缀索引里
+    /// 查不到）→ 不得计入 unresolved，也不得进入样本。
+    ///
+    /// 修复前：该片段在一个响应里重复 3 次 → 控制台误报「未还原 3 处」。
+    #[test]
+    fn loose_bare_random_base64_fragment_is_not_counted() {
+        // 防止其它用例的 DB 钩子残留导致该片段被“还原”。
+        let _hook_guard = RevHookGuard::new();
+        let parts = test_ctx(&[]);
+        // 与真机 `encrypted_content` 同形的合成 base64url（已脱敏，仅保留
+        // 误报片段 `I9HB_dbJQZg`）。
+        let blob = "ZmFrZS1lbmNyeXB0ZWQtcmVhc29uaW5nLWNvbnRlbnQtZm9yLXRlc3RzAA-BqI9HB_dbJQZgZvUoSY5Yg3tcQT15plVr6j6Palim20yQ9VrKb33Q";
+        // 前提：宽松正则确实会命中这个随机片段（这就是误报来源）。
+        assert!(
+            placeholder::loose_placeholder_rx().is_match("I9HB_dbJQZg"),
+            "前提不成立：宽松正则已不再把随机片段当候选"
+        );
+        let mut stats = RestoreStats::default();
+        let out = restore_final(blob, "t", false, &parts.1, &mut stats);
+        assert_eq!(out, blob, "密文必须逐字节原样返回");
+        assert_eq!(stats.unresolved, 0, "随机片段不得计入未还原");
+        assert!(stats.samples.is_empty(), "随机片段不得进入未还原样本");
+
+        // 真机形态：同一段密文在一个响应里重复出现（output_item.added /
+        // output_item.done / response.completed 各一次）→ 仍必须是 0。
+        let repeated = format!("{blob}\n{blob}\n{blob}");
+        let mut stats3 = RestoreStats::default();
+        let out3 = restore_final(&repeated, "t", false, &parts.1, &mut stats3);
+        assert_eq!(out3, repeated);
+        assert_eq!(stats3.unresolved, 0, "重复 3 次也不得累计成 3 处未还原");
+        assert!(stats3.samples.is_empty());
+    }
+
+    /// 新分支锁定：模型把**大小写改写**后的裸 token 交给 `suffix_real_token`
+    /// 救回（lookup 精确匹配会失败，只能靠后缀索引）。
+    #[test]
+    fn loose_bare_case_rewritten_token_restored_via_suffix_index() {
+        let _hook_guard = RevHookGuard::new();
+        let parts = test_ctx(&[]);
+        {
+            let taken = token_taken();
+            let mut s = parts.1.get_mut("t").unwrap();
+            parts.1.remember(&mut s, "ltdsj", "WORK", &taken);
+        }
+        let token = parts.1.get("t").unwrap().fwd["ltdsj"].clone();
+        let label = placeholder::token_label(&token);
+        // 模型「剥花括号 + 后缀大写」：精确 lookup 必然失败。
+        let suffix = placeholder::token_suffix(&token).to_uppercase();
+        let bare = format!("{label}_{suffix}");
+        assert!(
+            parts.1.lookup(&format!("{{{{{bare}}}}}"), "t").is_none(),
+            "前提：大小写改写后不得精确命中"
+        );
+        let mut stats = RestoreStats::default();
+        let out = restore_final(&bare, "t", false, &parts.1, &mut stats);
+        assert_eq!(out, "ltdsj", "后缀索引应把改写形态救回：{bare}");
+        assert_eq!(stats.restored, 1);
+        assert_eq!(stats.degraded, 1, "改写形态必须计入 degraded");
+    }
+
+    /// 可信度门槛的**另一个方向**：后缀索引确认「本网关确实签发过」的裸
+    /// token 仍必须如实计入 unresolved，不能被静默。
+    ///
+    /// 覆盖窗口：映射已清、索引仍在（TTL 未到/LRU 未淘汰）。`prune_recent`
+    /// 之后索引与映射同步删除，此时按取舍不再计数（见 `restore_pass_loose`
+    /// 里的可信度门槛说明）—— 属于“宁可少报也不误报”的已接受代价。
+    #[test]
+    fn loose_bare_known_suffix_is_counted_when_mapping_lost() {
+        let _hook_guard = RevHookGuard::new();
+        let parts = test_ctx(&[]);
+        {
+            let taken = token_taken();
+            let mut s = parts.1.get_mut("t").unwrap();
+            parts.1.remember(&mut s, "ltdsj", "WORK", &taken);
+        }
+        let token = parts.1.get("t").unwrap().fwd["ltdsj"].clone();
+        let bare = token.trim_matches(|c| c == '{' || c == '}').to_string();
+        // 模拟映射丢失：会话 rev 与全局复用表清空，但后缀索引仍记得签发过。
+        {
+            let mut s = parts.1.get_mut("t").unwrap();
+            s.rev.clear();
+        }
+        parts.1.recent_rev.clear();
+        assert!(
+            parts.1.suffix_known(&placeholder::token_suffix(&token)),
+            "前提：后缀索引必须仍记得该 token"
+        );
+        let mut stats = RestoreStats::default();
+        let out = restore_final(&bare, "t", false, &parts.1, &mut stats);
+        assert_eq!(out, bare, "映射丢失时不得猜原文");
+        assert_eq!(stats.unresolved, 1, "本网关签发的裸 token 必须计入未还原");
+        assert_eq!(stats.samples, vec![bare]);
+    }
+
     #[test]
     fn hold_partial_placeholder_streaming() {
         // 半截占位符扣留判定（对齐 restore() 的 pending 逻辑）
@@ -1615,6 +1785,56 @@ mod tests {
         assert!(s.contains("电话13800138000"), "键位占位符必须还原: {s}");
         assert!(!s.contains("{{"), "不应残留占位符: {s}");
         assert_eq!(stats.restored, 1);
+    }
+
+    /// 真机回归：`encrypted_content` 是 provider 加密的推理密文，还原侧对
+    /// **不含花括号**的密文整棵跳过 —— 里面的随机片段既不能被改写，也不能被
+    /// 计入未还原（一个响应里出现 3 次 → 控制台误报「未还原 3 处」）。
+    ///
+    /// 反向保险：密文里若出现 `{`（说明可能混入待还原占位符），不得整棵跳过，
+    /// 否则占位符会静默下发且统计为 0。
+    #[test]
+    fn restore_tree_skips_encrypted_content() {
+        let parts = test_ctx(&[]);
+        // 同一事件里的普通字段仍要还原，证明跳过范围只到不透明字段。
+        {
+            let mut s = parts.1.get_mut("t").unwrap();
+            s.rev.insert("{{TERM_bcdfgh}}".into(), "ltdsj".into());
+        }
+        let blob = "ZmFrZS1lbmNyeXB0ZWQtcmVhc29uaW5nLWNvbnRlbnQtZm9yLXRlc3RzAA-BqI9HB_dbJQZgZvUoSY5Yg3tcQT15plVr6j6Palim20yQ9VrKb33Q";
+        let ev = serde_json::json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                "type": "reasoning",
+                "id": "rs_04249b60d9c2d0ad016adecdaf5f9081a1",
+                "encrypted_content": blob
+            },
+            "text": "用户: {{TERM_bcdfgh}}"
+        });
+        let mut stats = RestoreStats::default();
+        let out = crate::mask::tree::restore_tree(&ev, "t", &parts.1, &mut stats, 0);
+        assert_eq!(
+            out["item"]["encrypted_content"], blob,
+            "brace-free 密文必须逐字节原样保留"
+        );
+        assert_eq!(out["text"], "用户: ltdsj", "普通字段仍须还原");
+        assert_eq!(stats.restored, 1, "只还原密文之外的那一处");
+        assert_eq!(stats.unresolved, 0, "密文里的随机片段不得计入未还原");
+        assert!(stats.samples.is_empty());
+
+        // 反向保险：密文里出现 `{` → 不跳过，占位符仍被还原（不静默）。
+        let ev2 = serde_json::json!({
+            "type": "response.output_item.added",
+            "item": { "encrypted_content": "prefix {{TERM_bcdfgh}} suffix" }
+        });
+        let mut stats2 = RestoreStats::default();
+        let out2 = crate::mask::tree::restore_tree(&ev2, "t", &parts.1, &mut stats2, 0);
+        assert_eq!(
+            out2["item"]["encrypted_content"], "prefix ltdsj suffix",
+            "含花括号的不透明字段不得静默跳过"
+        );
+        assert_eq!(stats2.restored, 1);
     }
 
     /// 键名还原冲突时**不得静默覆盖丢数据**。

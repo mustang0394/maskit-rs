@@ -1109,6 +1109,139 @@ async fn gzip_response_is_decoded_then_restored() {
     handle.abort();
 }
 
+/// 回归（真机）：流式响应的 `unresolved_samples` 必须落进 RESTORE 事件。
+///
+/// 修复前 `response.rs` 逐帧汇总只累加 `unresolved`、不合并 `samples`，
+/// 控制台「未还原 N 处」永远看不到具体字符串 —— 真机排查密文误报时无从定位。
+#[tokio::test]
+async fn streaming_restore_event_keeps_unresolved_samples() {
+    let h = Harness::new(true, false, true).await;
+    // 客户端自己带一个「像占位符、但不是本网关本次签发」的字符串：
+    // 脱敏侧不二次改写，上游原样回显，还原侧查不到映射 → 计未还原。
+    let body = r#"{"model":"gpt-4o","stream":true,"messages":[{"role":"user","content":"未还原哨兵 {{TERM_zzzzzz}}"}]}"#;
+    let (status, _) = h
+        .send("POST", "/v1/chat/completions", "application/json", body)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let ev = find_event(h.bus(), maskit_rs::store::events::EventType::Restore)
+        .expect("流式响应必须产生 RESTORE 事件");
+    // 计数允许偏大：槽位还原后还会做一次整树兜底，幻占位符会被两者各计一次
+    //（sse.rs 里已注明的已知小瑕疵，不影响下发内容）。本用例只验证
+    //「样本必须透传」这一修复点。
+    assert!(ev.unresolved >= 1, "应如实计未还原，实际 {}", ev.unresolved);
+    assert!(
+        ev.unresolved_samples.iter().any(|s| s == "{{TERM_zzzzzz}}"),
+        "未还原样本必须透传到事件：{:?}",
+        ev.unresolved_samples
+    );
+}
+
+/// 响应用例的固定 SSE：同一段 reasoning `encrypted_content` 分别出现在
+/// `output_item.added` / `output_item.done` / `response.completed` 三个事件里
+///（真机 trace 的形态；合成密文里的片段 `I9HB_dbJQZg` 会被宽松遍裸形态正则命中）。
+fn responses_sse_with_encrypted_content() -> String {
+    fn blob() -> String {
+        "ZmFrZS1lbmNyeXB0ZWQtcmVhc29uaW5nLWNvbnRlbnQtZm9yLXRlc3RzAA-BqI9HB_dbJQZgZvUoSY5Yg3tcQT15plVr6j6Palim20yQ9VrKb33Q".to_string()
+    }
+    let item = serde_json::json!({
+        "type": "reasoning",
+        "id": "rs_04249b60d9c2d0ad016adecdaf5f9081a1",
+        "encrypted_content": blob()
+    });
+    let added = serde_json::json!({
+        "type": "response.output_item.added", "output_index": 0, "item": item.clone()
+    });
+    let done = serde_json::json!({
+        "type": "response.output_item.done", "output_index": 0, "item": item
+    });
+    let completed = serde_json::json!({
+        "type": "response.completed",
+        "response": {"id": "resp_x", "output": [{"type": "reasoning", "encrypted_content": blob()}]}
+    });
+    format!(
+        "event: response.output_item.added\ndata: {added}\n\n\
+         event: response.output_item.done\ndata: {done}\n\n\
+         event: response.completed\ndata: {completed}\n\n"
+    )
+}
+
+/// 真机回归（Responses 流式端到端）：reasoning item 的 `encrypted_content`
+/// 随机片段不是占位符，不得让 RESTORE 事件误报未还原。
+///
+/// 修复前：该密文在三个事件各出现一次 → 日志 trace 报「未还原 3 处」
+///（用户报告的原始问题）。
+#[tokio::test]
+async fn responses_sse_encrypted_content_is_not_reported_unresolved() {
+    use axum::routing::any;
+    // 独立 mock 上游：无论请求内容，都回固定的 responses 风格 SSE。
+    let sse = responses_sse_with_encrypted_content();
+    let mock_app = axum::Router::new().fallback(any(move |_req: Request<Body>| {
+        let sse = sse.clone();
+        async move {
+            axum::response::Response::builder()
+                .status(200)
+                .header("content-type", "text/event-stream")
+                .body(Body::from(sse))
+                .unwrap()
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, mock_app).await.ok();
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let (center, _) = ConfigCenter::load_or_init(dir.path()).unwrap();
+    let mut cfg = center.get();
+    cfg.upstream.target = format!("http://{addr}");
+    center.update(cfg);
+    let upstream = Arc::new(UpstreamClient::new_or_placeholder(&center.get().upstream));
+    let bus = EventBus::new();
+    let store: &'static SessionStore = Box::leak(Box::new(SessionStore::new()));
+    let state = Arc::new(AppState::with_store(
+        center,
+        bus.clone(),
+        upstream,
+        None,
+        store,
+    ));
+    let app = build_router(state);
+
+    let body = r#"{"model":"gpt-6.1-sol","stream":true,"input":[{"type":"message","role":"user","content":"hi"}]}"#;
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/responses")
+        .header("content-type", "application/json")
+        .header("accept", "text/event-stream")
+        .body(Body::from(body))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024 * 1024)
+        .await
+        .unwrap();
+    let text = String::from_utf8_lossy(&bytes).to_string();
+    assert!(
+        text.contains("I9HB_dbJQZg"),
+        "密文必须原样下发给客户端：{text}"
+    );
+
+    let ev = find_event(&bus, maskit_rs::store::events::EventType::Restore)
+        .expect("流式响应必须产生 RESTORE 事件");
+    assert_eq!(
+        ev.unresolved, 0,
+        "密文随机片段不得计入未还原（samples={:?}）",
+        ev.unresolved_samples
+    );
+    assert!(
+        ev.unresolved_samples.is_empty(),
+        "不得产生未还原样本：{:?}",
+        ev.unresolved_samples
+    );
+    handle.abort();
+}
+
 // ===========================================================================
 // 多模态 blob（C 方案：解析前外置 + 转发前拼回）
 // ===========================================================================

@@ -350,9 +350,9 @@ pub fn stream_response(
                 let text = String::from_utf8_lossy(data);
                 usage_total.merge(&crate::store::usage::extract_usage(&text));
             }
-            stats_total.restored += stats.restored;
-            stats_total.unresolved += stats.unresolved;
-            stats_total.degraded += stats.degraded;
+            // 计数与样本一起合并：只加计数会让流式响应永远没有未还原样本，
+            // 控制台只能显示「未还原 N 处」而看不到具体字符串。
+            stats_total.merge(&stats);
             // 命令拦截（流式：逐帧处理 pending 缓冲）
             let out = if !blocked {
                 let (o, b) = cmdblock.process_stream_bytes(&out, &sid, store, false);
@@ -379,9 +379,7 @@ pub fn stream_response(
         }
         // 流末：flush 残余
         let (tail, stats) = state.push(b"", &sid, store);
-        stats_total.restored += stats.restored;
-        stats_total.unresolved += stats.unresolved;
-        stats_total.degraded += stats.degraded;
+        stats_total.merge(&stats);
         if !tail.is_empty() && !blocked {
             let (o, _) = cmdblock.process_stream_bytes(&tail, &sid, store, true);
             if trace_max > 0 && !o.is_empty() {
