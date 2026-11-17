@@ -304,6 +304,29 @@
       </div>
 
       <div class="panel">
+        <div class="panel-head">
+          <h2>完整报文（诊断环）</h2>
+          <span class="hint">原始字节，仅当 <code>mask.log_credential_plaintext=true</code> 时采集</span>
+        </div>
+        <div class="row">
+          <label class="field-label" for="traceCount">保留条数</label>
+          <input id="traceCount" type="number" class="narrow" min="0" max="200" />
+          <label class="field-label" for="traceMaxMb">单侧上限</label>
+          <input id="traceMaxMb" type="number" class="narrow" min="1" max="32" step="1" />
+          <span class="hint">MiB（原文 / 脱敏后 / 上游响应 / 还原后，每侧单独算）</span>
+        </div>
+        <div class="row">
+          <label class="field-label" for="traceTotalMb">总预算</label>
+          <input id="traceTotalMb" type="number" class="narrow" min="16" max="4096" step="16" />
+          <span class="hint">MiB（超出后按最旧会话整组淘汰，防止磁盘被撑爆）</span>
+        </div>
+        <p class="hint">
+          单侧上限小于实际报文大小时，导出文件里会显示「存储时截断」—— 把它调到不小于最大请求体
+          即可导出完整报文。保留条数设为 <code>0</code> 会整体关闭诊断环（不落盘、不可导出）。
+        </p>
+      </div>
+
+      <div class="panel">
         <div class="panel-head"><h2>访问令牌</h2></div>
         <div class="row">
           <input id="panelToken" type="password" class="grow mono"

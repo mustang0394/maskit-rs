@@ -696,3 +696,44 @@ cargo test 2>&1 | grep -E "test result" | awk '{s+=}'   # 只累加 passed
   历史明文（既有行为，需产品决策）；P2-8 `.lrow*` 共享类对审计列表的间距微调（已目检无破坏）；
   P2-9 `.d-kv` / `.detail-section` 已成死样式（保留待后续页面复用）；P2-12 ring 合并的
   `take(limit)` 短时挤掉页尾（既有行为，代码逐行等价）。
+
+## M23：完整报文导出完整性 + JSON 格式化（用户实测反馈）
+
+**问题**：导出文件里出现 `═══ 1/4 原始请求 ═══ 1443212 bytes（已截断）`。
+根因不在导出 —— **入库时就截断了**：`trace_blobs` 写入前按 `full_trace_max_bytes`
+（默认 1MiB）截断（`proxy.rs` / `response.rs` 调 `cap_body_bytes`），导出只是如实标注。
+另外截断提示被拼进正文，导出的 JSON 尾部挂着中文，本来也不是合法 JSON、无法格式化。
+
+**实现**：
+
+1. `full_trace_max_bytes` 默认 **1MiB → 32MiB**，与 `mask.max_body_bytes` 对齐
+   → 正常请求不截断，导出即完整；它降级为「防呆上限」。
+2. 新增 `full_trace_total_bytes`（默认 256MiB，夹在 16MiB–4GiB）：写线程按
+   `SUM(LENGTH(primary_body)+LENGTH(secondary_body))` 判断，超预算按**最旧 sid 整组**
+   淘汰 —— 条数上限管不住单条体积（20 组 × 4 侧 × 32MiB 理论 2.5GiB）。
+3. `cap_body` / `cap_body_bytes` **不再把「已截断」拼进正文**：正文保持纯原文（截断时
+   是干净前缀），截断事实由 `truncated` 标志带到导出渲染层。
+4. 导出渲染 `render_trace_text`：
+   - 新增 `pretty_body()`：整段合法 JSON → 2 空格缩进；SSE `data: {...}` / NDJSON
+     → 逐行美化并保留 `data: ` 前缀；非 JSON 原样（绝不丢内容）；单节 > 8MiB 跳过
+     美化并注明（32MiB 美化后接近 60MiB）。
+   - 节头改为 `实际 / 原始 bytes`，截断时写明「存储时按 full_trace_max_bytes=… 截断」。
+   - 抬头增加诊断环配置摘要（保留条数 / 单侧上限），一眼能判断为什么完整/不完整。
+5. 设置页新增「完整报文（诊断环）」面板：保留条数 / 单侧上限(MiB) / 总预算(MiB)，
+   保存走既有的 `POST /config`。
+
+**迁移决策（用户确认）**：**不做旧配置自动迁移**，改为在 UI 暴露配置项 —— 老实例
+`config.json` 里的 `1048576` 保持不变，用户自行在设置页调到 32 并保存。
+
+**验证**：
+- `tests/console_tests.rs::trace_export_is_complete_and_pretty_for_large_body`：
+  1.5MB 请求体端到端断言「不含『已截断』」+「JSON 已缩进换行」+「正文完整」。
+- `db.rs::trace_total_budget_evicts_oldest_groups`：条数不超但字节超预算时，
+  必须整组淘汰最旧的、保留最新的。
+- `console_api::tests::pretty_body_formats_json_and_keeps_raw` /
+  `pretty_body_skips_huge_payload`。
+- `trace.rs::cap_never_splits_utf8` 改为断言正文是纯前缀（不再含提示文本）。
+- `cargo fmt --check` + `clippy -D warnings` + `verify.sh`（455 测试全绿）。
+- 截图确认设置页新面板布局（`backups/log-redesign-shots/dark-settings.png`）。
+
+**说明**：已被截断的历史 trace 无法恢复（数据在写入时就丢了），只对新请求生效。

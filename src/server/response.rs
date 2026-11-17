@@ -426,6 +426,7 @@ pub fn stream_response(
                     "unresolved_samples": stats_total.samples.iter().take(5).cloned().collect::<Vec<_>>(),
                 }),
                 keep: meta.trace_keep,
+            budget_bytes: meta.trace_budget,
             });
         }
 
@@ -463,6 +464,8 @@ pub struct StreamMeta {
     pub trace_max_bytes: usize,
     /// 完整报文诊断环：保留最近多少组（写线程淘汰用）。
     pub trace_keep: usize,
+    /// 完整报文诊断环：总字节预算（写线程超出后按最旧 sid 整组淘汰）。
+    pub trace_budget: usize,
     /// 客户端请求头（随 RESTORE 事件落库，与同请求的 MASK 事件同一份）。
     pub request_headers: Vec<(String, String)>,
 }
@@ -629,6 +632,7 @@ pub fn process_and_emit(
                 "unresolved_samples": outcome.unresolved_samples,
             }),
             keep: meta.trace_keep,
+            budget_bytes: meta.trace_budget,
         });
     }
     // 响应侧 PII 扫描 + 审计

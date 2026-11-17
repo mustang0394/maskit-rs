@@ -465,12 +465,19 @@ pub struct Config {
     /// 关掉凭据明文开关时一并关闭，避免绕过红线。
     #[serde(default = "default_full_trace_count")]
     pub full_trace_count: usize,
-    /// 完整报文**单侧**字节上限（超出按字符边界截断并在详情页标注）。
+    /// 完整报文**单侧**字节上限（原文 / 脱敏后 / 上游响应 / 还原后各算一侧）。
     ///
-    /// 请求体上限默认 32MiB，若原样驻留 20 条会把内存/磁盘打爆，
-    /// 故对每条请求的每一侧（原文/脱敏/上游响应/还原后）单独封顶。
+    /// 默认 32MiB，与 `mask.max_body_bytes` 对齐 —— 即**正常请求不截断**，
+    /// 导出的就是完整报文。它只是防止 `max_body_bytes` 被调大后单条吞掉整个磁盘的
+    /// 安全网（调小它会让导出文件出现「已截断」）。
     #[serde(default = "default_full_trace_max_bytes")]
     pub full_trace_max_bytes: usize,
+    /// 完整报文**总字节预算**（所有保留组之和，默认 256MiB）。
+    ///
+    /// 条数上限（`full_trace_count`）管不住单条体积：20 组 × 4 侧 × 32MiB 理论上
+    /// 能到 2.5GiB。超过本预算时写线程按「最旧 sid」整组淘汰，直到回到预算内。
+    #[serde(default = "default_full_trace_total_bytes")]
+    pub full_trace_total_bytes: usize,
     /// Web 控制台令牌（不限长度，原样生效；空则启动时生成 24 位随机值并写入日志）
     #[serde(default)]
     pub panel_token: String,
@@ -488,7 +495,11 @@ fn default_full_trace_count() -> usize {
 }
 
 fn default_full_trace_max_bytes() -> usize {
-    1024 * 1024
+    32 * 1024 * 1024
+}
+
+fn default_full_trace_total_bytes() -> usize {
+    256 * 1024 * 1024
 }
 
 impl Default for Config {
@@ -505,6 +516,7 @@ impl Default for Config {
             log_retention_days: default_retention(),
             full_trace_count: default_full_trace_count(),
             full_trace_max_bytes: default_full_trace_max_bytes(),
+            full_trace_total_bytes: default_full_trace_total_bytes(),
             panel_token: String::new(),
             paused: false,
         }
@@ -626,6 +638,10 @@ impl Config {
         c.full_trace_count = c.full_trace_count.min(200);
         if c.full_trace_count > 0 {
             c.full_trace_max_bytes = c.full_trace_max_bytes.clamp(4096, 32 * 1024 * 1024);
+            // 总预算夹在 [16MiB, 4GiB]：太小会把诊断环挤成 1~2 组，太大失去兜底意义
+            c.full_trace_total_bytes = c
+                .full_trace_total_bytes
+                .clamp(16 * 1024 * 1024, 4 * 1024 * 1024 * 1024);
         }
         // panel_token 不做长度限制：用户设什么就是什么（仅空值才交给启动逻辑生成）。
         c.panel_token = c.panel_token.trim().to_string();

@@ -1157,6 +1157,47 @@ async fn full_trace_is_downloadable_not_inlined() {
     );
 }
 
+/// 回归（用户实测）：1.5MB 请求体在默认配置下导出的必须是**完整**报文，
+/// 并且 JSON 已格式化 —— 而不是「已截断」+ 一行到底。
+#[tokio::test]
+async fn trace_export_is_complete_and_pretty_for_large_body() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::with_owned_dir(dir);
+    let filler = "x".repeat(1_500_000);
+    let body = format!(
+        r#"{{"model":"gpt-4o","messages":[{{"role":"user","content":"电话{{13800138000}} {filler}"}}]}}"#
+    );
+    let (status, _) = h
+        .req("POST", "/v1/chat/completions", false, Some(&body))
+        .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    let es = h.state.event_store.as_ref().expect("自带事件库");
+    es.sync();
+    let (events, _) = es.fetch_events_page(10, 0, Some("MASK"), None);
+    let ev = events.first().expect("MASK 事件必须落库");
+
+    let (code, raw) = h
+        .req(
+            "GET",
+            &format!("/console/api/logs/trace/download?id={}", ev.id),
+            true,
+            None,
+        )
+        .await;
+    assert_eq!(code, StatusCode::OK);
+    let text = String::from_utf8_lossy(&raw);
+    let head: String = text.chars().take(300).collect();
+    assert!(
+        !text.contains("已截断"),
+        "默认单侧 32MiB 下 1.5MB 请求不得截断（实际头部）：{head}"
+    );
+    assert!(
+        text.contains("\n  \"model\":"),
+        "导出的 JSON 必须已格式化（缩进换行）：{head}"
+    );
+    assert!(text.contains(&filler[..1000]), "完整报文必须包含原始正文");
+}
+
 /// 下载端点必须走管理 API 的鉴权（它是唯一能拿到明文报文的出口）。
 #[tokio::test]
 async fn trace_download_requires_token() {

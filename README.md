@@ -91,7 +91,7 @@ MASKIT_RS_DATA_DIR=/var/lib/maskit-rs ./target/release/maskit-rs
 - **token 用量统计**：按模型统计输入/输出 token（`/api/stats/today`、`/api/stats/models`）。**只统计数量，不做价格/费用计算**
 - **事件与统计**：SQLite（事件表与 Python 版同 schema，可互读写；Rust 版另增一张 `placeholder_map` 映射表，见下）、每日聚合、保留期清理
 - **控制台**：单文件原生 JS（无构建步骤）。日志/审计/敏感词均为**主从双栏**；日志详情并排对照「原文（客户端发出）」与「发给上游（已脱敏）」（`masked_dialog`），并展示本次请求的**全部请求头**（保序、同名头不合并），支持全文搜索、类型过滤、分页、自动刷新；页面状态写入 URL hash（`/console#logs` 可直达、刷新不丢页）
-  - **完整报文（诊断环）**：**只能在详情页点「导出完整报文」下载 `.txt`**，页面不再内联渲染 —— 它最多 4 侧 × 1MiB，一次性塞进 DOM 会把浏览器卡死（这正是 2026-11 那次重构的起因）。导出文件分四节：原始请求 / 发给上游（已脱敏）/ 上游原始响应（占位符原样）/ 返回客户端（还原后），可在文件里直接搜索 `/` 对照。这是排查「脱敏了没还原」的关键证据：`dialog` 只是抽取后的对话文本，看不到上游回来的占位符原样。见配置 `full_trace_count`，端点 `GET /console/api/logs/trace/download?id=N`。注意：多模态载荷外置后，「发给上游」一节显示的是 token 形态（`kmb-…`），实际转发时已按原始字节拼回；「原始请求」一节仍是完整原始字节
+  - **完整报文（诊断环）**：**只能在详情页点「导出完整报文」下载 `.txt`**，页面不再内联渲染 —— 它最多 4 侧 × 单侧上限（默认 32MiB），一次性塞进 DOM 会把浏览器卡死（这正是 2026-11 那次重构的起因）。导出文件分四节：原始请求 / 发给上游（已脱敏）/ 上游原始响应（占位符原样）/ 返回客户端（还原后），JSON 会自动缩进格式化（SSE 的 `data: {...}` 逐事件美化，超过 8MiB 的节原样输出以免文件过大），可在文件里直接搜索 `/` 对照。这是排查「脱敏了没还原」的关键证据：`dialog` 只是抽取后的对话文本，看不到上游回来的占位符原样。见配置 `full_trace_count`，端点 `GET /console/api/logs/trace/download?id=N`。注意：多模态载荷外置后，「发给上游」一节显示的是 token 形态（`kmb-…`），实际转发时已按原始字节拼回；「原始请求」一节仍是完整原始字节
   - **列表只回摘要**：`GET /api/logs` 不返回 `dialog` / `masked_dialog` / `items[]` / `request_headers` / 报文，只回十来个标量 + `item_count` / `header_count`（SQL 层 `json_extract` 投影，不反序列化整条 payload）。对话文本与请求头由 `GET /api/logs/detail?id=N` 按需返回 —— 列表一页 100 条带上这些字段能到数 MB。
   - **请求头日志**：`events[].request_headers`，为 `[[name, value], …]`（保序 + 保留同名重复头，如多个 `accept`）。头名统一转小写。凭据类（`authorization` / `cookie` / `x-api-key` 等）的值按 `mask.log_credential_plaintext` 决定是否显示为 `***`；导出（`/api/logs/export`，接 `q` / `event_type` 筛选，超过 5000 条回 `X-Maskit-Truncated: true`）**恒剔除**该字段。为防客户端用超大/超多头撑爆事件库，上限为 100 个、单值 2048 字符、合计 16KiB，超限截断并附 `x-shield-truncated` 标记
 - **凭据明文落盘（按设计）**：脱敏命中的映射表 `placeholder_map` 会无条件记录**所有**分类（含凭据类）的 `占位符 → 原文`，用于进程重启后还原历史对话里的占位符。
@@ -155,7 +155,8 @@ maskit-rs/
 | `panel_token` | 控制台令牌（不限制长度，原样生效；留空自动生成 24 位随机值） |
 | `mask.log_credential_plaintext` | **`events` 表**是否保留凭据类**明文原文**（默认 `true`）。为 `false` 时只存 sha256 摘要与打码预览。⚠️ 注意：此项**不影响** `placeholder_map` 映射表——它按设计始终存原文 |
 | `full_trace_count` | **完整报文诊断环**保留最近几条（默认 `20`，`0` = 关闭）。存原始请求体 / 脱敏后请求体 / 上游原始响应 / 还原后响应到 `trace_blobs` 表，超出即淘汰。仅当 `mask.log_credential_plaintext=true` 时生效 |
-| `full_trace_max_bytes` | 完整报文**单侧**字节上限（默认 1MiB，夹在 4KiB–32MiB）。超出按 UTF-8 字符边界截断并标注 |
+| `full_trace_max_bytes` | 完整报文**单侧**字节上限（默认 **32MiB**，夹在 4KiB–32MiB）。默认值与 `mask.max_body_bytes` 对齐 → **正常请求不截断，导出即完整**。调小后导出文件会标注「存储时截断」+ 原始字节数 |
+| `full_trace_total_bytes` | 完整报文**总字节预算**（默认 256MiB，夹在 16MiB–4GiB）。条数上限管不住单条体积（20 组 × 4 侧 × 32MiB 理论可达 2.5GiB），超出后写线程按最旧会话整组淘汰 |
 
 ---
 
@@ -164,7 +165,7 @@ maskit-rs/
 - 默认只监听 `127.0.0.1`。要让局域网访问，改 `server.bind` 为 `0.0.0.0` 并**务必设置强令牌**。
 - 管理 API 有 Bearer 令牌鉴权 + Origin 校验（拒绝跨站写操作）+ 安全响应头。
 - 事件日志（`events` 表）按 `mask.log_credential_plaintext` 决定是否保留凭据明文；设为 `false` 后导出与日志明细均不含凭据原文。
-- **完整报文诊断环** `trace_blobs` 表存最近 `full_trace_count` 条请求的原始/脱敏/上游响应/还原后报文（含原始敏感明文）。它**同样受 `mask.log_credential_plaintext` 控制**：该开关为 `false` 时整环关闭（不落库）；导出（`/api/logs/export`）不含该表。默认 20 条 × 单侧 1MiB。
+- **完整报文诊断环** `trace_blobs` 表存最近 `full_trace_count` 条请求的原始/脱敏/上游响应/还原后报文（含原始敏感明文）。它**同样受 `mask.log_credential_plaintext` 控制**：该开关为 `false` 时整环关闭（不落库）；导出（`/api/logs/export`）不含该表。默认 20 条 × 单侧 32MiB，另有 256MiB 总预算兜底。
 - **多模态载荷跳过是有意为之的例外**：data URI / 大块 base64 不做规则扫描（编码后的随机字符几乎不可能被规则命中，扫描它们只会带来秒级延迟）。残余风险如实声明：**把 PII 文本先 base64 再塞进图片字段，本网关不会识别**。真正保守的选项是 `mask.multimodal_blob.mode=off`（完全退回旧行为）；`data_uri` 只是把跳过范围收窄到 data URI 形态，并不区分其中内容。
 - 占位符映射表 `placeholder_map`（`<数据目录>/shield-events.sqlite3` 内）**按设计存全部原文（含凭据）**，用于重启后还原历史占位符；按 `mask.mapping_ttl` 过期清理。**数据目录的备份必须加密。**
 - 事件库路径：`<数据目录>/shield-events.sqlite3`。备份该文件即可备份历史统计与占位符映射。

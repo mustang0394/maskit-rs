@@ -58,6 +58,8 @@ pub struct TraceBlob {
     pub extra: serde_json::Value,
     /// 保留最近多少组（写线程据此淘汰；0 表示关闭，调用方不该入队）
     pub keep: usize,
+    /// 所有保留报文的总字节预算（写线程超出后按最旧 sid 整组淘汰；0 = 不限制）
+    pub budget_bytes: usize,
 }
 
 /// 详情页用的合并视图：`(sid, req)` + `(sid, resp)` 合成一条。
@@ -105,14 +107,8 @@ pub fn cap_body(text: &str, max_bytes: usize) -> (String, bool) {
     while end > 0 && !text.is_char_boundary(end) {
         end -= 1;
     }
-    let mut out = String::with_capacity(end + 48);
-    out.push_str(&text[..end]);
-    out.push_str(&format!(
-        "\n…（已截断：原报文 {} 字节，此处保留前 {} 字节）",
-        text.len(),
-        end
-    ));
-    (out, true)
+    // 同上：正文保持纯原文，不拼提示
+    (text[..end].to_string(), true)
 }
 
 /// 按**字节**上限截断原始字节（避免先 `from_utf8_lossy` 全量复制）。
@@ -128,12 +124,10 @@ pub fn cap_body_bytes(raw: &[u8], max_bytes: usize) -> (String, bool) {
     while end > 0 && (raw[end] & 0xC0) == 0x80 {
         end -= 1;
     }
-    let mut out = String::from_utf8_lossy(&raw[..end]).to_string();
-    out.push_str(&format!(
-        "\n…（已截断：原报文 {} 字节，此处保留前 {} 字节）",
-        raw.len(),
-        end
-    ));
+    // 注意：**不要把「已截断」提示拼进正文**。正文要保持纯原文（截断时也是干净的前缀），
+    // 否则导出文件里的 JSON 尾部挂着中文、无法解析也无法格式化。
+    // 截断事实由 `truncated` 标志带到导出渲染层（见 `render_trace_text`）。
+    let out = String::from_utf8_lossy(&raw[..end]).to_string();
     (out, true)
 }
 
@@ -179,7 +173,7 @@ mod tests {
         let (s, t) = cap_body(text, 4);
         assert!(t);
         assert!(s.starts_with("啊"), "不得切出半个字符：{s:?}");
-        assert!(s.contains("已截断"));
+        assert_eq!(s, "啊", "正文必须只保留纯前缀，不得拼入提示文本");
         // 截断前的部分必须是合法 UTF-8 前缀
         assert!(s.is_char_boundary(3));
     }

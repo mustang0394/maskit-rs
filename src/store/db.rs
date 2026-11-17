@@ -1294,6 +1294,30 @@ fn write_trace(conn: &Connection, t: &TraceBlob) -> rusqlite::Result<()> {
            SELECT sid FROM trace_blobs GROUP BY sid ORDER BY MAX(id) DESC LIMIT ?1)",
         params![keep],
     )?;
+    // 总字节预算：条数上限管不住单条体积（默认单侧 32MiB × 4 侧 × 20 组 ≈ 2.5GiB）。
+    // 超预算时按「最旧 sid」整组淘汰 —— 一组的两行必须同生共死，否则详情里
+    // 只剩请求侧、响应侧凭空消失。
+    if t.budget_bytes > 0 {
+        for _ in 0..(keep.max(1) + 1) {
+            let total: i64 = conn.query_row(
+                "SELECT COALESCE(SUM(LENGTH(primary_body) + LENGTH(secondary_body)), 0) \
+                 FROM trace_blobs",
+                [],
+                |r| r.get(0),
+            )?;
+            if total <= t.budget_bytes as i64 {
+                break;
+            }
+            let n = conn.execute(
+                "DELETE FROM trace_blobs WHERE sid = ( \
+                   SELECT sid FROM trace_blobs GROUP BY sid ORDER BY MAX(id) ASC LIMIT 1)",
+                [],
+            )?;
+            if n == 0 {
+                break;
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1680,10 +1704,45 @@ mod tests {
             truncated: false,
             extra: serde_json::json!({}),
             keep,
+            budget_bytes: 0,
         }
     }
 
     /// 请求/响应两行按 sid 合并，且「保留最近 N 组」按 sid 淘汰。
+    /// 总字节预算：条数没超（keep 很大），但字节数超了 → 按最旧 sid 整组淘汰。
+    /// 这防的是「20 组 × 4 侧 × 32MiB」把磁盘撑爆。
+    #[test]
+    fn trace_total_budget_evicts_oldest_groups() {
+        use crate::store::trace::TraceKind;
+        let dir = tempfile::tempdir().unwrap();
+        let store = EventStore::open(dir.path()).unwrap();
+        let body = "x".repeat(1024); // 每行 1KB；一组两行 = 2KB
+        for i in 0..4 {
+            store.enqueue_trace(TraceBlob {
+                keep: 100,          // 条数不设限
+                budget_bytes: 5000, // 预算 5KB → 只装得下 2 组
+                ..trace_blob(
+                    &format!("sid-{i}"),
+                    TraceKind::Req,
+                    &body.clone(),
+                    &body.clone(),
+                    100,
+                )
+            });
+        }
+        store.sync();
+
+        let surviving: Vec<&str> = ["sid-0", "sid-1", "sid-2", "sid-3"]
+            .into_iter()
+            .filter(|s| store.fetch_trace(s).is_some())
+            .collect();
+        assert_eq!(
+            surviving,
+            vec!["sid-2", "sid-3"],
+            "必须整组淘汰最旧的，且保留最新的"
+        );
+    }
+
     #[test]
     fn trace_roundtrip_and_bounded_ring() {
         use crate::store::trace::TraceKind;

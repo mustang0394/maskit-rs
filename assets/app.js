@@ -1461,6 +1461,9 @@
     $('streamResponse').checked = !!cfg.stream_response;
     $('cmdMode').value = cfg.command_block.mode || 'observe';
     $('retentionDays').value = cfg.log_retention_days;
+    $('traceCount').value = cfg.full_trace_count == null ? 20 : cfg.full_trace_count;
+    $('traceMaxMb').value = Math.max(1, Math.round((cfg.full_trace_max_bytes || 33554432) / (1024 * 1024)));
+    $('traceTotalMb').value = Math.round((cfg.full_trace_total_bytes || 268435456) / (1024 * 1024));
     $('panelToken').value = cfg.panel_token || '';
     $('saveMsg').textContent = '';
   }
@@ -1477,6 +1480,11 @@
       cfg.stream_response = $('streamResponse').checked;
       cfg.command_block.mode = $('cmdMode').value;
       cfg.log_retention_days = parseInt($('retentionDays').value, 10) || 7;
+      cfg.full_trace_count = Math.max(0, parseInt($('traceCount').value, 10) || 0);
+      const traceMaxMb = parseInt($('traceMaxMb').value, 10);
+      if (traceMaxMb > 0) cfg.full_trace_max_bytes = traceMaxMb * 1024 * 1024;
+      const traceTotalMb = parseInt($('traceTotalMb').value, 10);
+      if (traceTotalMb > 0) cfg.full_trace_total_bytes = traceTotalMb * 1024 * 1024;
       const newTok = $('panelToken').value.trim();
       if (newTok && newTok !== cfg.panel_token) cfg.panel_token = newTok;
       const r = await api('/config', { method: 'POST', body: JSON.stringify(cfg) });

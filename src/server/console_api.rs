@@ -355,11 +355,13 @@ pub async fn download_trace(
     let es = es.clone();
     let sid = ev.session_id.clone();
     let ev_for_render = ev.clone();
-    // 最多要读 4 侧 × 单侧上限（默认 1MiB）并拼成一个大 String：放到阻塞池里做，
-    // 不要压在 tokio worker 上（同进程还扛着代理转发）。
+    let trace_count = cfg.full_trace_count;
+    let trace_max = cfg.full_trace_max_bytes;
+    // 最多要读 4 侧 × 单侧上限（默认 32MiB）并拼成一个大 String（还要做 JSON 美化）：
+    // 放到阻塞池里做，不要压在 tokio worker 上（同进程还扛着代理转发）。
     let rendered = tokio::task::spawn_blocking(move || {
         es.fetch_trace(&sid)
-            .map(|t| render_trace_text(&ev_for_render, &t))
+            .map(|t| render_trace_text(&ev_for_render, &t, trace_count, trace_max))
     })
     .await
     .ok()
@@ -424,25 +426,108 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
+/// 单节超过这个大小就跳过 JSON 美化：32MiB 的 body 美化后接近 60MiB，
+/// 既费内存也让文件难打开；原样输出 + 一句说明更实用。
+const PRETTY_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+/// 尽量把报文排版成人能读的样子。
+///
+/// 客户端发的是紧凑 JSON（一行），上游 SSE 是 `data: {...}` 逐事件，
+/// 原样导出就是一坨长行。这里按三种形态分别处理：
+///   1. 整段是合法 JSON → `to_string_pretty`（2 空格缩进）
+///   2. SSE / NDJSON → 逐行解析，`data: ` 前缀保留，JSON 部分美化
+///   3. 其它（纯文本、二进制、非 JSON）→ 原样
+///
+/// 只影响**显示**，不改变数据：解析失败时一律回退原文，绝不丢内容。
+fn pretty_body(text: &str) -> String {
+    if text.is_empty() {
+        return String::new();
+    }
+    if text.len() > PRETTY_MAX_BYTES {
+        return format!(
+            "{text}\n\n[本节约 {} KiB，超过 {} KiB 上限，未格式化输出]",
+            text.len() / 1024,
+            PRETTY_MAX_BYTES / 1024
+        );
+    }
+    let trimmed = text.trim();
+    let looks_json = (trimmed.starts_with('{') && trimmed.ends_with('}'))
+        || (trimmed.starts_with('[') && trimmed.ends_with(']'));
+    if looks_json {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            if let Ok(p) = serde_json::to_string_pretty(&v) {
+                return p;
+            }
+        }
+    }
+    // 逐行：SSE（data: {...}）与 NDJSON 都能覆盖
+    let mut out = String::with_capacity(text.len() + text.len() / 4);
+    let mut any = false;
+    for line in text.lines() {
+        let (has_data_prefix, payload) = match line.strip_prefix("data:") {
+            Some(rest) => (true, rest.trim()),
+            None => (false, line.trim()),
+        };
+        if payload.is_empty() {
+            out.push('\n'); // 保留 SSE 事件之间的空行
+            continue;
+        }
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(payload) {
+            if let Ok(p) = serde_json::to_string_pretty(&v) {
+                if has_data_prefix {
+                    out.push_str("data: ");
+                }
+                out.push_str(&p);
+                out.push('\n');
+                any = true;
+                continue;
+            }
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    if any {
+        out
+    } else {
+        text.to_string()
+    }
+}
+
 /// 把一组完整报文渲染成可读文本（分 4 节，便于贴进 issue / 邮件）。
 fn render_trace_text(
     ev: &crate::store::events::Event,
     t: &crate::store::trace::TraceView,
+    full_trace_count: usize,
+    full_trace_max_bytes: usize,
 ) -> String {
+    // 嵌套 `fn` 不能捕获外部变量，上限值必须显式传进来
     fn section(
         out: &mut String,
         idx: usize,
         title: &str,
-        bytes: usize,
+        original_bytes: usize,
         truncated: bool,
         text: &str,
+        max_bytes: usize,
     ) {
-        out.push_str(&format!(
-            "\n═══ {idx}/4 {title} ═══  {} bytes{}\n\n",
-            bytes,
-            if truncated { "（已截断）" } else { "" }
-        ));
-        out.push_str(if text.is_empty() { "（空）" } else { text });
+        out.push_str(&format!("\n═══ {idx}/4 {title} ═══  "));
+        if truncated {
+            // 写清「存储时就截了」以及上限来源，否则看到「已截断」会以为是导出出错
+            out.push_str(&format!(
+                "{} / {} bytes  ⚠ 存储时按 full_trace_max_bytes={} 截断\n\n",
+                text.len(),
+                original_bytes,
+                fmt_bytes_human(max_bytes),
+            ));
+        } else {
+            out.push_str(&format!("{} bytes\n\n", original_bytes));
+        }
+        let body = if text.is_empty() {
+            "（空）".to_string()
+        } else {
+            pretty_body(text)
+        };
+        out.push_str(&body);
         out.push('\n');
     }
 
@@ -477,6 +562,11 @@ fn render_trace_text(
             &ev.model
         }
     ));
+    out.push_str(&format!(
+        "诊断环配置：保留最近 {full_trace_count} 组 · 单侧上限 {}（调大可让导出不再出现「截断」）\n",
+        fmt_bytes_human(full_trace_max_bytes)
+    ));
+    out.push_str("说明：下方 JSON 已格式化便于阅读；原始字节以导出时为准。\n");
     section(
         &mut out,
         1,
@@ -484,6 +574,7 @@ fn render_trace_text(
         t.req_bytes,
         t.req_truncated,
         &t.req_raw,
+        full_trace_max_bytes,
     );
     section(
         &mut out,
@@ -492,6 +583,7 @@ fn render_trace_text(
         t.req_masked_bytes,
         t.req_truncated,
         &t.req_masked,
+        full_trace_max_bytes,
     );
     section(
         &mut out,
@@ -500,6 +592,7 @@ fn render_trace_text(
         t.resp_bytes,
         t.resp_truncated,
         &t.resp_raw,
+        full_trace_max_bytes,
     );
     section(
         &mut out,
@@ -508,6 +601,7 @@ fn render_trace_text(
         t.resp_out_bytes,
         t.resp_truncated,
         &t.resp_out,
+        full_trace_max_bytes,
     );
     if t.unresolved > 0 {
         out.push_str(&format!(
@@ -521,6 +615,15 @@ fn render_trace_text(
         ));
     }
     out
+}
+
+/// 字节数转人类可读（`1.0 MiB` / `512 KiB`）。
+fn fmt_bytes_human(n: usize) -> String {
+    if n >= 1024 * 1024 {
+        format!("{:.1} MiB", n as f64 / (1024.0 * 1024.0))
+    } else {
+        format!("{} KiB", n / 1024)
+    }
 }
 
 pub async fn clear_logs(State(state): State<SharedState>) -> Response {
@@ -961,5 +1064,38 @@ mod tests {
         let t = new_token();
         assert_eq!(t.len(), 24);
         assert!(t.chars().all(|c| c.is_ascii_alphanumeric()));
+    }
+
+    /// 导出文件的可读性：紧凑 JSON 要能展开，SSE 的 `data:` 前缀要保留，
+    /// 非 JSON 内容必须原样（绝不能因为美化丢内容）。
+    #[test]
+    fn pretty_body_formats_json_and_keeps_raw() {
+        let packed = r#"{"model":"gpt-4o","messages":[{"role":"user"}]}"#;
+        let pretty = pretty_body(packed);
+        assert!(pretty.contains('\n'), "紧凑 JSON 必须被展开：{pretty}");
+        assert!(pretty.contains("  \"model\": \"gpt-4o\""), "{pretty}");
+        // 展开后的内容仍等价
+        let a: serde_json::Value = serde_json::from_str(packed).unwrap();
+        let b: serde_json::Value = serde_json::from_str(&pretty).unwrap();
+        assert_eq!(a, b);
+
+        // SSE：data 前缀保留，JSON 部分美化，[DONE] 原样
+        let sse = "data: {\"x\":1}\n\ndata: [DONE]\n";
+        let out = pretty_body(sse);
+        assert!(out.contains("data: {"), "{out}");
+        assert!(out.contains("[DONE]"), "{out}");
+
+        // 非 JSON 原样返回（不能丢内容）
+        let raw = "not json at all\nsecond line";
+        assert_eq!(pretty_body(raw), raw);
+    }
+
+    /// 超过美化上限的报文原样输出，并标注原因（避免 32MiB 美化后接近 60MiB）。
+    #[test]
+    fn pretty_body_skips_huge_payload() {
+        let big = "x".repeat(PRETTY_MAX_BYTES + 1);
+        let out = pretty_body(&big);
+        assert!(out.len() > PRETTY_MAX_BYTES);
+        assert!(out.contains("未格式化输出"), "必须说明为什么没格式化");
     }
 }

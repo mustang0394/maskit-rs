@@ -628,6 +628,7 @@ pub async fn handler(State(state): State<SharedState>, req: Request) -> Response
             truncated: raw_tr || masked_tr,
             extra: serde_json::Value::Null,
             keep: cfg_now.full_trace_count,
+            budget_bytes: cfg_now.full_trace_total_bytes,
         });
     }
 
@@ -904,11 +905,15 @@ async fn forward_inner(
                     let cfg_meta = state.config.get();
                     let keep_plaintext = crate::config::log_keeps_credential_plaintext(&cfg_meta);
                     // 完整报文诊断环：凭据明文开关关闭时一并关闭（完整报文含凭据明文）
-                    let (trace_max_bytes, trace_keep) =
+                    let (trace_max_bytes, trace_keep, trace_budget) =
                         if keep_plaintext && cfg_meta.full_trace_count > 0 {
-                            (cfg_meta.full_trace_max_bytes, cfg_meta.full_trace_count)
+                            (
+                                cfg_meta.full_trace_max_bytes,
+                                cfg_meta.full_trace_count,
+                                cfg_meta.full_trace_total_bytes,
+                            )
                         } else {
-                            (0, 0)
+                            (0, 0, 0)
                         };
                     let meta = crate::server::response::StreamMeta {
                         host: uri.host().unwrap_or("").to_string(),
@@ -924,6 +929,7 @@ async fn forward_inner(
                         secret_prefixes: cfg_meta.mask.secret_prefixes.clone(),
                         trace_max_bytes,
                         trace_keep,
+                        trace_budget,
                         request_headers: sess.request_headers.clone(),
                     };
                     let cmdblock = state.cmdblock();
