@@ -126,6 +126,59 @@
     } catch { toast('剪贴板不可用', true); }
   }
 
+  /**
+   * 带鉴权下载一个文件（blob → `a[download]`）。
+   *
+   * 为什么不用 `window.open(url)`：管理 API 要 Bearer 令牌，而把令牌塞进 URL
+   * 会被浏览器历史 / 代理日志记下来（凭据外泄）。也不能用 `api()` —— 它固定
+   * `res.json()`，二进制/文本附件会解析失败。
+   */
+  async function downloadFile(path, fallbackName, btn) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 120000);
+    const old = btn ? btn.textContent : '';
+    if (btn) { btn.disabled = true; btn.textContent = '导出中…'; }
+    try {
+      const res = await fetch(API + path, {
+        headers: TOKEN ? { Authorization: 'Bearer ' + TOKEN } : {},
+        signal: ctrl.signal,
+      });
+      if (res.status === 401) {
+        showLogin('令牌无效或已过期，请重新输入');
+        return; // 不再抛错：否则会在登录框之外再弹一条英文 toast
+      }
+      if (!res.ok) {
+        let msg = res.status + ' ' + res.statusText;
+        try { const j = await res.json(); msg = j.error || msg; } catch (e) {}
+        throw new Error(msg);
+      }
+      const blob = await res.blob();
+      const cd = res.headers.get('content-disposition') || '';
+      const m = /filename="?([^";]+)"?/.exec(cd);
+      const name = (m && m[1]) || fallbackName;
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = name;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 3000);
+      // 后端按条数/字节预算截断时会带这个头；不提示的话用户会以为导全了
+      if ((res.headers.get('x-maskit-truncated') || '') === 'true') {
+        toast('已导出 ' + name + '（已截断：仅最近 5000 条，可用筛选缩小范围）', true);
+      } else {
+        toast('已导出 ' + name);
+      }
+    } catch (e) {
+      if (e && e.name === 'AbortError') toast('导出超时', true);
+      else toast('导出失败：' + e.message, true);
+    } finally {
+      clearTimeout(timer);
+      if (btn) { btn.disabled = false; btn.textContent = old; }
+    }
+  }
+
   /** 空状态 HTML。 */
   function emptyBox(text) { return `<div class="d-empty">${esc(text)}</div>`; }
 
@@ -142,7 +195,7 @@
       }, opts || {}));
       if (res.status === 401) {
         showLogin('令牌无效或已过期，请重新输入');
-        throw new Error('unauthorized');
+        return; // 不再抛错：否则会在登录框之外再弹一条英文 toast
       }
       if (!res.ok) {
         let msg = res.status + ' ' + res.statusText;
@@ -901,8 +954,10 @@
     renderLogMeta();
     log.timer = setInterval(() => {
       if (currentPage !== 'logs') { stopLogAuto(); return; }
-      log.offset = 0;
-      loadLogs().catch(() => {});
+      // 后台标签页不刷新：省掉一次无意义的列表请求
+      if (typeof document !== 'undefined' && document.hidden) return;
+      // 保持当前页与选中项（旧实现强制 offset=0，翻页/读详情时会被拽回第一页）
+      loadLogs({ detail: false }).catch(() => {});
     }, 5000);
   }
 
@@ -917,55 +972,45 @@
 
   function logRowHtml(e) {
     const t = String(e.type || '');
-    const flags = [];
-    if (e.reason) flags.push(esc(e.reason));
-    if (e.unknown_shape) flags.push('未知形态');
+    // 列表只拿摘要字段：没有 dialog / items / request_headers，
+    // 所以这里用 item_count / header_count 代替原来的 .length。
+    const meta = [];
+    if (e.count) meta.push(`脱敏 ${e.count}`);
+    if (e.restored) meta.push(`还原 ${e.restored}`);
+    if (e.unresolved) meta.push(`<span class="lrow-flag">未还原 ${e.unresolved}</span>`);
+    if (e.item_count) meta.push(`明细 ${e.item_count}`);
+    if (e.header_count) meta.push(`头 ${e.header_count}`);
+    if (e.status >= 400) meta.push(`HTTP ${e.status}`);
+    if (e.reason) meta.push(esc(e.reason));
+    if (e.unknown_shape) meta.push('<span class="lrow-flag">未知形态</span>');
     if (e.stream_mode) {
       const actual = e.stream_actual || 'whole';
-      flags.push(actual !== e.stream_mode ? `流式不符(${esc(e.stream_mode)}→${esc(actual)})` : esc(e.stream_mode));
+      meta.push(actual !== e.stream_mode
+        ? `<span class="lrow-flag">流式不符(${esc(e.stream_mode)}→${esc(actual)})</span>`
+        : esc(e.stream_mode));
     }
-    const stat = [];
-    if (e.count) stat.push(`脱敏 ${e.count}`);
-    if (e.restored) stat.push(`还原 ${e.restored}`);
-    if (e.unresolved) stat.push(`未还原 ${e.unresolved}`);
-    if (e.degraded) stat.push(`容错 ${e.degraded}`);
-    if (e.status >= 400) stat.push(`HTTP ${e.status}`);
-    const hits = e.count || e.restored || (e.items || []).length;
-    const hdrN = (e.request_headers || []).length;
     return `<button class="lrow ${log.sel === e.id ? 'active' : ''}" data-log-id="${e.id}" role="option"
               aria-selected="${log.sel === e.id ? 'true' : 'false'}">
-        <span class="lrow-top">
+        <span class="lrow-line1">
           <span class="lrow-time">${esc(fmtTime(e.ts))}</span>
           <span class="badge ${esc(t)}">${esc(t)}</span>
-          ${hits ? `<span class="hint">${hits} 命中</span>` : ''}
-          ${hdrN ? `<span class="hint">${hdrN} 头</span>` : ''}
-          ${e.mask_ms != null ? `<span class="hint mono">${esc(fmtMs(e.mask_ms))}</span>` : ''}
+          <span class="lrow-path">${esc(e.method || '')} ${esc(e.path || '')}</span>
+          ${e.mask_ms != null ? `<span class="lrow-ms">${esc(fmtMs(e.mask_ms))}</span>` : ''}
         </span>
-        <span class="lrow-sub"><span class="lrow-path">${esc(e.method || '')} ${esc(e.path || '')}</span></span>
-        ${flags.length ? `<span class="lrow-sub">${flags.join(' · ')}</span>` : ''}
-        ${stat.length ? `<span class="lrow-sub mono">${stat.join(' · ')}</span>` : ''}
+        <span class="lrow-line2">
+          ${meta.length ? `<span>${meta.join(' · ')}</span>` : '<span>—</span>'}
+          <span class="lrow-id">#${esc(e.id)}</span>
+        </span>
       </button>`;
   }
 
   /**
-   * 完整报文面板：标题（含字节数 / 截断标记）+ 复制按钮 + 高亮后的 pre。
-   * `highlight` 会顺带把 `{{LABEL_xxxxxx}}` 占位符标出来 —— 排查未还原时
-   * 一眼就能看到上游响应里哪些占位符没被换回。
+   * 详情卡片：sticky 头部 + 指标 chips + 折叠分区。
+   *
+   * 完整报文**不在页面内联渲染**：它最多 4 侧 × 1MiB，一次性塞进 DOM 会让
+   * 浏览器卡死（这正是本轮重构要解决的问题）。这里只根据 `trace_available`
+   * 决定是否显示「导出完整报文」按钮，正文走 /logs/trace/download 下载。
    */
-  function tracePanel(id, title, titleCls, text, meta) {
-    const m = meta || {};
-    const size = m.bytes ? ` · ${fmtBytes(m.bytes)}` : '';
-    const cut = m.truncated ? ' · <span class="warn-text">已截断</span>' : '';
-    const body = text ? highlight(text, m.needles || []) : '<span class="hint">（空）</span>';
-    return `<div class="cmp2-col">
-      <div class="cmp2-head">
-        <span class="cmp2-title ${titleCls}">${esc(title)}${size}${cut}</span>
-        <button class="btn btn-sm copy-btn" data-copy-target="${id}" ${text ? '' : 'disabled'}>复制</button>
-      </div>
-      <pre class="cmp2-pre" id="${id}">${body}</pre>
-    </div>`;
-  }
-
   function logDetailHtml(e) {
     const type = String(e.type || '');
     const items = e.items || [];
@@ -973,107 +1018,114 @@
     const needles = items.map(it => it.original).filter(Boolean);
     const parts = [];
 
+    const statusCls = e.status >= 400 ? 'bad' : '';
     parts.push(`<header class="d-head">
       <div class="d-head-main">
         <span class="badge ${esc(type)}">${esc(type)}</span>
-        <span class="mono d-path">${esc(e.method || '')} ${esc(e.path || '')}</span>
-        ${e.status ? `<span class="hint mono">HTTP ${esc(e.status)}</span>` : ''}
+        <span class="d-method">${esc(e.method || '')}</span>
+        <span class="d-path mono">${esc(e.path || '')}</span>
+        ${e.status ? `<span class="d-status ${statusCls}">${esc(e.status)}</span>` : ''}
       </div>
       <div class="d-head-sub">${esc(fmtTs(e.ts))}${e.protocol ? ' · ' + esc(e.protocol) : ''}${e.model ? ' · ' + esc(e.model) : ''}</div>
     </header>`);
 
-    const kv = [
-      ['耗时', e.mask_ms != null ? fmtMs(e.mask_ms) : ''],
-      ['首字节', e.first_byte_ms != null ? fmtMs(e.first_byte_ms) : ''],
-      ['上游耗时', e.upstream_ms != null ? fmtMs(e.upstream_ms) : ''],
-      ['请求体', fmtBytes(e.req_bytes)],
-      ['响应体', fmtBytes(e.resp_bytes)],
-      ['新增/复用', `${e.new_count || 0} / ${e.reused_count || 0}`],
-      ['会话', e.sid || ''],
-    ].filter(([, v]) => v);
-    if (kv.length) {
-      parts.push(`<div class="d-kv">${kv.map(([k, v]) =>
-        `<div><span>${esc(k)}</span><b>${esc(v)}</b></div>`).join('')}</div>`);
-    }
+    // 指标 chips：原来是一组散碎的 label/value 网格，读不出重点
+    const chips = [];
+    const addChip = (label, val, cls) => chips.push(
+      `<span class="d-chip ${cls || ''}"><b>${esc(val)}</b>${esc(label)}</span>`);
+    if (e.mask_ms != null) addChip(' 耗时', fmtMs(e.mask_ms));
+    if (e.first_byte_ms != null) addChip(' 首字节', fmtMs(e.first_byte_ms));
+    if (e.upstream_ms != null) addChip(' 上游', fmtMs(e.upstream_ms));
+    if (e.req_bytes) addChip(' 请求体', fmtBytes(e.req_bytes));
+    if (e.resp_bytes) addChip(' 响应体', fmtBytes(e.resp_bytes));
+    if (e.count) addChip(' 命中', e.count);
+    if (e.restored) addChip(' 还原', e.restored);
+    if (e.new_count || e.reused_count) addChip(' 新增/复用', (e.new_count || 0) + ' / ' + (e.reused_count || 0));
+    if (e.unresolved) addChip(' 未还原', e.unresolved, 'warn');
+    // sid 是标签在前（值在前读起来像一堆哈希）
+    if (e.sid) chips.push(`<span class="d-chip">sid <b>${esc(e.sid)}</b></span>`);
+    if (chips.length) parts.push(`<div class="d-chips">${chips.join('')}</div>`);
 
-    // 原文 / 发给上游
+    // ── 对话对照（客户端原文 / 实际发给上游）──
     const orig = e.dialog || '';
     const up = e.masked_dialog || '';
     if (up) {
-      parts.push(`<div class="cmp2">
-        <div class="cmp2-col">
-          <div class="cmp2-head"><span class="cmp2-title cmp2-title-orig">原文（客户端发出）</span></div>
-          <pre class="cmp2-pre">${highlight(orig, needles)}</pre>
-        </div>
-        <div class="cmp2-col">
-          <div class="cmp2-head"><span class="cmp2-title cmp2-title-up">发给上游（已脱敏）</span></div>
-          <pre class="cmp2-pre">${highlight(up, [])}</pre>
-        </div>
-      </div>`);
+      parts.push(`<details class="d-sec" open>
+        <summary>对话对照<span class="pill">原文 / 发给上游</span></summary>
+        <div class="d-sec-body"><div class="cmp2">
+          <div class="cmp2-col">
+            <div class="cmp2-head"><span class="cmp2-title cmp2-title-orig">原文（客户端发出）</span></div>
+            <pre class="cmp2-pre">${highlight(orig, needles)}</pre>
+          </div>
+          <div class="cmp2-col">
+            <div class="cmp2-head"><span class="cmp2-title cmp2-title-up">发给上游（已脱敏）</span></div>
+            <pre class="cmp2-pre">${highlight(up, [])}</pre>
+          </div>
+        </div></div>
+      </details>`);
     } else if (orig) {
       // 老事件没有 masked_dialog：按命中明细推算，并如实标注
       const derived = deriveMasked(orig, items);
       const title = type === 'MASK' ? '原文（客户端发出）'
         : type === 'RESTORE' ? '助手回复（还原后）' : '正文';
       if (derived !== orig) {
-        parts.push(`<div class="cmp2">
-          <div class="cmp2-col">
-            <div class="cmp2-head"><span class="cmp2-title cmp2-title-orig">${esc(title)}</span></div>
-            <pre class="cmp2-pre">${highlight(orig, needles)}</pre>
-          </div>
-          <div class="cmp2-col">
-            <div class="cmp2-head"><span class="cmp2-title cmp2-title-up">发给上游（按命中明细推算）</span></div>
-            <pre class="cmp2-pre">${highlight(derived, [])}</pre>
-          </div>
-        </div>`);
+        parts.push(`<details class="d-sec" open>
+          <summary>对话正文<span class="pill">发给上游按命中明细推算</span></summary>
+          <div class="d-sec-body"><div class="cmp2">
+            <div class="cmp2-col">
+              <div class="cmp2-head"><span class="cmp2-title cmp2-title-orig">${esc(title)}</span></div>
+              <pre class="cmp2-pre">${highlight(orig, needles)}</pre>
+            </div>
+            <div class="cmp2-col">
+              <div class="cmp2-head"><span class="cmp2-title cmp2-title-up">发给上游（按命中明细推算）</span></div>
+              <pre class="cmp2-pre">${highlight(derived, [])}</pre>
+            </div>
+          </div></div>
+        </details>`);
       } else {
-        parts.push(`<div class="detail-section"><div class="detail-title">${esc(title)}</div>
-          <pre class="cmp2-pre">${highlight(orig, needles)}</pre></div>`);
+        parts.push(`<details class="d-sec" open>
+          <summary>${esc(title)}</summary>
+          <div class="d-sec-body"><pre class="cmp2-pre">${highlight(orig, needles)}</pre></div>
+        </details>`);
       }
     }
-
-    // 上面那两个框只是**摘要**，不是完整报文：
-    //   * `dialog` / `masked_dialog` 是 extract_dialog_text() 从 JSON 里抽出的对话
-    //     文本（只认 content/text/input 等键），并在 DIALOG_MAX_CHARS=8000 处截断；
-    //   * 完整字节在下方诊断环（req_raw / req_masked）里。
-    // 不写这句时，用户看到「摘要被截断」很容易误判成「完整报文功能没生效」（真机踩过）。
+    // 摘要被截断时如实说明：上面只是摘要，完整字节要导出
     const cutMark = '已截断';
     if (orig.indexOf(cutMark) >= 0 || up.indexOf(cutMark) >= 0) {
-      parts.push('<div class="hint">上方为摘要（<code>dialog</code> / '
-        + '<code>masked_dialog</code>：抽取对话文本后超过 8000 字符即截断）；'
-        + '完整请求体 / 响应体见下方「完整报文 · 原始字节（诊断环）」'
-        + '（需 <code>full_trace_count &gt; 0</code> 且 <code>mask.log_credential_plaintext=true</code>）。</div>');
+      parts.push('<div class="d-note hint">上方为对话摘要（抽取对话文本后超过上限即截断）；'
+        + '完整字节请用下方「导出完整报文」。</div>');
     }
 
-    // 完整报文诊断环（最近 N 条）：原文请求 / 脱敏请求 / 上游原始响应 / 还原后响应。
-    // 这是排查「脱敏了没还原」的关键证据：「上游原始响应」保留占位符原样。
-    if (e.trace) {
-      const tr = e.trace;
-      parts.push(`<div class="detail-section">
-        <div class="detail-title">完整报文 · 原始字节（诊断环）</div>
-        <div class="cmp2">
-          ${tracePanel('trReqRaw', '原始请求（客户端发出）', 'cmp2-title-orig', tr.req_raw, { needles, bytes: tr.req_bytes, truncated: tr.req_truncated })}
-          ${tracePanel('trReqMasked', '发给上游（已脱敏）', 'cmp2-title-up', tr.req_masked, { bytes: tr.req_masked_bytes, truncated: tr.req_truncated })}
+    // ── 命中明细 ──
+    if (items.length) {
+      const rows = items.map(it => {
+        const src = it.original
+          ? esc(it.original)
+          : (it.preview
+              ? `<span class="item-redacted hint" title="凭据类不存明文，只留打码预览与 sha256 摘要">${esc(it.preview)}</span>`
+              : '<span class="hint">—</span>');
+        const meta = [
+          it.length ? esc(it.length) + ' 位' : '',
+          it.digest ? 'sha256:' + esc(String(it.digest).slice(0, 12)) : '',
+        ].filter(Boolean).join(' · ');
+        return `<tr>
+          <td class="mono">${it.cred ? '🔒 ' : ''}${esc(it.label)}</td>
+          <td class="mono cmp-orig">${src}</td>
+          <td class="mono cmp-tok">${esc(it.tok || it.token || '—')}</td>
+          <td class="mono hint">${meta || '—'}</td>
+        </tr>`;
+      }).join('');
+      parts.push(`<details class="d-sec" open>
+        <summary>命中明细<span class="pill">${items.length}</span></summary>
+        <div class="d-sec-body">
+          <table class="cmp cmp-items"><thead><tr>
+            <th>类型</th><th>原文</th><th>占位符</th><th>长度 / 摘要</th>
+          </tr></thead><tbody>${rows}</tbody></table>
         </div>
-        <div class="cmp2" style="margin-top:10px">
-          ${tracePanel('trRespRaw', '上游原始响应（占位符原样）', 'cmp2-title-up', tr.resp_raw, { bytes: tr.resp_bytes, truncated: tr.resp_truncated })}
-          ${tracePanel('trRespOut', '返回客户端（还原后）', 'cmp2-title-back', tr.resp_out, { bytes: tr.resp_out_bytes, truncated: tr.resp_truncated })}
-        </div>
-        ${tr.unresolved
-          ? `<div class="note warn">未还原 ${tr.unresolved} 处${(tr.unresolved_samples || []).length
-              ? '：<span class="mono">' + tr.unresolved_samples.map(esc).join('、') + '</span>' : ''}
-              —— 对照左侧「上游原始响应」可判断是占位符被改写、跨块截断，还是映射缺失。</div>`
-          : ''}
-        ${(tr.req_truncated || tr.resp_truncated)
-          ? '<div class="hint">部分报文超过 <code>full_trace_max_bytes</code>，已在字节边界截断。</div>' : ''}
-      </div>`);
-    } else if (e.trace_enabled === false) {
-      parts.push('<div class="note">完整报文诊断环未启用：需要 <code>full_trace_count &gt; 0</code> 且 <code>mask.log_credential_plaintext=true</code>。</div>');
-    } else if (e.sid) {
-      parts.push(`<div class="hint">该请求不在完整报文保留窗口内（仅保留最近 ${esc(e.trace_keep_count || 0)} 条），或未走脱敏管线。</div>`);
+      </details>`);
     }
 
-    // 请求头（客户端实际发送的全部头；凭据类值受 mask.log_credential_plaintext 控制）
+    // ── 请求头（默认折叠：内容长且多数时候用不到）──
     if (headers.length) {
       const credNames = ['authorization', 'proxy-authorization', 'cookie',
         'x-api-key', 'api-key', 'apikey', 'x-goog-api-key', 'x-auth-token',
@@ -1092,51 +1144,40 @@
         </tr>`;
       }).join('');
       const truncated = headers.some(([k]) => String(k).toLowerCase() === 'x-shield-truncated');
-      parts.push(`<div class="detail-section">
-        <div class="detail-title">请求头 · ${headers.length}</div>
-        <table class="cmp cmp-items hdr-table"><thead><tr>
-          <th>Header</th><th>值</th>
-        </tr></thead><tbody>${rows}</tbody></table>
-        ${truncated
-          ? '<div class="note warn">请求头过多/过长，已截断（仅展示前一部分）</div>'
-          : '<div class="hint">凭据类头的值受 <code>mask.log_credential_plaintext</code> 控制；关闭时显示 <code>***</code>。</div>'}
-      </div>`);
-    }
-
-    if (items.length) {
-      parts.push(`<div class="detail-section">
-        <div class="detail-title">命中明细 · ${items.length}</div>
-        <table class="cmp cmp-items"><thead><tr>
-          <th>类型</th><th>原文</th><th>占位符</th><th>长度 / 摘要</th>
-        </tr></thead><tbody>${items.map(it => {
-          const src = it.original
-            ? esc(it.original)
-            : (it.preview
-                ? `<span class="item-redacted hint" title="凭据类不存明文，只留打码预览与 sha256 摘要">${esc(it.preview)}</span>`
-                : '<span class="hint">—</span>');
-          const meta = [
-            it.length ? esc(it.length) + ' 位' : '',
-            it.digest ? 'sha256:' + esc(String(it.digest).slice(0, 12)) : '',
-          ].filter(Boolean).join(' · ');
-          return `<tr>
-            <td class="mono">${it.cred ? '🔒 ' : ''}${esc(it.label)}</td>
-            <td class="mono cmp-orig">${src}</td>
-            <td class="mono cmp-tok">${esc(it.tok || it.token || '—')}</td>
-            <td class="mono hint">${meta || '—'}</td>
-          </tr>`;
-        }).join('')}</tbody></table></div>`);
+      parts.push(`<details class="d-sec">
+        <summary>请求头<span class="pill">${headers.length}</span></summary>
+        <div class="d-sec-body">
+          <table class="cmp cmp-items hdr-table"><thead><tr>
+            <th>Header</th><th>值</th>
+          </tr></thead><tbody>${rows}</tbody></table>
+          ${truncated
+            ? '<div class="note warn">请求头过多/过长，已截断（仅展示前一部分）</div>'
+            : '<div class="hint">凭据类头的值受 <code>mask.log_credential_plaintext</code> 控制；关闭时显示 <code>***</code>。</div>'}
+        </div>
+      </details>`);
     }
 
     if ((e.unresolved_samples || []).length) {
-      parts.push(`<div class="note warn">未还原占位符：<span class="mono">${e.unresolved_samples.map(esc).join('、')}</span></div>`);
+      parts.push(`<div class="d-note"><div class="note warn">未还原占位符：<span class="mono">${e.unresolved_samples.map(esc).join('、')}</span></div></div>`);
     }
     if (e.message || e.reason) {
-      parts.push(`<div class="note warn">${esc(e.message || e.reason)}</div>`);
+      parts.push(`<div class="d-note"><div class="note warn">${esc(e.message || e.reason)}</div></div>`);
     }
+
+    // ── 完整报文：只能导出，不内联 ──
+    parts.push(`<div class="d-actions">
+      ${e.trace_available
+        ? `<button class="btn btn-sm btn-primary" data-trace-id="${esc(e.id)}">导出完整报文</button>
+           <span class="hint">原始请求 / 脱敏请求 / 上游原始响应 / 还原后响应，导出为 .txt</span>`
+        : e.trace_enabled === false
+          ? '<span class="hint">完整报文诊断环未启用：需要 <code>full_trace_count &gt; 0</code> 且 <code>mask.log_credential_plaintext=true</code>。</span>'
+          : `<span class="hint">该请求不在完整报文保留窗口内（仅保留最近 ${esc(e.trace_keep_count || 0)} 条），或未走脱敏管线。</span>`}
+    </div>`);
     return parts.join('');
   }
 
-  async function loadLogs() {
+  async function loadLogs(opts) {
+    opts = opts || {};
     const q = log.q.trim();
     const url = `/logs?limit=${log.limit}&offset=${log.offset}`
       + (log.type ? `&event_type=${encodeURIComponent(log.type)}` : '')
@@ -1144,6 +1185,12 @@
     const data = await api(url);
     log.rows = data.events || [];
     log.total = data.total == null ? log.rows.length : data.total;
+    // 别的标签页「清空」或保留期清理会让 total 变小。自动刷新现在保留 offset，
+    // 若不回收页码就会停在一个永远空白的页上（旧实现每 5s 强制 offset=0 掩盖了它）。
+    if (log.offset > 0 && log.offset >= log.total) {
+      log.offset = Math.max(0, Math.floor(Math.max(0, log.total - 1) / log.limit) * log.limit);
+      return loadLogs(opts); // clamp 后必然收敛，不会无限递归
+    }
 
     $('logList').innerHTML = log.rows.length
       ? log.rows.map(logRowHtml).join('')
@@ -1154,6 +1201,7 @@
     $('logNext').disabled = log.offset + log.limit >= log.total;
 
     // 选中项：优先保留原选择，否则自动选第一条
+    const prevSel = log.sel;
     const keep = log.rows.some(e => e.id === log.sel);
     if (!keep) log.sel = log.rows.length ? log.rows[0].id : null;
     document.querySelectorAll('#logList .lrow').forEach(el => {
@@ -1162,16 +1210,22 @@
       el.setAttribute('aria-selected', on ? 'true' : 'false');
     });
     if (log.sel == null) { $('logDetail').innerHTML = emptyBox('左侧选择一条事件'); return; }
+    // 自动刷新只刷列表：选中项没变就别重绘详情，否则用户正在读的内容、
+    // 展开的折叠区与滚动位置都会被冲掉（旧实现还强制回第一页）。
+    if (opts.detail === false && log.sel === prevSel) return;
     await showLogDetail(log.sel);
   }
   loaders.logs = loadLogs;
 
   async function showLogDetail(id) {
-    $('logDetail').innerHTML = emptyBox('加载中…');
+    $('logDetail').innerHTML = '<div class="skeleton">'
+      + '<div class="sk-line w60"></div><div class="sk-line w80"></div>'
+      + '<div class="sk-line w40"></div></div>';
     try {
       const d = await api('/logs/detail?id=' + encodeURIComponent(id));
       if (log.sel !== id) return; // 期间已切到别的行
-      $('logDetail').innerHTML = logDetailHtml(d.event || d);
+      const card = logDetailHtml(d.event || d);
+      $('logDetail').innerHTML = `<div class="d-card">${card}</div>`;
     } catch (e) {
       $('logDetail').innerHTML = `<div class="note warn">详情加载失败：${esc(e.message)}</div>`;
     }
@@ -1190,12 +1244,15 @@
     });
     showLogDetail(id);
   });
-  // 完整报文面板的「复制」按钮（详情为重绘 innerHTML，用委托避免重绑）
+  // 详情里的「导出完整报文」按钮（详情为重绘 innerHTML，用委托避免重绑）
   $('logDetail').addEventListener('click', ev => {
-    const btn = ev.target.closest('.copy-btn');
+    const btn = ev.target.closest('[data-trace-id]');
     if (!btn || btn.disabled) return;
-    const pre = document.getElementById(btn.dataset.copyTarget);
-    if (pre) copyFrom(pre, btn);
+    const id = btn.dataset.traceId;
+    // 该文件含脱敏前的原始字节（可能含凭据/PII 明文），下载前明确告知
+    if (!confirm('完整报文含原始字节（可能包含凭据 / PII 明文），请勿外发或贴进公开 issue。\n\n确定下载？')) return;
+    downloadFile('/logs/trace/download?id=' + encodeURIComponent(id),
+      'maskit-trace-' + id + '.txt', btn);
   });
   $('logType').addEventListener('change', () => {
     log.type = $('logType').value; log.offset = 0; log.sel = null;
@@ -1223,6 +1280,15 @@
     log.offset += log.limit; log.sel = null;
     loadLogs().catch(e => toast(e.message, true));
   });
+  // 导出：按**当前筛选**导出（旧实现忽略筛选、且超过 2000 条静默截断）
+  $('logExport').addEventListener('click', ev => {
+    const q = log.q.trim();
+    const params = [];
+    if (log.type) params.push('event_type=' + encodeURIComponent(log.type));
+    if (q) params.push('q=' + encodeURIComponent(q));
+    const path = '/logs/export' + (params.length ? '?' + params.join('&') : '');
+    downloadFile(path, 'maskit-logs.json', ev.currentTarget);
+  });
   $('logClear').addEventListener('click', () => {
     if (!confirm('清空事件日志？（统计摘要保留）')) return;
     api('/logs/clear', { method: 'POST' }).then(() => {
@@ -1246,24 +1312,27 @@
   }
 
   function auditDetailHtml(a) {
-    const kv = [
-      ['时间', fmtTs(a.ts)],
-      ['主机', a.host || ''],
-      ['方法 / 路径', `${a.method || ''} ${a.path || ''}`.trim()],
-      ['会话', a.sid || ''],
-    ].filter(([, v]) => v);
+    // 与日志详情共用同一套卡片语言：sticky 头部 + 指标 chips + 折叠分区
+    const chips = [];
+    const addChip = (label, val) => val && chips.push(
+      `<span class="d-chip"><b>${esc(val)}</b>${esc(label)}</span>`);
+    addChip(' 时间', fmtTs(a.ts));
+    addChip(' 主机', a.host || '');
+    addChip(' 会话', a.sid || '');
     return `<header class="d-head">
         <div class="d-head-main">
           <span class="sev sev-${esc(a.severity)}">${esc(a.severity)}</span>
           <span class="mono d-path">${esc(a.signal_type)}</span>
+          ${a.method || a.path
+            ? `<span class="d-method">${esc(a.method || '')} ${esc(a.path || '')}</span>`
+            : ''}
         </div>
       </header>
-      <div class="d-kv">${kv.map(([k, v]) =>
-        `<div><span>${esc(k)}</span><b>${esc(v)}</b></div>`).join('')}</div>
-      <div class="detail-section">
-        <div class="detail-title">证据</div>
-        <pre class="cmp2-pre">${highlight(a.evidence || '—', [])}</pre>
-      </div>`;
+      ${chips.length ? `<div class="d-chips">${chips.join('')}</div>` : ''}
+      <details class="d-sec" open>
+        <summary>证据</summary>
+        <div class="d-sec-body"><pre class="cmp2-pre">${highlight(a.evidence || '—', [])}</pre></div>
+      </details>`;
   }
 
   async function loadAudit() {

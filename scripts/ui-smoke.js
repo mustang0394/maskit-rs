@@ -160,18 +160,9 @@ const maskEvent = {
     ['accept', 'application/json'],
     ['accept', 'text/event-stream'],
   ],
-  // 完整报文诊断环（最近 N 条）：原文请求 / 脱敏请求 / 上游原始响应 / 还原后响应
-  trace: {
-    sid: 'abc-1f2e3d4c', ts: 1758600000.5, method: 'POST', path: '/v1/chat/completions',
-    protocol: 'chat_completions', model: 'gpt-4o', stream: false,
-    req_raw: '{"model":"gpt-4o","messages":[{"role":"user","content":"我的电话是13800138000"}]}',
-    req_masked: '{"model":"gpt-4o","messages":[{"role":"user","content":"我的电话是{{PHONE_bcdfgh}}"}]}',
-    req_bytes: 76, req_masked_bytes: 84, req_truncated: false,
-    resp_raw: '{"choices":[{"message":{"content":"已记录 {{PHONE_bcdfgh}}"}}]}',
-    resp_out: '{"choices":[{"message":{"content":"已记录 13800138000"}}]}',
-    resp_bytes: 61, resp_out_bytes: 62, resp_truncated: false,
-    unresolved: 0, unresolved_samples: [],
-  },
+  // 完整报文只回可用性标志：正文改为点「导出完整报文」下载（页面内联会卡死）
+  trace_available: true, trace_enabled: true, trace_keep_count: 20,
+  item_count: 2, header_count: 7,
 };
 // 老事件：没有 masked_dialog，必须走「按命中明细推算」兜底
 const legacyEvent = {
@@ -205,7 +196,15 @@ async function fetchStub(url, opts) {
     const id = Number((u.match(/id=(\d+)/) || [])[1]);
     body = id === 6 ? legacyEvent : id === 5 ? errEvent : maskEvent;
   } else if (u.includes('/console/api/logs')) {
-    body = { events: [maskEvent, legacyEvent, errEvent], total: 3, offset: 0, limit: 100 };
+    const toSummary = e => {
+      const o = Object.assign({}, e);
+      delete o.dialog; delete o.masked_dialog;
+      delete o.items; delete o.request_headers; delete o.trace;
+      o.item_count = (e.items || []).length;
+      o.header_count = (e.request_headers || []).length;
+      return o;
+    };
+    body = { events: [maskEvent, legacyEvent, errEvent].map(toSummary), total: 3, offset: 0, limit: 100 };
   } else if (u.includes('/console/api/audit/events')) {
     body = auditPayload;
   } else if (u.includes('/console/api/mask/test')) {
@@ -364,15 +363,14 @@ const tick = (n = 6) => new Promise(async res => {
   check(detail.includes('class="tok"'), '日志详情：占位符未高亮');
   check(detail.includes('13800138000'), '日志详情：原文应可见');
   check(!detail.includes('>13800138000<') || detail.includes('发给上游'), '日志详情：结构异常');
-  // 完整报文诊断环：四栏必须渲染，且「上游原始响应」保留占位符原样
-  check(detail.includes('完整报文'), '日志详情：缺完整报文面板');
-  check(detail.includes('上游原始响应'), '日志详情：缺上游原始响应面板');
-  check(detail.includes('trRespRaw') && detail.includes('trRespOut'), '日志详情：完整报文四栏未齐全');
-  check(detail.includes('{{PHONE_bcdfgh}}'), '日志详情：上游原始响应应保留占位符');
+  // 完整报文：页面**不得内联**，只给导出按钮（内联几 MB 会卡死浏览器）
+  check(detail.includes('导出完整报文'), '日志详情：缺「导出完整报文」按钮');
+  check(detail.includes('data-trace-id="7"'), '日志详情：导出按钮未带事件 id');
+  check(!detail.includes('trRespRaw') && !detail.includes('req_raw'), '日志详情：不得内联完整报文');
   check(byId.get('logMeta').textContent.includes('共 3 条'), '日志页：缺总数');
 
   // 请求头面板：头名/值渲染、凭据打码标记、同名头不合并、列表行计数
-  check(detail.includes('请求头 · 7'), '日志详情：缺「请求头」面板');
+  check(detail.includes('请求头') && detail.includes('class="pill">7<'), '日志详情：缺「请求头」面板');
   check(detail.includes('hdr-table'), '日志详情：请求头未用表格渲染');
   check(detail.includes('anthropic-version'), '日志详情：普通请求头未渲染');
   check(detail.includes('2023-06-01'), '日志详情：请求头值未渲染');
@@ -386,7 +384,7 @@ const tick = (n = 6) => new Promise(async res => {
     detail.includes('application/json') && detail.includes('text/event-stream'),
     '日志详情：同名 accept 被合并了',
   );
-  check(listHtml.includes('7 头'), '日志列表：缺请求头条数');
+  check(listHtml.includes('头 7'), '日志列表：缺请求头条数');
 
   // 切到「老事件」（无 masked_dialog）→ 必须走推算兜底
   byId.get('logList').fire('click', {

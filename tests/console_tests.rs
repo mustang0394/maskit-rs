@@ -414,8 +414,12 @@ async fn embedded_assets_are_versioned_and_uncached() {
     let js = String::from_utf8_lossy(&js);
     assert!(js.contains("/console/api"), "带查询串时必须仍是 app.js");
     assert!(
-        js.contains("上方为摘要") && js.contains("完整报文 · 原始字节（诊断环）"),
-        "详情页必须说明 dialog 是摘要、完整报文在诊断环"
+        js.contains("上方为对话摘要") && js.contains("导出完整报文"),
+        "详情页必须说明 dialog 是摘要、完整报文只能导出"
+    );
+    assert!(
+        !js.contains("trRespRaw"),
+        "详情页不得再内联渲染完整报文（改为按钮导出下载）"
     );
 }
 
@@ -1084,12 +1088,12 @@ async fn persisted_events_have_real_ids_and_masked_dialog() {
     assert_eq!(n3, 0, "本次请求没有 RESTORE 事件");
 }
 
-/// 完整报文诊断环：日志详情必须带「原文请求 / 脱敏请求」，且能看到上游响应侧。
+/// 完整报文改为**按需下载**：详情只回可用性标志，正文走 `/logs/trace/download`。
 ///
-/// 这是排查「脱敏了没还原」的关键证据：`dialog` 只是抽取后的对话文本，
-/// 看不到上游回来的占位符原样；`trace` 存的是原始字节。
+/// 起因：详情曾把 4 侧报文（各上限 1MiB）内联返回，浏览器一次性把几 MB 文本
+/// 塞进 DOM 并做全文高亮 —— 这是「打开日志详情就卡」的根因。
 #[tokio::test]
-async fn log_detail_exposes_full_trace_ring() {
+async fn full_trace_is_downloadable_not_inlined() {
     let dir = tempfile::tempdir().unwrap();
     let h = Harness::with_owned_dir(dir);
     let (status, _) = h
@@ -1118,20 +1122,139 @@ async fn log_detail_exposes_full_trace_ring() {
         .await;
     assert_eq!(code, StatusCode::OK);
     assert_eq!(v["trace_enabled"], serde_json::json!(true));
-    let tr = &v["trace"];
-    assert!(tr.is_object(), "详情必须带 trace 字段：{v}");
     assert!(
-        tr["req_raw"].as_str().unwrap_or("").contains("13800138000"),
-        "完整报文必须保留原文请求体：{tr}"
+        v.get("trace").is_none(),
+        "详情**不得**内联完整报文（改为按需下载）：{v}"
     );
-    let masked = tr["req_masked"].as_str().unwrap_or("");
+    assert_eq!(
+        v["trace_available"],
+        serde_json::json!(true),
+        "必须报告「本条可导出报文」"
+    );
+
+    // 正文只能通过下载端点拿到
+    let (code, body) = h
+        .req(
+            "GET",
+            &format!("/console/api/logs/trace/download?id={}", ev.id),
+            true,
+            None,
+        )
+        .await;
+    assert_eq!(code, StatusCode::OK);
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("1/4 原始请求（客户端发出）"), "{text}");
+    assert!(text.contains("2/4 发给上游（已脱敏）"), "{text}");
+    assert!(text.contains("3/4 上游原始响应"), "{text}");
+    assert!(text.contains("4/4 返回客户端"), "{text}");
     assert!(
-        masked.contains("{{PHONE_"),
-        "必须带发给上游的脱敏请求体：{masked}"
+        text.contains("13800138000"),
+        "下载必须保留客户端原文请求体：{text}"
     );
-    assert!(!masked.contains("13800138000"), "脱敏请求体不得含原文");
-    // 上游不可达时没有响应侧，但请求侧已完整
-    assert!(tr["resp_raw"].as_str().unwrap_or("").is_empty());
+    assert!(
+        text.contains("{{PHONE_"),
+        "必须带发给上游的脱敏请求体：{text}"
+    );
+}
+
+/// 下载端点必须走管理 API 的鉴权（它是唯一能拿到明文报文的出口）。
+#[tokio::test]
+async fn trace_download_requires_token() {
+    let h = Harness::new();
+    let (s, _) = h
+        .req("GET", "/console/api/logs/trace/download?id=1", false, None)
+        .await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "无令牌不得下载报文");
+}
+
+/// 导出必须**接筛选**：旧实现写死 fetch_events(2000,0)，筛了也导全量。
+#[tokio::test]
+async fn export_respects_event_type_filter() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::with_owned_dir(dir);
+    let mut mask = maskit_rs::store::events::Event {
+        event_type: maskit_rs::store::events::EventType::Mask,
+        method: "POST".into(),
+        path: "/v1/chat/completions".into(),
+        ..Default::default()
+    };
+    mask.id = 0;
+    let mut pass = maskit_rs::store::events::Event {
+        event_type: maskit_rs::store::events::EventType::Pass,
+        method: "GET".into(),
+        path: "/v1/models".into(),
+        ..Default::default()
+    };
+    pass.id = 0;
+    let es = h.state.event_store.as_ref().expect("自带事件库");
+    es.enqueue(mask.clone());
+    es.enqueue(pass.clone());
+    es.sync();
+
+    let (code, v) = h
+        .json("GET", "/console/api/logs/export?event_type=MASK", None)
+        .await;
+    assert_eq!(code, StatusCode::OK);
+    let events = v["events"].as_array().expect("events 数组");
+    assert_eq!(events.len(), 1, "筛选 MASK 后不得导出 PASS：{v}");
+    assert_eq!(events[0]["type"], serde_json::json!("MASK"));
+    assert_eq!(v["truncated"], serde_json::json!(false));
+    assert!(
+        v["total"].as_u64().unwrap_or(0) >= 1,
+        "导出必须回命中总数：{v}"
+    );
+}
+
+/// 列表接口只回摘要：**不得**带请求体 / 命中明细 / 请求头 / 报文。
+///
+/// 这是本轮重构的硬约束 —— 一页 100 条带上这些字段能到数 MB，
+/// 浏览器解析 + 渲染会直接卡死（明细只在详情里按需返回）。
+#[tokio::test]
+async fn logs_list_returns_summary_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::with_owned_dir(dir);
+    let (status, _) = h
+        .req(
+            "POST",
+            "/v1/chat/completions",
+            false,
+            Some(
+                r#"{"model":"gpt-4o","messages":[{"role":"user","content":"我的手机号是13800138000"}]}"#,
+            ),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    h.state.event_store.as_ref().expect("自带事件库").sync();
+
+    let (code, v) = h.json("GET", "/console/api/logs", None).await;
+    assert_eq!(code, StatusCode::OK);
+    let blob = serde_json::to_string(&v).unwrap();
+    for forbidden in [
+        "\"dialog\"",
+        "\"masked_dialog\"",
+        "\"items\"",
+        "\"request_headers\"",
+        "\"trace\"",
+    ] {
+        assert!(
+            !blob.contains(forbidden),
+            "列表不得返回 {forbidden}：{blob}"
+        );
+    }
+    let first = &v["events"][0];
+    assert_eq!(first["type"], serde_json::json!("MASK"));
+    assert!(
+        first["item_count"].as_u64().unwrap_or(0) >= 1,
+        "摘要必须带命中条数：{first}"
+    );
+    assert!(
+        first["header_count"].as_u64().unwrap_or(0) >= 1,
+        "摘要必须带请求头条数：{first}"
+    );
+    assert!(
+        first["count"].as_u64().unwrap_or(0) >= 1,
+        "摘要必须带脱敏计数：{first}"
+    );
 }
 
 /// 凭据明文开关关闭时，完整报文诊断环必须**一并关闭**（完整报文含凭据明文）。
@@ -1173,6 +1296,21 @@ async fn full_trace_is_disabled_when_credential_plaintext_off() {
         "关掉凭据明文时必须报告诊断环未启用"
     );
     assert!(v.get("trace").is_none(), "不得保留完整报文：{v}");
+    assert_eq!(
+        v["trace_available"],
+        serde_json::json!(false),
+        "未启用时不得声称可导出"
+    );
+    // 下载端点也必须拒绝
+    let (code, _) = h
+        .req(
+            "GET",
+            &format!("/console/api/logs/trace/download?id={}", ev.id),
+            true,
+            None,
+        )
+        .await;
+    assert_eq!(code, StatusCode::NOT_FOUND, "诊断环关闭时下载端点必须 404");
 }
 
 /// 回归：审计事件 id 非 0，且每条 finding 只触发一次落库钩子。

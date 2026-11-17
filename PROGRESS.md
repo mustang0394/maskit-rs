@@ -611,3 +611,88 @@ cargo test 2>&1 | grep -E "test result" | awk '{s+=}'   # 只累加 passed
   回退默认而丢掉上游地址/令牌）；base64 判定收紧为「≥3 类字符且含符号」
   （排除 base62 长签名/拼接 ID）；data URI 探测窗口 256→1024 字节；
   `mode=data_uri` 端到端测试（只外置 data URI）。
+
+## M22：日志页重构（列表摘要 / 报文导出 / 视觉重做）
+
+**问题（用户反馈）**：打开日志详情浏览器会卡。根因不在渲染，而在**数据契约**：
+`fetch_events_page` 是 `SELECT payload` 全字段返回，而 payload 里塞着
+`dialog` + `masked_dialog`（各 8000 字符上限）、`request_headers`（合计 16KiB）、
+`items[]`（30 条完整命中原文）。一页 100 条 → 典型数百 KB、极端数 MB。
+详情更狠：`get_log_detail` 无条件内联 `trace`（4 侧 × 单侧 1MiB = 最多 4MiB），
+前端把 4 个 `<pre>` 全量塞进 DOM 并逐段跑 `highlight()` 全文扫描。
+
+**数据契约（三级）**：
+
+1. **L1 列表** `GET /api/logs` → `EventSummary`：只含 20 个标量 + `item_count` /
+   `header_count`（替代原来的 `items.length` / `request_headers.length`）。
+   实现是 **SQL 层投影**（`json_extract` / `json_array_length`），不再反序列化整条
+   payload；`WHERE json_valid(payload)` 挡住损坏行，避免 `json_extract` 报错让整页空白。
+2. **L2 详情** `GET /api/logs/detail?id=N`：保留 `dialog` / `masked_dialog` / `items` /
+   `request_headers`，**移除 `trace`**，改为 `trace_enabled` / `trace_keep_count` /
+   `trace_available` 三个标志（`has_trace` 走 `idx_trace_sid` 只查存在性，不读正文）。
+3. **L3 报文** `GET /api/logs/trace/download?id=N`（新增）：`text/plain` 附件，
+   四节合并（原始请求 / 脱敏请求 / 上游原始响应 / 还原后响应）。页面不再内联。
+
+**顺带修的两个既有缺陷**：
+- 前端**没有任何导出入口**（`/api/logs/export` 是孤儿端点，README 却写成已交付）→ 工具栏补「导出」按钮。
+- 导出写死 `fetch_events(2000, 0)`：忽略 `q` / `event_type` 筛选、超 2000 条**静默截断**
+  → 改为接筛选、上限 5000、截断时回 `X-Maskit-Truncated: true`。
+
+**前端交互修复**：
+- 自动刷新原来每 5s 执行 `log.offset = 0; loadLogs()` —— 翻到第 N 页或正在读详情时
+  会被强行拽回第一页且详情重绘。改为**保留页与选中项**，且选中项未变时
+  `loadTs({detail:false})` 不重拉详情；`document.hidden` 时跳过。
+- 详情加载态由纯文字「加载中…」改为骨架屏；复制按钮的旧委托改为「导出完整报文」委托。
+
+**视觉（S0 token 层 + 全站组件精修）**：
+- 新增设计节奏变量：`--sp-1..6` / `--r-sm|md|lg|pill` / `--fs-xs..lg` / `--el-1..3`；
+  原来 4/5/6/7/8/9/10/11/14px 圆角混用、字号只有 11.5/13 两档。
+- 日志页：固定高度双栏（**消灭两条滚动条打架**，`max-height:640px` 的坑在
+  `.split-detail` 上，需显式解除）→ 列表行成列对齐（时间 62px / 徽章 74px 定宽，
+  路径为唯一主视觉，耗时右对齐，第二行单行省略保证行高整齐）→ 详情卡片化：
+  sticky 头部 + 指标 chips + `<details>` 折叠分区（对话对照 / 命中明细 / 请求头）+ 底部导出按钮。
+- 全站：`.panel` 圆角/阴影统一、`.card` 数字与标签比例、`table.kv` 行高与 hover、
+  输入框 focus ring；审计详情改套同一套卡片语言（原来 kv 网格把
+  `POST /v1/chat/completions` 断成 `…completion` + `s`，改用 `overflow-wrap: anywhere`）。
+
+**验证**：
+- `cargo test`：39 个 `console_tests` 全绿（新增 `logs_list_returns_summary_only`、
+  `full_trace_is_downloadable_not_inlined`；改写 `full_trace_is_disabled_when_credential_plaintext_off`）。
+  `cargo clippy --all-targets -- -D warnings` 通过（仅 2 条既有的未使用依赖提示）。
+- 前端：`node --check assets/app.js` + `node scripts/ui-smoke.js` 通过（断言已按新契约更新）。
+- 视觉：`/usr/bin/chromium --headless` 截图 1440×900 深/浅两版 + 860 窄屏 + 审计页，
+  逐张目检：行高整齐、双栏等高、sticky 头部在滚动 600px 后仍常驻、窄屏正确堆叠。
+
+**已知遗留**：`tests/parity_tests.rs::large_text_performance_smoke` 是**时间敏感**断言
+（600KB 脱敏 < 2s），实测 1.97s，与 clippy 并行编译时会失败（CPU 争用），单独跑通过。
+本次未改动脱敏引擎，属既有 flaky，建议后续改为相对基线或提高阈值。
+
+**只读评审后的修复（2026-11-17，子代理 review：0 个 P0 / 4 个 P1 / 11 个 P2）**：
+
+- **P1-2 id 域不一致**：列表对缺 `$.id` 的行（Python 版 payload）回退成表自增 id，
+  但 `fetch_event_by_id` 只按 `json_extract(payload,'$.id')` 查 → 这类行「列表能点、点开 404」。
+  详情改为与列表**完全相同的表达式**，并 `ORDER BY (json_extract(...) IS NULL)` 让真 id 优先命中。
+  锁：`db.rs::python_payload_without_id_is_reachable_by_same_id`。
+- **P1-3 `json_valid` 进了 COUNT**：无筛选时 `COUNT(*)` 本可只走最小索引，
+  加上 `json_valid(payload)` 后要逐行读并解析 payload；列表 5s 自动刷新一次，
+  几万条 × 数十 KB 会把 DB 打满。改为**只在取页查询里加** `json_valid`，total 退回普通 COUNT。
+- **P1-4 导出内存无上限**：5000 条 × 最坏 ~80KB ≈ 数百 MB。改为**按序列化字节预算**
+  （32MiB）边生成边截断，不再先攒 `Vec<Value>` 再整体序列化；`truncated` 判定改成
+  `total > EXPORT_MAX || 命中字节预算`（旧写法 `total > events.len()` 会把「坏行被筛掉」
+  误报成截断）。
+- **P1-1 明文报文可下载但文案在鼓励外发**：`render_trace_text` 抬头加醒目警示
+  （可能含凭据/PII 明文、禁止外发）；前端下载前 `confirm()` 二次确认。
+- **P2-2 页码不回收**：自动刷新改为保留 offset 后，别的标签页清空/保留期清理会让
+  total 变小 → 停在永远空白的页。`loadLogs` 拿到响应后 clamp offset 并重取一次。
+- **P2-3 截断无提示**：前端读 `x-maskit-truncated`，导出后明确 toast「已截断」。
+- **P2-4 401 双重提示**：`downloadFile` 的 401 分支改为 return（不再抛错让 catch 再弹英文 toast）。
+- **P2-5 下载阻塞 tokio worker**：`fetch_trace` + 文本渲染移进 `spawn_blocking`。
+- **P2-7 样式重复定义**：`.d-head` / `.d-head-main` 有两份、`.d-head-sub` 被全局改了字号；
+  收窄为 `.logs-detail .d-head*`，避免让注释与实现不符、后续误伤审计页。
+- **P2-10 测试缺口**：补 `trace_download_requires_token`（无令牌 401）、
+  `export_respects_event_type_filter`（导出接筛选 + truncated 字段）。
+- **P2-11 极端 ts**：`fmt_utc` 加 9999 年上限，避免 `z + 719_468` 溢出。
+- 未处理（记录在案）：P2-6 关闭 `log_credential_plaintext` 不会清理已落盘的 `trace_blobs`
+  历史明文（既有行为，需产品决策）；P2-8 `.lrow*` 共享类对审计列表的间距微调（已目检无破坏）；
+  P2-9 `.d-kv` / `.detail-section` 已成死样式（保留待后续页面复用）；P2-12 ring 合并的
+  `take(limit)` 短时挤掉页尾（既有行为，代码逐行等价）。

@@ -116,7 +116,7 @@
     <!-- ==================== 日志 ==================== -->
     <section class="page" id="page-logs">
       <div class="panel">
-        <div class="panel-head">
+        <div class="panel-head logs-head">
           <h2>事件日志</h2>
           <div class="panel-actions">
             <select id="logType" aria-label="事件类型">
@@ -130,33 +130,35 @@
             </select>
             <input id="logSearch" type="search" class="grow-sm"
                    placeholder="搜索 路径 / 模型 / 原文 / 占位符" aria-label="搜索日志" />
-            <label class="switch-inline" title="每 5 秒自动刷新第一页">
+            <label class="switch-inline" title="每 5 秒刷新列表；保持当前页与选中项">
               <input type="checkbox" id="logAuto" /> 自动刷新
             </label>
             <button class="btn btn-sm" id="logRefresh">刷新</button>
+            <button class="btn btn-sm" id="logExport" title="按当前筛选导出（恒脱敏，不含原文与请求头）">导出</button>
             <button class="btn btn-sm btn-warn" id="logClear">清空</button>
           </div>
         </div>
-        <p class="hint">
-          左选事件、右侧看详情。详情里「原文」是客户端发出的内容，「发给上游」是脱敏后
-          实际转发给上游的内容（含 <code>{{占位符}}</code>），下方另有本次请求的
-          <strong>全部请求头</strong>。凭据类（<code>dialog</code> / 请求头里的
-          <code>authorization</code>、<code>cookie</code> 等）受
-          <code>mask.log_credential_plaintext</code> 控制。
+        <p class="logs-hint">
+          列表只含摘要；点开某条才加载它的对话文本与请求头。
+          <strong>完整报文</strong>（原始字节，最多 4 侧）不在页面内联渲染，请在详情底部用「导出完整报文」下载。
+          凭据类受 <code>mask.log_credential_plaintext</code> 控制。
         </p>
-        <div class="split">
-          <div class="split-list" id="logList" role="listbox" aria-label="事件列表"></div>
-          <div class="split-detail" id="logDetail"></div>
-        </div>
-        <div class="split-foot">
-          <span class="hint" id="logMeta"></span>
-          <span class="pager">
-            <button class="btn btn-sm" id="logPrev">‹ 上一页</button>
-            <button class="btn btn-sm" id="logNext">下一页 ›</button>
-          </span>
+        <div class="logs-body">
+          <div class="logs-list-col">
+            <div class="split-list" id="logList" role="listbox" aria-label="事件列表"></div>
+            <div class="split-foot">
+              <span class="hint" id="logMeta"></span>
+              <span class="pager">
+                <button class="btn btn-sm" id="logPrev">‹ 上一页</button>
+                <button class="btn btn-sm" id="logNext">下一页 ›</button>
+              </span>
+            </div>
+          </div>
+          <div class="split-detail logs-detail" id="logDetail"></div>
         </div>
       </div>
     </section>
+
 
     <!-- ==================== 审计 ==================== -->
     <section class="page" id="page-audit">

@@ -162,6 +162,10 @@ pub fn build_router(state: SharedState) -> Router {
         .route("/console/api/logs/detail", get(console_api::get_log_detail))
         .route("/console/api/logs/clear", post(console_api::clear_logs))
         .route("/console/api/logs/export", get(console_api::export_logs))
+        .route(
+            "/console/api/logs/trace/download",
+            get(console_api::download_trace),
+        )
         // 统计
         .route("/console/api/stats/today", get(console_api::stats_today))
         .route(

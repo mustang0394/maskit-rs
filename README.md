@@ -91,8 +91,9 @@ MASKIT_RS_DATA_DIR=/var/lib/maskit-rs ./target/release/maskit-rs
 - **token 用量统计**：按模型统计输入/输出 token（`/api/stats/today`、`/api/stats/models`）。**只统计数量，不做价格/费用计算**
 - **事件与统计**：SQLite（事件表与 Python 版同 schema，可互读写；Rust 版另增一张 `placeholder_map` 映射表，见下）、每日聚合、保留期清理
 - **控制台**：单文件原生 JS（无构建步骤）。日志/审计/敏感词均为**主从双栏**；日志详情并排对照「原文（客户端发出）」与「发给上游（已脱敏）」（`masked_dialog`），并展示本次请求的**全部请求头**（保序、同名头不合并），支持全文搜索、类型过滤、分页、自动刷新；页面状态写入 URL hash（`/console#logs` 可直达、刷新不丢页）
-  - **完整报文（诊断环）**：详情页底部四栏展示最近 N 条请求的**原始字节** —— 原始请求 / 发给上游（已脱敏）/ 上游原始响应（占位符原样）/ 返回客户端（还原后），各栏可一键复制。这是排查「脱敏了没还原」的关键证据：`dialog` 只是抽取后的对话文本，看不到上游回来的占位符原样；「上游原始响应」里被改写、截断的 `{{LABEL_xxxxxx}}` 会被高亮标出。见配置 `full_trace_count`。注意：多模态载荷外置后，「脱敏后报文」栏显示的是 token 形态（`kmb-…`），实际转发时已按原始字节拼回；「原始请求」栏仍是完整原始字节
-  - **请求头日志**：`events[].request_headers`，为 `[[name, value], …]`（保序 + 保留同名重复头，如多个 `accept`）。头名统一转小写。凭据类（`authorization` / `cookie` / `x-api-key` 等）的值按 `mask.log_credential_plaintext` 决定是否显示为 `***`；导出（`/api/logs/export`）**恒剔除**该字段。为防客户端用超大/超多头撑爆事件库，上限为 100 个、单值 2048 字符、合计 16KiB，超限截断并附 `x-shield-truncated` 标记
+  - **完整报文（诊断环）**：**只能在详情页点「导出完整报文」下载 `.txt`**，页面不再内联渲染 —— 它最多 4 侧 × 1MiB，一次性塞进 DOM 会把浏览器卡死（这正是 2026-11 那次重构的起因）。导出文件分四节：原始请求 / 发给上游（已脱敏）/ 上游原始响应（占位符原样）/ 返回客户端（还原后），可在文件里直接搜索 `/` 对照。这是排查「脱敏了没还原」的关键证据：`dialog` 只是抽取后的对话文本，看不到上游回来的占位符原样。见配置 `full_trace_count`，端点 `GET /console/api/logs/trace/download?id=N`。注意：多模态载荷外置后，「发给上游」一节显示的是 token 形态（`kmb-…`），实际转发时已按原始字节拼回；「原始请求」一节仍是完整原始字节
+  - **列表只回摘要**：`GET /api/logs` 不返回 `dialog` / `masked_dialog` / `items[]` / `request_headers` / 报文，只回十来个标量 + `item_count` / `header_count`（SQL 层 `json_extract` 投影，不反序列化整条 payload）。对话文本与请求头由 `GET /api/logs/detail?id=N` 按需返回 —— 列表一页 100 条带上这些字段能到数 MB。
+  - **请求头日志**：`events[].request_headers`，为 `[[name, value], …]`（保序 + 保留同名重复头，如多个 `accept`）。头名统一转小写。凭据类（`authorization` / `cookie` / `x-api-key` 等）的值按 `mask.log_credential_plaintext` 决定是否显示为 `***`；导出（`/api/logs/export`，接 `q` / `event_type` 筛选，超过 5000 条回 `X-Maskit-Truncated: true`）**恒剔除**该字段。为防客户端用超大/超多头撑爆事件库，上限为 100 个、单值 2048 字符、合计 16KiB，超限截断并附 `x-shield-truncated` 标记
 - **凭据明文落盘（按设计）**：脱敏命中的映射表 `placeholder_map` 会无条件记录**所有**分类（含凭据类）的 `占位符 → 原文`，用于进程重启后还原历史对话里的占位符。
   因此「凭据类原文永不落库」**只对 `events` 表成立**（受 `mask.log_credential_plaintext` 控制），不适用于映射表；`config.json` 里的原始敏感词同理。**备份数据目录必须加密。**
 

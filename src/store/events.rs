@@ -29,6 +29,25 @@ pub enum EventType {
     CmdHit,
 }
 
+impl EventType {
+    /// 大写字面量（与 `#[serde(rename_all = "UPPERCASE")]` 及数据库 `type` 列一致）。
+    ///
+    /// 存在的意义：过滤/摘要路径要按类型名比较，早期用 `format!("{:?}")` 会为
+    /// ring 里每条事件分配一个 String（2000 条 × 每次列表请求）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EventType::Mask => "MASK",
+            EventType::Restore => "RESTORE",
+            EventType::Pass => "PASS",
+            EventType::Bypass => "BYPASS",
+            EventType::Block => "BLOCK",
+            EventType::Err => "ERR",
+            EventType::ScanWarn => "SCANWARN",
+            EventType::CmdHit => "CMDHIT",
+        }
+    }
+}
+
 /// 事件明细条目（命中的原文/占位符对；凭据类不落原文，见 cred 模块）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventItem {
@@ -165,6 +184,85 @@ pub struct Event {
     /// 采集与上限截断见 `upstream::http_client::collect_log_headers`。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub request_headers: Vec<(String, String)>,
+}
+
+/// 日志列表摘要（L1）：只含列表 UI 真正消费的字段。
+///
+/// **刻意不含** `dialog` / `masked_dialog` / `items[]` / `request_headers` / `trace`：
+/// 这几项决定单条 payload 可达数十 KB（dialog 两段各 8000 字符、请求头合计 16KiB、
+/// items 里是完整命中原文），列表一页 100 条会到数 MB —— 浏览器解析与渲染都会卡。
+/// 它们只在**详情**里按需返回，完整报文更是只能通过导出下载。
+///
+/// `item_count` / `header_count` 是对应数组的长度：列表只需要「有几个」，
+/// 不需要本体（旧实现靠 `items.length`，等于把整份明细也传给了列表页）。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct EventSummary {
+    pub id: u64,
+    pub ts: f64,
+    #[serde(rename = "type")]
+    pub event_type: String,
+    pub method: String,
+    pub path: String,
+    pub status: u16,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub reason: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub protocol: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub model: String,
+    #[serde(rename = "sid", skip_serializing_if = "String::is_empty")]
+    pub session_id: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub stream_mode: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub stream_actual: String,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub unknown_shape: bool,
+    #[serde(skip_serializing_if = "is_zero_usize")]
+    pub count: usize,
+    #[serde(skip_serializing_if = "is_zero_usize")]
+    pub restored: usize,
+    #[serde(skip_serializing_if = "is_zero_usize")]
+    pub unresolved: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mask_ms: Option<f64>,
+    #[serde(skip_serializing_if = "is_zero_usize")]
+    pub req_bytes: usize,
+    #[serde(skip_serializing_if = "is_zero_usize")]
+    pub resp_bytes: usize,
+    #[serde(skip_serializing_if = "is_zero_usize")]
+    pub item_count: usize,
+    #[serde(skip_serializing_if = "is_zero_usize")]
+    pub header_count: usize,
+}
+
+impl EventSummary {
+    /// 从完整事件裁剪出摘要（事件库不可用时的内存 ring 降级路径用）。
+    pub fn from_event(e: &Event) -> Self {
+        Self {
+            id: e.id,
+            ts: e.ts,
+            event_type: e.event_type.as_str().to_string(),
+            method: e.method.clone(),
+            path: e.path.clone(),
+            status: e.status,
+            reason: e.reason.clone(),
+            protocol: e.protocol.clone(),
+            model: e.model.clone(),
+            session_id: e.session_id.clone(),
+            stream_mode: e.stream_mode.clone(),
+            stream_actual: e.stream_actual.clone(),
+            unknown_shape: e.unknown_shape,
+            count: e.count,
+            restored: e.restored,
+            unresolved: e.unresolved,
+            mask_ms: e.mask_ms,
+            req_bytes: e.req_bytes,
+            resp_bytes: e.resp_bytes,
+            item_count: e.items.len(),
+            header_count: e.request_headers.len(),
+        }
+    }
 }
 
 fn is_zero_usize(v: &usize) -> bool {
@@ -376,7 +474,7 @@ impl EventBus {
             .rev()
             .filter(|e| {
                 if let Some(w) = &want {
-                    if format!("{:?}", e.event_type).to_ascii_uppercase() != *w {
+                    if e.event_type.as_str() != w.as_str() {
                         return false;
                     }
                 }

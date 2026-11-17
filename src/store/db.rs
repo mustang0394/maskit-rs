@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 
-use crate::store::events::{AuditEvent, Event};
+use crate::store::events::{AuditEvent, Event, EventSummary};
 use crate::store::trace::{TraceBlob, TraceView};
 
 /// 事件队列上限（对齐 `EVENT_QUEUE_MAX` = 5000）。
@@ -229,21 +229,172 @@ impl EventStore {
         (events, total)
     }
 
+    /// 列表摘要分页查询（L1）：**在 SQL 层投影**，不把整条 payload 读进内存。
+    ///
+    /// 与 `fetch_events_page` 的区别只有一件事：不反序列化整条事件。
+    /// 单条 payload 含 dialog（8000 字符）、masked_dialog（8000 字符）、
+    /// request_headers（合计 16KiB）、items（30 条完整命中原文）—— 一页 100 条能到
+    /// 数 MB。列表只需要十来个标量 + 两个数组长度，用 `json_extract` /
+    /// `json_array_length` 在 SQLite 里取出来即可。
+    ///
+    /// `WHERE json_valid(payload)`：一条损坏的 payload 会让 `json_extract` 报错、
+    /// 整条查询失败（旧实现是逐行 `from_str().ok()` 静默跳过）。把它挡在 WHERE 里，
+    /// 坏行既不计入 total 也不进结果，与原「静默跳过」语义一致且不会整页空白。
+    pub fn fetch_event_summaries(
+        &self,
+        limit: usize,
+        offset: usize,
+        event_type: Option<&str>,
+        q: Option<&str>,
+    ) -> (Vec<EventSummary>, usize) {
+        let Ok(conn) = open_read(&self.path) else {
+            return (vec![], 0);
+        };
+        let mut filter_where: Vec<&str> = Vec::new();
+        let mut binds: Vec<rusqlite::types::Value> = Vec::new();
+        if let Some(t) = event_type.filter(|t| !t.trim().is_empty()) {
+            filter_where.push("type = ?");
+            binds.push(rusqlite::types::Value::Text(t.trim().to_ascii_uppercase()));
+        }
+        if let Some(q) = q.filter(|q| !q.trim().is_empty()) {
+            filter_where.push("payload LIKE ?");
+            binds.push(rusqlite::types::Value::Text(format!("%{}%", q.trim())));
+        }
+        let filter_sql = if filter_where.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", filter_where.join(" AND "))
+        };
+        // `json_valid` **只加在取页查询上**，不进 COUNT：
+        // COUNT(*) 配上 `json_valid(payload)` 必须把每一行的 payload 完整读出并解析，
+        // 而无筛选时的 COUNT(*) 本来可以只走最小索引。列表 5s 自动刷新一次，
+        // 几万条 × 数十 KB 的 payload 会让「为了不卡」的重构反过来卡住数据库。
+        // 代价：库里若真有坏行，total 会比可取出的行略大（旧实现同样如此）。
+        let total: usize = conn
+            .query_row(
+                &format!("SELECT COUNT(*) FROM events{filter_sql}"),
+                rusqlite::params_from_iter(binds.iter()),
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap_or(0)
+            .max(0) as usize;
+        let where_sql = if filter_where.is_empty() {
+            " WHERE json_valid(payload)".to_string()
+        } else {
+            format!(
+                " WHERE json_valid(payload) AND {}",
+                filter_where.join(" AND ")
+            )
+        };
+        let events = (|| -> Option<Vec<EventSummary>> {
+            let mut stmt = conn
+                .prepare(&format!(
+                    // 数值列一律 `CAST(... AS INTEGER/REAL)`：Python 版 RESTORE 的
+                    // `status` 是**字符串**（"restored"/"unresolved"），直接按 i64 读会
+                    // 得到 InvalidColumnType —— 而 `filter_map(|r| r.ok())` 会把整行
+                    // 静默丢掉（列表里少事件，且 total 与行数不一致）。
+                    // CAST 后：字符串 -> 0（与 `de_status_flexible` 的兜底语义一致），
+                    // 整数 -> 原值，缺失 -> NULL -> COALESCE 兜底。
+                    "SELECT \
+                       CAST(COALESCE(json_extract(payload,'$.id'), id) AS INTEGER), ts, type, \
+                       COALESCE(json_extract(payload,'$.method'),''), \
+                       COALESCE(json_extract(payload,'$.path'),''), \
+                       CAST(COALESCE(json_extract(payload,'$.status'),0) AS INTEGER), \
+                       COALESCE(json_extract(payload,'$.reason'),''), \
+                       COALESCE(json_extract(payload,'$.protocol'),''), \
+                       COALESCE(json_extract(payload,'$.model'),''), \
+                       COALESCE(CAST(json_extract(payload,'$.sid') AS TEXT), CAST(json_extract(payload,'$.session_id') AS TEXT), ''), \
+                       COALESCE(json_extract(payload,'$.stream_mode'),''), \
+                       COALESCE(json_extract(payload,'$.stream_actual'),''), \
+                       CAST(COALESCE(json_extract(payload,'$.unknown_shape'),0) AS INTEGER), \
+                       CAST(COALESCE(json_extract(payload,'$.count'),0) AS INTEGER), \
+                       CAST(COALESCE(json_extract(payload,'$.restored'),0) AS INTEGER), \
+                       CAST(COALESCE(json_extract(payload,'$.unresolved'),0) AS INTEGER), \
+                       CAST(json_extract(payload,'$.mask_ms') AS REAL), \
+                       CAST(COALESCE(json_extract(payload,'$.req_bytes'),0) AS INTEGER), \
+                       CAST(COALESCE(json_extract(payload,'$.resp_bytes'),0) AS INTEGER), \
+                       CAST(COALESCE(json_array_length(json_extract(payload,'$.items')),0) AS INTEGER), \
+                       CAST(COALESCE(json_array_length(json_extract(payload,'$.request_headers')),0) AS INTEGER) \
+                     FROM events{where_sql} ORDER BY id DESC LIMIT ? OFFSET ?"
+                ))
+                .ok()?;
+            let mut page_binds = binds;
+            page_binds.push(rusqlite::types::Value::Integer(limit as i64));
+            page_binds.push(rusqlite::types::Value::Integer(offset as i64));
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(page_binds.iter()), |r| {
+                    Ok(EventSummary {
+                        id: r.get::<_, i64>(0)?.max(0) as u64,
+                        ts: r.get::<_, f64>(1)?,
+                        event_type: r.get::<_, String>(2)?,
+                        method: r.get::<_, String>(3)?,
+                        path: r.get::<_, String>(4)?,
+                        status: r.get::<_, i64>(5)?.clamp(0, u16::MAX as i64) as u16,
+                        reason: r.get::<_, String>(6)?,
+                        protocol: r.get::<_, String>(7)?,
+                        model: r.get::<_, String>(8)?,
+                        session_id: r.get::<_, String>(9)?,
+                        stream_mode: r.get::<_, String>(10)?,
+                        stream_actual: r.get::<_, String>(11)?,
+                        unknown_shape: r.get::<_, i64>(12)? != 0,
+                        count: r.get::<_, i64>(13)?.max(0) as usize,
+                        restored: r.get::<_, i64>(14)?.max(0) as usize,
+                        unresolved: r.get::<_, i64>(15)?.max(0) as usize,
+                        mask_ms: r.get::<_, Option<f64>>(16)?,
+                        req_bytes: r.get::<_, i64>(17)?.max(0) as usize,
+                        resp_bytes: r.get::<_, i64>(18)?.max(0) as usize,
+                        item_count: r.get::<_, i64>(19)?.max(0) as usize,
+                        header_count: r.get::<_, i64>(20)?.max(0) as usize,
+                    })
+                })
+                .ok()?;
+            Some(rows.filter_map(|r| r.ok()).collect())
+        })()
+        .unwrap_or_default();
+        (events, total)
+    }
+
     /// 按事件 id 取单条（内存 ring 已淘汰时给详情页兜底）。
     ///
     /// ⚠️ 查的是 payload 里的 `id`（总线赋的全局事件 id），不是表的自增行号：
     /// 两者在全量落库时恰好一致，但一旦有入队丢弃（`try_send` 失败）就会漂移，
     /// 而前端拿到的永远是 payload 里的 id。
+    /// 匹配表达式必须与 `fetch_event_summaries` **完全一致**：
+    /// 列表对缺 `$.id` 的行（Python 版写的 payload）回退成表自增 id，
+    /// 若详情只按 `json_extract(payload,'$.id')` 查，这类行就是「列表能点、点开 404」。
+    /// `ORDER BY (… IS NULL)` 让真有 payload id 的行优先命中，避免与 rowid 撞车时选错。
     pub fn fetch_event_by_id(&self, id: u64) -> Option<Event> {
         let conn = open_read(&self.path).ok()?;
         let payload: String = conn
             .query_row(
-                "SELECT payload FROM events WHERE json_extract(payload, '$.id') = ?1 LIMIT 1",
+                "SELECT payload FROM events \
+                 WHERE json_valid(payload) \
+                   AND CAST(COALESCE(json_extract(payload,'$.id'), id) AS INTEGER) = ?1 \
+                 ORDER BY (json_extract(payload,'$.id') IS NULL) LIMIT 1",
                 params![id as i64],
                 |r| r.get(0),
             )
             .ok()?;
         serde_json::from_str(&payload).ok()
+    }
+
+    /// 该 sid 是否有可导出的完整报文（**只查存在性，不读正文**）。
+    ///
+    /// 详情接口需要告诉前端「这条能不能点导出」，但不能为此把几 MB 报文拉出来
+    /// —— 那正是本次改造要消灭的问题。走 `idx_trace_sid` 索引，代价可忽略。
+    pub fn has_trace(&self, sid: &str) -> bool {
+        if sid.is_empty() {
+            return false;
+        }
+        let Ok(conn) = open_read(&self.path) else {
+            return false;
+        };
+        conn.query_row(
+            "SELECT 1 FROM trace_blobs WHERE sid = ?1 LIMIT 1",
+            params![sid],
+            |_| Ok(()),
+        )
+        .is_ok()
     }
 
     /// 按 sid 取一组完整报文（req + resp 两行合并）。
@@ -1037,11 +1188,7 @@ fn write_event(conn: &Connection, ev: &Event) -> rusqlite::Result<()> {
     let day = today_str();
     conn.execute(
         "INSERT INTO events (ts, type, payload) VALUES (?1, ?2, ?3)",
-        params![
-            ev.ts,
-            format!("{:?}", ev.event_type).to_uppercase(),
-            payload
-        ],
+        params![ev.ts, ev.event_type.as_str(), payload],
     )?;
     // 每日聚合
     let bump = |key: &str, n: i64| -> rusqlite::Result<()> {
@@ -1340,6 +1487,66 @@ mod tests {
             .sum();
         assert_eq!(total, 3);
         assert!(st["day"].as_str().unwrap().len() == 10);
+    }
+
+    /// Python 版 RESTORE 的 `status` 是字符串（"restored"/"unresolved"）。
+    /// 列表投影若按 i64 直读会 InvalidColumnType，然后被 `filter_map(r.ok())`
+    /// 静默丢行 —— 表现为「列表里少事件、total 还对不上」。这里锁住该行为。
+    #[test]
+    fn event_summaries_tolerate_python_string_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = EventStore::open(dir.path()).unwrap();
+        store.sync();
+        {
+            let conn = rusqlite::Connection::open(store.path()).unwrap();
+            conn.execute(
+                "INSERT INTO events (ts, type, payload) VALUES (?1, 'RESTORE', ?2)",
+                rusqlite::params![
+                    1.0_f64,
+                    r#"{"id":9001,"ts":1.0,"type":"RESTORE","status":"restored","path":"/v1/chat/completions","restored":2,"items":[{"label":"PHONE","tok":"13800138000"}]}"#
+                ],
+            )
+            .unwrap();
+        }
+        let (rows, total) = store.fetch_event_summaries(10, 0, None, None);
+        assert_eq!(total, 1, "坏行不得进 total");
+        assert_eq!(rows.len(), 1, "Python 字符串 status 不得让整行被丢弃");
+        assert_eq!(rows[0].id, 9001);
+        assert_eq!(rows[0].status, 0, "字符串状态按 Python 兼容语义落 0");
+        assert_eq!(rows[0].restored, 2);
+        assert_eq!(rows[0].item_count, 1, "数组长度必须投影出来");
+    }
+
+    /// Python 版 payload **没有 `$.id` 字段**。列表会回退成表自增 id，
+    /// 详情必须用同一个表达式反查 —— 否则就是「列表能点、点开 404」。
+    #[test]
+    fn python_payload_without_id_is_reachable_by_same_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = EventStore::open(dir.path()).unwrap();
+        store.sync();
+        let rowid = {
+            let conn = rusqlite::Connection::open(store.path()).unwrap();
+            conn.execute(
+                "INSERT INTO events (ts, type, payload) VALUES (?1, 'MASK', ?2)",
+                rusqlite::params![
+                    1.0_f64,
+                    r#"{"ts":1.0,"type":"MASK","path":"/v1/chat/completions","count":1}"#
+                ],
+            )
+            .unwrap();
+            conn.last_insert_rowid()
+        };
+        let (rows, total) = store.fetch_event_summaries(10, 0, None, None);
+        assert_eq!(total, 1);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].id as i64, rowid,
+            "缺 $.id 的 Python 行回退成自增 id"
+        );
+        let ev = store
+            .fetch_event_by_id(rows[0].id)
+            .expect("详情必须能用列表给出的同一个 id 取回");
+        assert_eq!(ev.path, "/v1/chat/completions");
     }
 
     #[test]
