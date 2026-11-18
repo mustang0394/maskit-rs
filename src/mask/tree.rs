@@ -195,6 +195,43 @@ pub fn mask_tree(
             if ctx.is_blob_token(s) {
                 return Ok(obj.clone());
             }
+            // JSON 文本字段（工具参数等）：客户端可能把内层 JSON 预先转义成
+            // `\uXXXX` 字符串，直接扫原文会漏掉中文自定义词/含引号口令。
+            // 解析内层树、按业务区递归脱敏，再紧凑序列化；整串改写登记成
+            // splice pair，避免等价校验失败退化为整棵重序列化。
+            if key
+                .map(|k| super::exemptions::json_str_keys().contains(k))
+                .unwrap_or(false)
+                && !super::blob::is_skippable_str(s, &ctx.blob)
+            {
+                if let Ok(inner) = serde_json::from_str::<Value>(s) {
+                    let mut inner_path = path.clone();
+                    if let Some(k) = key {
+                        inner_path.push(k.to_string());
+                    }
+                    let mut inner_changed = false;
+                    let masked_inner = mask_tree(
+                        &inner,
+                        ctx,
+                        key,
+                        parent,
+                        &mut inner_path,
+                        depth + 1,
+                        &mut inner_changed,
+                    )?;
+                    if inner_changed {
+                        let serialized = serde_json::to_string(&masked_inner)
+                            .map_err(|e| format!("json_args_serialize: {e}"))?;
+                        if serialized != *s {
+                            ctx.record_splice_pair(s.clone(), serialized.clone());
+                            *changed = true;
+                            return Ok(Value::String(serialized));
+                        }
+                    }
+                    // 内层没有可脱敏内容：保留原始字节形态
+                    return Ok(obj.clone());
+                }
+            }
             // 路径豁免（协议位置）或值形态豁免（data URI / 大块裸 base64）。
             // 后者是 C 方案的兜底层：解析前外置已移走绝大多数大载荷，这里覆盖
             // 短 data URI、未知形态与响应侧字符串。
@@ -214,10 +251,13 @@ pub fn mask_tree(
         }
         Value::Bool(_) | Value::Null => Ok(obj.clone()),
         Value::Number(n) => {
-            // 数值型协议字段豁免；业务区内的数值照常扫描
-            let exempt_key = key
-                .map(|k| skip_numeric_keys().contains(k))
-                .unwrap_or(false);
+            // 数值型协议字段豁免；业务区内的数值照常扫描。
+            // 注意必须先判断 in_business：业务区内的 seed/index/n 等
+            // 同名数值字段是用户数据，不能套协议豁免。
+            let exempt_key = !in_business
+                && key
+                    .map(|k| skip_numeric_keys().contains(k))
+                    .unwrap_or(false);
             if exempt_key || super::exemptions::leaf_exempt(key, parent, in_business) {
                 return Ok(obj.clone());
             }
@@ -293,6 +333,20 @@ fn value_contains_brace(v: &Value) -> bool {
     }
 }
 
+/// 统计子树里可识别的 `{{...}}` 占位符数量（含对象键）。
+fn count_braced_placeholders(v: &Value) -> usize {
+    let rx = crate::mask::placeholder::braced_placeholder_rx();
+    match v {
+        Value::String(s) => rx.find_iter(s).count(),
+        Value::Array(arr) => arr.iter().map(count_braced_placeholders).sum(),
+        Value::Object(map) => map
+            .iter()
+            .map(|(k, v)| rx.find_iter(k).count() + count_braced_placeholders(v))
+            .sum(),
+        _ => 0,
+    }
+}
+
 /// 递归还原 JSON 树。返回 (还原后的值, 统计)。
 pub fn restore_tree(
     obj: &Value,
@@ -302,7 +356,10 @@ pub fn restore_tree(
     depth: usize,
 ) -> Value {
     if depth > super::exemptions::RESTORE_MAX_DEPTH {
-        stats.unresolved += 1;
+        // 子树里的占位符无法在这里还原，但不能只记 1 条：统计要反映
+        // 实际静默下发的占位符数量，否则控制台「未还原」严重失真。
+        let n = count_braced_placeholders(obj);
+        stats.unresolved += n.max(1) as u64;
         return obj.clone();
     }
     match obj {
@@ -392,7 +449,7 @@ pub fn restore_tree(
 // ---------------------------------------------------------------------------
 
 pub const SPLICE_MAX: usize = 8 << 20;
-pub const SPLICE_MAX_FORMS: usize = 128;
+pub const SPLICE_MAX_FORMS: usize = 256;
 
 /// 在原始字节上就地替换被脱敏的原文（保住客户端排版/转义风格）。
 ///
@@ -405,6 +462,7 @@ pub fn splice_mask(
         return None;
     }
     let mut table: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
     for (orig, tok) in pairs {
         if orig.is_empty() || tok.is_empty() || orig == tok {
             continue;
@@ -412,12 +470,21 @@ pub fn splice_mask(
         for ascii_esc in [false, true] {
             let lit = json_string_literal(orig, ascii_esc);
             let repl = json_string_literal(tok, ascii_esc);
-            if lit != repl {
+            // 纯 ASCII 原文两种转义形态完全相同：去重，否则预算被白白吃半，
+            // 约 65 个不同敏感值就会误触发「退回整树重序列化」。
+            if lit != repl && seen.insert(lit.clone()) {
                 table.push((lit, repl));
             }
         }
     }
-    if table.is_empty() || table.len() > SPLICE_MAX_FORMS {
+    if table.is_empty() {
+        return None;
+    }
+    if table.len() > SPLICE_MAX_FORMS {
+        tracing::warn!(
+            forms = table.len(),
+            "splice form 超过上限，退回整树重序列化（排版/prompt cache 可能变化）"
+        );
         return None;
     }
     // 长 form 优先
@@ -548,8 +615,12 @@ pub fn mask_body(raw: &[u8], ctx: &MaskCtx<'_>) -> Result<MaskedBody, String> {
                 changed = true;
             }
         }
-        let masked_v = mask_tree(v, ctx, Some(k), None, &mut path, 0, &mut changed)?;
-        renamed.insert(new_key, masked_v);
+        // 顶层键也必须进 path：否则 `{"input":{...}}` 这类顶层业务容器的
+        // 直接子字段 in_business=false，协议位置豁免会错误生效。
+        path.push(k.clone());
+        let masked_v = mask_tree(v, ctx, Some(k), None, &mut path, 0, &mut changed);
+        path.pop();
+        renamed.insert(new_key, masked_v?);
     }
     body = Value::Object(renamed);
     let masked_root = if root_is_object {
@@ -580,8 +651,11 @@ pub fn mask_body(raw: &[u8], ctx: &MaskCtx<'_>) -> Result<MaskedBody, String> {
     let mut masked_raw: Option<String> = None;
     if !has_dup_keys {
         if let Some(fwd) = ctx.store.get(&ctx.sid).map(|s| s.fwd.clone()) {
-            let pairs: std::collections::HashMap<String, String> =
+            let mut pairs: std::collections::HashMap<String, String> =
                 fwd.into_iter().filter(|(_, t)| !t.is_empty()).collect();
+            // JSON 文本字段整串改写（arguments/partial_json）也纳入 splice，
+            // 否则等价校验必然失败 → 所有带工具参数的请求退化为整树重序列化。
+            pairs.extend(ctx.take_splice_extra());
             if let Some(spliced) = splice_mask(raw, &pairs) {
                 // 等价校验
                 if let Ok(s) = String::from_utf8(spliced.clone()) {
@@ -1077,6 +1151,27 @@ mod tests {
             .unwrap();
         let parsed: Value = serde_json::from_str(out_args).unwrap();
         assert_eq!(parsed["name"], "张\"三", "JSON 字符串字段还原必须转义");
+    }
+
+    #[test]
+    fn splice_survives_many_ascii_values() {
+        // 100 个不同 ASCII 敏感值：旧实现每对生成两份相同 form，65 个即超预算。
+        let mut pairs = std::collections::HashMap::new();
+        let mut body = String::from("{");
+        for i in 0..100 {
+            let orig = format!("value{i:03}@example.com");
+            let tok = format!("{{{{EMAIL_{i:06}}}}}");
+            pairs.insert(orig.clone(), tok);
+            if i > 0 {
+                body.push(',');
+            }
+            body.push_str(&format!("\"k{i}\":\"{orig}\""));
+        }
+        body.push('}');
+        let out = splice_mask(body.as_bytes(), &pairs).expect("100 个 ASCII 值仍应走 splice");
+        let text = String::from_utf8(out).unwrap();
+        assert!(!text.contains("value099@example.com"));
+        assert!(text.contains("{{EMAIL_000099}}"));
     }
 
     #[test]

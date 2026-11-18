@@ -12,9 +12,10 @@ use serde::{Deserialize, Serialize};
 pub use signals::*;
 
 /// 严重级别。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, PartialOrd, Ord, Default)]
 pub enum Severity {
     Low = 1,
+    #[default]
     Medium = 2,
     High = 3,
     Critical = 4,
@@ -116,36 +117,109 @@ pub fn on_response(
     restored_text: &str,
     meta: &crate::server::response::StreamMeta,
 ) {
+    // 配置门控：关闭审计/被动审计时一条都不跑（此前 audit.* 完全是死配置）。
+    if !meta.audit_enabled || !meta.audit_passive {
+        return;
+    }
+    let enabled = |sig: &str| meta.audit_signals.get(sig).copied().unwrap_or(true);
     let mut findings = Vec::new();
+
     // S2 换芯：请求 model vs 响应 model
-    let resp_model = extract_response_model(restored_text);
-    if let Some(rm) = resp_model {
-        findings.extend(scan_identity_swap(&meta.model, &rm));
+    if enabled("identity_swap") {
+        let resp_model = extract_response_model(restored_text);
+        if let Some(rm) = resp_model {
+            findings.extend(scan_identity_swap(&meta.model, &rm));
+        }
     }
     // S6 响应投毒 / 凭据回流
-    findings.extend(scan_response_poison(restored_text, None));
-    // S9 危险动作（命令拦截的槽位命中优先合并）
-    let slot_hits: Vec<(String, bool)> = store
+    if enabled("response_poison") {
+        findings.extend(scan_response_poison(restored_text, None));
+    }
+    // S1 错误响应泄漏（此前完全没接线）
+    if enabled("error_leak") && meta.status >= 400 {
+        findings.extend(scan_error_leak(
+            Some(meta.status),
+            restored_text,
+            &meta.req_dialog,
+        ));
+    }
+    // S4 SSE 事件异常（从还原后文本重解析 data: 行，无需流内缓存）
+    if enabled("sse_anomaly") {
+        let events: Vec<serde_json::Value> = restored_text
+            .lines()
+            .filter_map(|l| l.trim_start().strip_prefix("data:"))
+            .filter_map(|p| serde_json::from_str::<serde_json::Value>(p.trim()).ok())
+            .collect();
+        if events.len() >= 2 {
+            findings.extend(scan_sse_anomaly(&events));
+        }
+    }
+    // S9 危险动作（文本扫描 + 命令拦截槽位命中合并）
+    let hits = store
         .get(sid)
-        .map(|s| {
-            s.cmd_hits
-                .iter()
-                .map(|h| (format!("[通道={}] {}", h.channel, h.kind), h.blocked))
-                .collect()
-        })
+        .map(|s| s.cmd_hits.clone())
         .unwrap_or_default();
-    let reason_snips: Vec<String> = store
-        .get(sid)
-        .map(|s| s.cmd_reason_snippets.iter().cloned().collect())
-        .unwrap_or_default();
-    let mut danger = scan_dangerous_action(restored_text, None);
-    let _ = slot_hits;
-    // 思考通道出现过的片段 → 压掉全量扫描的对应误报
-    danger.retain(|f| !reason_snips.iter().any(|s| f.evidence.contains(s.as_str())));
-    findings.extend(danger);
+    if enabled("dangerous_action") {
+        let reason_snips: Vec<String> = store
+            .get(sid)
+            .map(|s| s.cmd_reason_snippets.iter().cloned().collect())
+            .unwrap_or_default();
+        let mut danger = scan_dangerous_action(restored_text, None);
+        // 思考通道出现过的片段 → 压掉全量扫描的对应误报
+        danger.retain(|f| !reason_snips.iter().any(|s| f.evidence.contains(s.as_str())));
+        findings.extend(danger);
+        // 命令拦截命中不再丢弃：并入审计 findings（blocked 升 High）
+        for h in &hits {
+            findings.push(Finding {
+                signal: "dangerous_action".into(),
+                severity: if h.blocked {
+                    Severity::High
+                } else {
+                    Severity::Medium
+                },
+                evidence: format!(
+                    "cmd_hit channel={} kind={} snippet={}",
+                    h.channel,
+                    h.kind,
+                    crate::util::truncate_utf8(&h.snippet, 120)
+                ),
+                kind: format!("cmd_hit:{}", h.kind),
+            });
+        }
+    }
 
     for f in dedupe_findings(findings) {
-        bus.emit_audit(&f, sid, &meta.host, &meta.method, &meta.path);
+        bus.emit_audit(
+            &f,
+            sid,
+            &meta.host,
+            &meta.method,
+            &meta.path,
+            meta.audit_floor,
+        );
+    }
+
+    // CMDHIT 事件（此前 EventType::CmdHit 全仓无 emit 点：命令命中在控制台不可见）
+    if meta.audit_enabled {
+        for h in hits {
+            let ev = crate::store::events::Event {
+                id: 0,
+                ts: 0.0,
+                event_type: crate::store::events::EventType::CmdHit,
+                method: meta.method.clone(),
+                path: meta.path.clone(),
+                status: meta.status,
+                reason: h.kind.clone(),
+                protocol: meta.protocol.clone(),
+                model: meta.model.clone(),
+                session_id: sid.into(),
+                count: 1,
+                message: crate::util::truncate_utf8(&h.snippet, 200).to_string(),
+                request_headers: meta.request_headers.clone(),
+                ..Default::default()
+            };
+            bus.emit(ev);
+        }
     }
 }
 
@@ -181,34 +255,6 @@ pub fn extract_response_model(text: &str) -> Option<String> {
         }
     }
     None
-}
-
-/// canary nonce 注册表（跨请求污染检测用）。
-pub fn register_canaries(nonces: &[String]) {
-    use once_cell::sync::Lazy;
-    use std::sync::Mutex;
-    static REGISTRY: Lazy<Mutex<std::collections::HashMap<String, f64>>> =
-        Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
-    let now = crate::store::events::now_secs();
-    let mut reg = REGISTRY.lock().unwrap();
-    // 清理过期（1h）
-    reg.retain(|_, ts| now - *ts <= 3600.0);
-    for n in nonces {
-        reg.insert(n.clone(), now);
-    }
-}
-
-/// 取已注册的非本次 canary（跨请求污染素材）。
-pub fn prior_canaries(exclude: &[String]) -> Vec<String> {
-    use once_cell::sync::Lazy;
-    use std::sync::Mutex;
-    static REGISTRY: Lazy<Mutex<std::collections::HashMap<String, f64>>> =
-        Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
-    let reg = REGISTRY.lock().unwrap();
-    reg.keys()
-        .filter(|k| !exclude.contains(k))
-        .cloned()
-        .collect()
 }
 
 #[cfg(test)]

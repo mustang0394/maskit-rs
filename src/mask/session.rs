@@ -24,6 +24,8 @@ pub struct Session {
     pub last_hits: std::collections::HashSet<String>,
     /// 本次请求新增原文
     pub new_orig: std::collections::HashSet<String>,
+    /// 本次请求复用了多少已有映射（new_orig 之外的新登记中 reused=true）
+    pub reused_count: usize,
     /// 还原计数 / 未还原计数 / 宽松兜底还原计数
     pub restored: u64,
     pub unresolved: u64,
@@ -103,9 +105,16 @@ pub const RECENT_MAX: usize = 10000;
 ///
 /// 摊还的关键 —— 见 [`SessionStore::maybe_prune_recent`]。
 pub const PRUNE_SLACK: usize = RECENT_MAX / 8;
-/// 映射 TTL：全局 24h。内存表与 SQLite 映射表同口径，
-/// 避免「内存还能还原、但 DB 已过期导致重启后还原不回来」的不一致窗口。
+/// 内存映射默认 TTL：24h（仅独立构造/测试的初值，生产由 `set_ttl(mapping_ttl)`
+/// 对齐配置；不再作为下限强制覆盖用户配置）。
 pub const RECENT_TTL: u64 = 24 * 3600;
+
+/// inflight 会话的兜底回收时限。
+///
+/// 正常路径由 `SessionGuard` 在所有退出方式（含 never-polled Body）释放；
+/// 这里只是最后保险：若某条路径漏释放，2h 后强制回收，避免 unbounded 泄漏。
+/// inflight 兜底 24h：2h 会误删合法的超长流式会话（请求期间 `ts` 不刷新）。
+pub const INFLIGHT_MAX_SECS: f64 = 24.0 * 3600.0;
 
 /// 全局会话表。
 pub struct SessionStore {
@@ -202,9 +211,13 @@ impl SessionStore {
         self.rehydrate(orig, token, label);
     }
 
-    pub fn set_ttl(&self, session_ttl_secs: u64) {
+    /// 内存映射 TTL 对齐 `mask.mapping_ttl`（启动与配置热更新时调用）。
+    ///
+    /// 不能再用 24h 下限：否则用户把 `mapping_ttl` 调小后，内存里的原文
+    /// 仍会按 24h 保留并可继续还原，配置的保留窗口形同虚设。
+    pub fn set_ttl(&self, mapping_ttl_secs: u64) {
         self.ttl_secs.store(
-            RECENT_TTL.max(session_ttl_secs),
+            mapping_ttl_secs.max(1),
             std::sync::atomic::Ordering::Release,
         );
     }
@@ -243,12 +256,64 @@ impl SessionStore {
             .iter()
             .filter(|kv| {
                 let s = kv.value();
-                !s.inflight && (now - s.ts) > ttl_secs
+                let age = now - s.ts;
+                (!s.inflight && age > ttl_secs) || (s.inflight && age > INFLIGHT_MAX_SECS)
             })
             .map(|kv| kv.key().clone())
             .collect();
         for sid in expired {
+            let inflight = self.sessions.get(&sid).map(|s| s.inflight).unwrap_or(false);
+            if inflight {
+                tracing::warn!(
+                    sid = %sid,
+                    "inflight 会话超过兜底时限仍未释放，强制回收（可能有守卫遗漏）"
+                );
+            }
             self.sessions.remove(&sid);
+        }
+    }
+
+    /// 淘汰超过内存 TTL 的映射（含后缀索引）。
+    ///
+    /// `lookup`/`recall_token` 虽然会按 TTL 拒绝过期项，但过期原文若不主动清，
+    /// 会一直驻留在进程内存里直到下次写满触发 `maybe_prune_recent` —— 低流量
+    /// 时可能远超配置的保留窗口。30s 维护线程调用本函数。
+    pub fn prune_expired(&self) {
+        let now = now();
+        let ttl = self.recent_ttl() as f64;
+        let expired: Vec<(String, String)> = self
+            .recent_fwd
+            .iter()
+            .filter(|e| now - e.value().ts > ttl)
+            .map(|e| (e.key().clone(), e.value().token.clone()))
+            .collect();
+        for (orig, token) in expired {
+            // 快照后到删除前可能刚被 remember 刷新 TTL；remove_if 在分片锁内
+            // 复核，避免误删新映射（旧实现 filter→remove 有窗口）。
+            if self
+                .recent_fwd
+                .remove_if(&orig, |_, v| now - v.ts > ttl)
+                .is_some()
+            {
+                self.recent_rev.remove(&token);
+            }
+        }
+        // 后缀索引：指向已不在 recent_rev 的 token 的条目一并清掉
+        let stale: Vec<String> = self
+            .recent_suffix
+            .iter()
+            .filter_map(|e| match e.value() {
+                SuffixIndexValue::Token(tok) if !self.recent_rev.contains_key(tok) => {
+                    Some(e.key().clone())
+                }
+                _ => None,
+            })
+            .collect();
+        for k in stale {
+            let _ = self.recent_suffix.remove_if(
+                &k,
+                |_, v| matches!(v, SuffixIndexValue::Token(t) if !self.recent_rev.contains_key(t)),
+            );
         }
     }
 
@@ -858,12 +923,28 @@ mod tests {
         }
         {
             let mut s = store.get_mut("live").unwrap();
-            s.ts = now() - 10000.0;
+            // inflight 且未超过兜底时限 → 保留
+            s.ts = now() - 10.0;
             s.inflight = true;
         }
         store.sweep(600.0);
         assert!(store.get("old").is_none());
         assert!(store.get("live").is_some());
+    }
+
+    /// inflight 只是“正常清理跳过”，不是永久免死金牌：超过兜底时限必须回收，
+    /// 否则一条守卫遗漏的会话会永久泄漏。
+    #[test]
+    fn sweep_reaps_stale_inflight_after_backstop() {
+        let store = fresh_store();
+        store.new_session("stale");
+        {
+            let mut s = store.get_mut("stale").unwrap();
+            s.ts = now() - INFLIGHT_MAX_SECS - 1.0;
+            s.inflight = true;
+        }
+        store.sweep(600.0);
+        assert!(store.get("stale").is_none());
     }
 
     #[test]

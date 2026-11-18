@@ -85,9 +85,10 @@ MASKIT_RS_DATA_DIR=/var/lib/maskit-rs ./target/release/maskit-rs
 - **流式还原**：SSE / NDJSON 逐事件还原，跨 chunk 的半截占位符扣留后拼合
   - 覆盖范围：Chat Completions（`delta.content` / `reasoning_content` / `reasoning` / `reasoning_details[]` / `tool_calls.arguments`）、Anthropic（`text` / `thinking` / `partial_json`）、Responses API（`output_text` / `reasoning_summary_text` / `function_call_arguments`）、Ollama NDJSON（`message.content` / `message.thinking` / 结构化 `tool_calls`）
   - 每个事件里**未被槽位接管的其余文本**也会走一次整树兜底还原 —— 各家中转的字段名远比协议文档多，逐个列举等于打地鼠
-  - 响应为文本类（`json` / `text/*` / `xml` / **未声明 content-type**）都会尝试还原；二进制（图片/音频/octet-stream）与**压缩体**不动
+  - 响应为文本类（`json` / `text/*` / `xml` / **未声明 content-type**）都会尝试还原；二进制（图片/音频/octet-stream）不动
+  - **压缩响应**：gzip/deflate 的 SSE/NDJSON 会边解压边还原（不超过 128MiB 防炸弹上限）；`br`/`zstd` 仍先整包解码再还原（流式增量 API 复杂，见「已知限制」）
 - **命令拦截**：observe（只记录，默认）/ rewrite（改写为 no-op 说明）/ block（停止下发）
-- **8 类被动审计信号**：错误泄露 / 换芯 / 工具重写 / 流异常 / 响应投毒 / 跨请求污染 / 凭据回流 / 危险动作
+- **被动审计信号（已接线）**：错误泄露 / 换芯 / 流异常 / 响应投毒（含凭据回流检测）/ 危险动作。`audit.enabled`、`audit.passive`、`audit.signals`、`audit.severity_floor` 均生效；`CMDHIT` 事件会在控制台可见。需主动探针的「工具调用重写」「跨请求污染」不再作为可配置信号提供（无注入点，开启也不会触发）
 - **token 用量统计**：按模型统计输入/输出 token（`/api/stats/today`、`/api/stats/models`）。**只统计数量，不做价格/费用计算**
 - **事件与统计**：SQLite（事件表与 Python 版同 schema，可互读写；Rust 版另增一张 `placeholder_map` 映射表，见下）、每日聚合、保留期清理
 - **控制台**：单文件原生 JS（无构建步骤）。日志/审计/敏感词均为**主从双栏**；日志详情并排对照「原文（客户端发出）」与「发给上游（已脱敏）」（`masked_dialog`），并展示本次请求的**全部请求头**（保序、同名头不合并），支持全文搜索、类型过滤、分页、自动刷新；页面状态写入 URL hash（`/console#logs` 可直达、刷新不丢页）
@@ -121,7 +122,7 @@ maskit-rs/
     │   └── tree.rs      # mask_tree/restore_tree + 字节级 splice
     ├── stream/          # SSE / NDJSON 流式还原
     ├── server/          # axum 路由、反代管线、管理 API、内嵌 UI
-    ├── audit/           # 8 类审计信号
+    ├── audit/           # 被动审计信号
     ├── cmdblock/        # 命令拦截
     ├── store/           # 内存事件总线 + SQLite 事件库
     └── upstream.rs      # 上游 HTTP 客户端
@@ -138,8 +139,10 @@ maskit-rs/
 | `server.port` / `server.bind` | 监听端口与地址（默认 `18701` / `127.0.0.1`） |
 | `upstream.target` | 唯一上游地址，可带路径前缀（改后热生效） |
 | `upstream.extra_headers` | 注入的静态请求头（凭据类头会被拒绝注入） |
+| `upstream.connect_timeout_secs` / `read_timeout_secs` | 连接超时 / 等待响应头超时（`0` = 300s 安全上限；SSE body 读取不受影响） |
 | `mask.builtin_rules` | 23 类规则开关 |
-| `mask.custom_words` | 自定义敏感词 `{词: 分类}` |
+| `mask.custom_words` | 自定义敏感词 `{词: 分类}`；词以 `re:` 开头时按正则处理 |
+| `mask.custom_regexes` | 自定义正则 `[{name, pattern}]`（label 取 name；坏正则跳过并 warn） |
 | `mask.custom_word_groups` | 自定义敏感词分组名（**有序**，允许空组；Rust 版新增，Python 版不识别） |
 | `mask.sensitive_disabled` | 禁用的词分组（整组关闭） |
 | `mask.sensitive_word_disabled` | 词级禁用 `{分组: [词...]}` |
@@ -147,11 +150,13 @@ maskit-rs/
 | `mask.secret_prefixes` | 密钥前缀（默认 `sk-`、`ah-`） |
 | `mask.max_body_bytes` | 请求体上限（默认 32MiB，超出返回 413） |
 | `mask.multimodal_blob` | 多模态/编码载荷跳过策略，默认 `{"enabled":true,"mode":"auto","min_base64_bytes":8192}`。`mode`：`off`（完全关闭，行为与改动前一致）/ `data_uri`（只跳 `data:...;base64,` 形态；注意它**不看 data URI 里装的是不是文本**，不是「更保守」的档位）/ `auto`（data URI + 大块裸 base64）。解析前把值位置上的 blob 替换成短 token，转发前按原始字节拼回，规则引擎不再扫描它们。真正保守的选项只有 `off`。详见「多模态载荷跳过」 |
-| `mask.session_ttl` | 占位符复用窗口（秒，默认 600，仅决定内存复用表条目何时可回收） |
-| `mask.mapping_ttl` | 占位符映射落盘保留期（秒，默认 86400 = 24h）。过期行由后台维护任务清理；设为 `0` 时回落为 24h。需长期保留映射就把它设得足够大（如 `31536000` = 1 年） |
+| `mask.session_ttl` | 会话槽位 GC 窗口（秒，默认 600）；过期会话由后台维护线程清理，inflight 另有 2h 兜底 |
+| `mask.mapping_ttl` | 占位符映射保留期（秒，默认 86400 = 24h）；**内存复用表与 SQLite 同口径**，过期行/内存条目均由后台维护任务清理。设为 `0` 时回落为 24h |
 | `fail_closed` | 已路由流量是否绝不放行未脱敏原文（默认 `true`） |
+| `stream_response` | SSE/NDJSON 是否逐事件流式还原（默认 `true`；`false` 时整包聚合后还原） |
+| `response_scan` | 响应侧 PII 幻觉/泄漏扫描，命中发 `SCANWARN`（默认 `true`） |
 | `command_block.mode` | `observe` / `rewrite` / `block` |
-| `audit.*` | 审计开关、严重度门槛（**无主动探针**，只做被动检测） |
+| `audit.enabled` / `audit.passive` / `audit.signals` / `audit.severity_floor` | 审计总开关、被动审计开关（`false` = 关闭全部被动信号）、逐信号开关、落库严重度门槛（均生效；**无主动探针**） |
 | `panel_token` | 控制台令牌（不限制长度，原样生效；留空自动生成 24 位随机值） |
 | `mask.log_credential_plaintext` | **`events` 表**是否保留凭据类**明文原文**（默认 `true`）。为 `false` 时只存 sha256 摘要与打码预览。⚠️ 注意：此项**不影响** `placeholder_map` 映射表——它按设计始终存原文 |
 | `full_trace_count` | **完整报文诊断环**保留最近几条（默认 `20`，`0` = 关闭）。存原始请求体 / 脱敏后请求体 / 上游原始响应 / 还原后响应到 `trace_blobs` 表，超出即淘汰。仅当 `mask.log_credential_plaintext=true` 时生效 |
@@ -159,6 +164,13 @@ maskit-rs/
 | `full_trace_total_bytes` | 完整报文**总字节预算**（默认 256MiB，夹在 16MiB–4GiB）。条数上限管不住单条体积（20 组 × 4 侧 × 32MiB 理论可达 2.5GiB），超出后写线程按最旧会话整组淘汰 |
 
 ---
+
+## 已知限制
+
+- `br` / `zstd` 压缩的 SSE/NDJSON 仍会先整包解码（gzip/deflate 已流式）；超大压缩流会受 64MiB 压缩体 / 128MiB 解压上限约束。
+- `rewrite` / `block` 模式为了不把半截命令先下发给客户端，会对流式响应强制整包处理（失去逐字流式，但拦截语义正确）。
+- `arguments` / `partial_json` 这类「JSON 文本字段」会被解析后按业务区重新脱敏，序列化风格可能变化（保持 JSON 语义不变）。
+- 完整报文诊断环的「发给上游」一节显示 blob token 形态，实际转发已按原始字节拼回。
 
 ## 安全须知
 

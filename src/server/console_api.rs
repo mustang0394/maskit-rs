@@ -166,13 +166,19 @@ pub async fn get_status(State(state): State<SharedState>) -> Response {
         ),
         None => (Value::Null, Value::Null),
     };
+    let (bound_host, bound_port, listening) = match state.bound_addr() {
+        Some((h, p)) => (h.clone(), *p, true),
+        None => (cfg.server.bind.clone(), cfg.server.port, false),
+    };
     json_response(
         StatusCode::OK,
         &json!({
             "ok": true,
-            "listening": true,
-            "port": cfg.server.port,
-            "bind": cfg.server.bind,
+            "listening": listening,
+            "port": bound_port,
+            "bind": bound_host,
+            "configured_port": cfg.server.port,
+            "configured_bind": cfg.server.bind,
             "upstream_target": cfg.upstream.target,
             "paused": cfg.paused,
             "fail_closed": cfg.fail_closed,
@@ -188,16 +194,12 @@ pub async fn get_status(State(state): State<SharedState>) -> Response {
 }
 
 pub async fn pause(State(state): State<SharedState>) -> Response {
-    let mut cfg = state.config.get();
-    cfg.paused = true;
-    state.config.update(cfg);
+    state.config.update_with(|cfg| cfg.paused = true);
     json_response(StatusCode::OK, &json!({ "ok": true, "paused": true }))
 }
 
 pub async fn resume(State(state): State<SharedState>) -> Response {
-    let mut cfg = state.config.get();
-    cfg.paused = false;
-    state.config.update(cfg);
+    state.config.update_with(|cfg| cfg.paused = false);
     json_response(StatusCode::OK, &json!({ "ok": true, "paused": false }))
 }
 
@@ -210,7 +212,7 @@ pub async fn health(State(state): State<SharedState>) -> Response {
             "ok": upstream_ok,
             "panel_port_listening": true,
             "upstream_configured": upstream_ok,
-            "upstream_target": cfg.upstream.target,
+            // 不返回 upstream_target：/health 免鉴权，target 可能含内网地址/凭据。
             "version": env!("CARGO_PKG_VERSION"),
         }),
     )
@@ -849,8 +851,8 @@ pub async fn test_upstream(State(state): State<SharedState>) -> Response {
     let target = crate::upstream::http_client::parse_target(&cfg.upstream.target);
     match target {
         Ok(parts) => {
-            // 只做 TCP 连接测试（不消耗 token）
-            let addr = format!("{}:{}", parts.host, parts.port);
+            // 只做 TCP 连接测试（不消耗 token）；IPv6 需方括号
+            let addr = crate::upstream::http_client::authority(&parts.host, parts.port);
             match tokio::time::timeout(
                 std::time::Duration::from_secs(5),
                 tokio::net::TcpStream::connect(&addr),
@@ -876,24 +878,25 @@ pub async fn test_upstream(State(state): State<SharedState>) -> Response {
     }
 }
 
-/// 演示脱敏（不计事件、不动会话：用独立 sid）。
+/// 演示脱敏（不计事件、不动会话：局部 store，与全局映射隔离）。
 pub async fn demo_mask(State(state): State<SharedState>, body: String) -> Response {
     let req: Value = serde_json::from_str(&body).unwrap_or(json!({}));
     let text = req.get("text").and_then(|v| v.as_str()).unwrap_or("");
     let sid = "console-demo";
-    state.sessions.drop_session(sid);
-    state.sessions.new_session(sid);
+    // 与 `mask_test` 同款隔离：recall_token 会写全局 recent_fwd/recent_rev，
+    // 只 drop_session 清不掉，演示文本会污染生产映射 24h。
+    let store = crate::mask::session::SessionStore::new();
+    store.new_session(sid);
     let custom = state.custom_words();
+    custom.register_words(&store);
     let cfg = state.config.get();
-    let ctx = crate::mask::engine::MaskCtx::new(&cfg, state.sessions, sid.into(), &custom);
+    let ctx = crate::mask::engine::MaskCtx::new(&cfg, &store, sid.into(), &custom);
     let masked = ctx.mask(text);
     let mut stats = crate::mask::engine::RestoreStats::default();
-    let restored =
-        crate::mask::engine::restore_final(&masked, sid, false, state.sessions, &mut stats);
-    state.sessions.drop_session(sid);
+    let restored = crate::mask::engine::restore_final(&masked, sid, false, &store, &mut stats);
     json_response(
         StatusCode::OK,
-        &json!({ "ok": true, "masked": masked, "restored": restored, "matches": stats.restored }),
+        &json!({ "ok": true, "masked": masked, "restored": restored, "matches": stats.restored, "isolated": true }),
     )
 }
 
@@ -1005,9 +1008,8 @@ fn wrap_request(protocol: &str, model: &str, text: &str) -> String {
 
 /// 令牌轮换。
 pub async fn rotate_token(State(state): State<SharedState>) -> Response {
-    let mut cfg = state.config.get();
-    cfg.panel_token = new_token();
-    state.config.update(cfg);
+    let tok = new_token();
+    state.config.update_with(|cfg| cfg.panel_token = tok);
     json_response(
         StatusCode::OK,
         &json!({ "ok": true, "panel_token": state.config.get().panel_token }),

@@ -231,7 +231,7 @@ pub fn business_keys() -> &'static HashSet<&'static str> {
 
 /// 递归深度上限。
 pub const MASK_MAX_DEPTH: usize = 24;
-pub const RESTORE_MAX_DEPTH: usize = 24;
+pub const RESTORE_MAX_DEPTH: usize = 64;
 
 /// 数值型协议字段（数值豁免；字符串形态照常扫描）。
 pub fn skip_numeric_keys() -> &'static HashSet<&'static str> {

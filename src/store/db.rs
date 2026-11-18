@@ -25,6 +25,9 @@ pub const BATCH_SIZE: usize = 100;
 pub struct EventStore {
     tx: SyncSender<StoreMsg>,
     path: PathBuf,
+    /// 写线程启动前从库中计算出的下一事件 id。
+    /// 进程重启后 EventBus 用它续号，避免与已落库事件 id 撞车。
+    initial_event_id: u64,
     /// 写入统计（供 /api/status 展示）
     pub stats: Arc<Mutex<WriterStats>>,
     handle: Option<std::thread::JoinHandle<()>>,
@@ -52,9 +55,13 @@ enum StoreMsg {
     Trace(Box<TraceBlob>),
     /// 清理过期映射
     PruneMappings,
+    /// 清空事件明细（保留统计摘要）
+    ClearEvents,
+    /// 清空审计事件
+    ClearAudits,
     /// 同步屏障：写线程处理到此消息时，先把之前累积的批次落盘再回复。
     /// 供测试 / 关停前确保「已入队 == 已落盘」。
-    Flush(std::sync::mpsc::Sender<()>),
+    Flush(std::sync::mpsc::Sender<bool>),
     Shutdown,
 }
 
@@ -66,6 +73,7 @@ impl EventStore {
         init_schema(&path)?;
         // 库内含明文凭据映射，仅属主可读写
         restrict_permissions(&path);
+        let initial_event_id = compute_next_event_id(&path);
         let (tx, rx) = sync_channel::<StoreMsg>(EVENT_QUEUE_MAX);
         let stats = Arc::new(Mutex::new(WriterStats {
             alive: true,
@@ -80,9 +88,15 @@ impl EventStore {
         Ok(Arc::new(Self {
             tx,
             path,
+            initial_event_id,
             stats,
             handle,
         }))
+    }
+
+    /// 重启后事件 id 的起始值（> 库中已见过的所有 id）。
+    pub fn initial_event_id(&self) -> u64 {
+        self.initial_event_id
     }
 
     pub fn path(&self) -> &Path {
@@ -95,13 +109,14 @@ impl EventStore {
     /// 落盘（同一批次内 commit）。写线程卡死时最多等 5s，不会永久挂起。
     ///
     /// 代理热路径**不应**调用（那是阻塞的）；它的用途是测试与关停前排空。
-    pub fn sync(&self) {
+    pub fn sync(&self) -> bool {
         let (tx, rx) = std::sync::mpsc::channel();
         // 用阻塞 send 而非 try_send：屏障必须保证顺序，队列满则等写线程排空
         if self.tx.send(StoreMsg::Flush(tx)).is_err() {
-            return;
+            return false;
         }
-        let _ = rx.recv_timeout(std::time::Duration::from_secs(5));
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap_or(false)
     }
 
     /// 入队事件（非阻塞；队列满则丢弃并计数 —— 绝不让日志拖慢代理）。
@@ -519,22 +534,27 @@ impl EventStore {
     }
 
     /// 清空事件明细（保留统计摘要，对齐 Python 语义）。
-    pub fn clear_events(&self) -> rusqlite::Result<()> {
-        let conn = open_read(&self.path)?;
-        conn.execute_batch(
-            "DELETE FROM events; DELETE FROM daily_words; \
-             DELETE FROM trace_blobs; \
-             DELETE FROM sqlite_sequence WHERE name='events';",
-        )?;
+    ///
+    /// 走写线程队列而非另开连接：避免与写线程争 SQLite 写锁（busy_timeout 后
+    /// 500），并靠 `sync()` 保证返回时已提交。
+    pub fn clear_events(&self) -> Result<(), String> {
+        self.tx
+            .send(StoreMsg::ClearEvents)
+            .map_err(|e| format!("clear_events_enqueue: {e}"))?;
+        if !self.sync() {
+            return Err("clear_events_failed: 写线程超时或提交失败".into());
+        }
         Ok(())
     }
 
-    /// 清空审计事件。
-    pub fn clear_audits(&self) -> rusqlite::Result<()> {
-        let conn = open_read(&self.path)?;
-        conn.execute_batch(
-            "DELETE FROM audit_events; DELETE FROM sqlite_sequence WHERE name='audit_events';",
-        )?;
+    /// 清空审计事件（同样走写线程）。
+    pub fn clear_audits(&self) -> Result<(), String> {
+        self.tx
+            .send(StoreMsg::ClearAudits)
+            .map_err(|e| format!("clear_audits_enqueue: {e}"))?;
+        if !self.sync() {
+            return Err("clear_audits_failed: 写线程超时或提交失败".into());
+        }
         Ok(())
     }
 
@@ -846,6 +866,49 @@ fn open_read(path: &Path) -> rusqlite::Result<Connection> {
     Ok(conn)
 }
 
+/// 计算下一事件 id：取 meta 值、payload `$.id`、表 rowid 三者的最大值 + 1。
+///
+/// - 兼容 Python 版写入的 payload（可能没有 `$.id`，此时 rowid 兜底）；
+/// - `clear_events` 只重置 sqlite_sequence、不重置 meta，因此清库后仍能续号；
+/// - 新 id 严格大于旧 rowid，避免与「缺 `$.id` 的旧行」在详情查询里撞车。
+fn compute_next_event_id(path: &Path) -> u64 {
+    let Ok(conn) = open_read(path) else {
+        return 1;
+    };
+    // 正常情况下 meta 已由写线程与事件同事务维护：直接用它，避免启动时
+    // 对 events 全表做 json_extract 扫描（大库可达数十万行）。
+    let meta: i64 = conn
+        .query_row(
+            "SELECT COALESCE(CAST(value AS INTEGER), 0) FROM meta WHERE key = 'next_event_id'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    let max_row: i64 = conn
+        .query_row("SELECT COALESCE(MAX(id), 0) FROM events", [], |r| r.get(0))
+        .unwrap_or(0);
+    if meta > max_row && meta > 0 {
+        return meta as u64;
+    }
+    // 旧库（Python 版写入，meta 缺失）或 meta 落后：扫一次 payload id，
+    // 取三者最大值 + 1，并把水位补写回 meta。
+    let max_payload: i64 = conn
+        .query_row(
+            "SELECT COALESCE(MAX(CAST(json_extract(payload,'$.id') AS INTEGER)), 0) \
+             FROM events WHERE json_valid(payload)",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    let next = (max_payload.max(max_row).max(meta).max(0) as u64).saturating_add(1);
+    let _ = conn.execute(
+        "INSERT INTO meta (key, value) VALUES ('next_event_id', ?1) \
+         ON CONFLICT(key) DO UPDATE SET value = ?1",
+        params![next.to_string()],
+    );
+    next
+}
+
 /// 建表（schema 与 Python 版一致）。
 pub fn init_schema(path: &Path) -> rusqlite::Result<()> {
     let conn = Connection::open(path)?;
@@ -1099,9 +1162,10 @@ fn flush_batch(
     let Some(c) = conn.take() else { return };
     let mut written = 0u64;
     let mut failed = 0u64;
+    let mut clear_failed = false;
     let mut reconnect = false;
     // 屏障回执必须等 commit 之后再发：先发会让调用方在事务尚未落盘时就去读库
-    let mut flush_replies: Vec<std::sync::mpsc::Sender<()>> = Vec::new();
+    let mut flush_replies: Vec<std::sync::mpsc::Sender<bool>> = Vec::new();
     match c.unchecked_transaction() {
         Ok(tx) => {
             for msg in msgs.iter() {
@@ -1148,9 +1212,57 @@ fn flush_batch(
                     StoreMsg::Prune(days) => {
                         let _ = prune_events(&tx, *days);
                     }
+                    StoreMsg::ClearEvents => {
+                        let r = tx.execute_batch(
+                            "SAVEPOINT clear_events; \
+                             DELETE FROM events; DELETE FROM daily_words; \
+                             DELETE FROM trace_blobs; \
+                             DELETE FROM sqlite_sequence WHERE name='events'; \
+                             RELEASE clear_events;",
+                        );
+                        if r.is_err() {
+                            let _ =
+                                tx.execute_batch("ROLLBACK TO clear_events; RELEASE clear_events;");
+                            clear_failed = true;
+                        }
+                    }
+                    StoreMsg::ClearAudits => {
+                        let r = tx.execute_batch(
+                            "SAVEPOINT clear_audits; \
+                             DELETE FROM audit_events; \
+                             DELETE FROM sqlite_sequence WHERE name='audit_events'; \
+                             RELEASE clear_audits;",
+                        );
+                        if r.is_err() {
+                            let _ =
+                                tx.execute_batch("ROLLBACK TO clear_audits; RELEASE clear_audits;");
+                            clear_failed = true;
+                        }
+                    }
                     StoreMsg::Shutdown => {}
                     StoreMsg::Flush(reply) => flush_replies.push(reply.clone()),
                 }
+            }
+            // 事件 id 水位：与事件写入同一事务提交，保证 sync() 返回时
+            // 「库中已落库最大 id < meta.next_event_id」；重启 seed 不会撞车。
+            // 取 max（而非最后一条）：try_send 入队顺序与 id 顺序不保证一致。
+            let max_batch_id = msgs
+                .iter()
+                .filter_map(|m| match m {
+                    StoreMsg::Event(ev) => Some(ev.id),
+                    _ => None,
+                })
+                .max()
+                .unwrap_or(0);
+            if max_batch_id > 0 {
+                let next = max_batch_id.saturating_add(1).to_string();
+                let _ = tx.execute(
+                    "INSERT INTO meta (key, value) VALUES ('next_event_id', ?1) \
+                     ON CONFLICT(key) DO UPDATE SET value = \
+                       CASE WHEN CAST(COALESCE(meta.value, '0') AS INTEGER) < CAST(?1 AS INTEGER) \
+                            THEN ?1 ELSE meta.value END",
+                    params![next],
+                );
             }
             if tx.commit().is_err() {
                 reconnect = true;
@@ -1175,8 +1287,9 @@ fn flush_batch(
         *conn = Some(c);
     }
     // 无论 commit 成功与否都要回执：否则写线程故障时 sync() 会白等满 5s
+    let ok = !reconnect && !clear_failed;
     for reply in flush_replies {
-        let _ = reply.send(());
+        let _ = reply.send(ok);
     }
 }
 
@@ -1399,6 +1512,28 @@ mod tests {
             message: String::new(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn event_id_watermark_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = EventStore::open(dir.path()).unwrap();
+        let mut ev = sample_event(EventType::Mask, "PHONE", "13800138000", false);
+        ev.id = 7;
+        store.enqueue(ev);
+        store.sync();
+        drop(store);
+        let store2 = EventStore::open(dir.path()).unwrap();
+        assert!(
+            store2.initial_event_id() > 7,
+            "重启后事件 id 必须续号，实际 {}",
+            store2.initial_event_id()
+        );
+        // 再开一次仍然只增不减（meta 已持久化）
+        let n = store2.initial_event_id();
+        drop(store2);
+        let store3 = EventStore::open(dir.path()).unwrap();
+        assert_eq!(store3.initial_event_id(), n);
     }
 
     #[test]

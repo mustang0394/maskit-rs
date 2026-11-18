@@ -102,6 +102,65 @@ fn sniff_framing(text: &str) -> Option<Framing> {
     None
 }
 
+/// 对整包 SSE/NDJSON 逐事件做命令拦截（rewrite/block 专用）。
+///
+/// `process_and_emit` 的 JSON 分支本来就有 `process_tree`，但 SSE/NDJSON 分支
+/// 之前完全不接 cmdblock —— 聚合后的压缩流/block 模式因此形同虚设。
+fn apply_cmd_to_encoded(
+    text: &str,
+    sse: bool,
+    sid: &str,
+    store: &SessionStore,
+    cmdblock: &crate::cmdblock::CmdBlockEngine,
+    blocked: &mut bool,
+) -> String {
+    if sse {
+        let mut blocks: Vec<String> = Vec::new();
+        for block in text.split("\n\n") {
+            let mut lines: Vec<String> = Vec::new();
+            for line in block.split('\n') {
+                let Some(rest) = line.strip_prefix("data:") else {
+                    lines.push(line.to_string());
+                    continue;
+                };
+                let payload = rest.strip_prefix(' ').unwrap_or(rest);
+                if payload.trim() == "[DONE]" {
+                    lines.push(line.to_string());
+                    continue;
+                }
+                match serde_json::from_str::<serde_json::Value>(payload) {
+                    Ok(v) => {
+                        let v = cmdblock.process_tree(v, sid, store, blocked);
+                        lines.push(format!(
+                            "data: {}",
+                            serde_json::to_string(&v).unwrap_or_else(|_| payload.to_string())
+                        ));
+                    }
+                    Err(_) => lines.push(line.to_string()),
+                }
+            }
+            blocks.push(lines.join("\n"));
+        }
+        blocks.join("\n\n")
+    } else {
+        text.split('\n')
+            .map(|line| {
+                if line.trim().is_empty() {
+                    return line.to_string();
+                }
+                match serde_json::from_str::<serde_json::Value>(line) {
+                    Ok(v) => {
+                        let v = cmdblock.process_tree(v, sid, store, blocked);
+                        serde_json::to_string(&v).unwrap_or_else(|_| line.to_string())
+                    }
+                    Err(_) => line.to_string(),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
 /// 处理整包响应(非流式路径)。
 ///
 /// 关键约束：**已路由的流量绝不能让占位符原样出去**（与请求侧 `fail_closed`
@@ -171,6 +230,9 @@ pub fn process_whole(
             joined.push_str(tail.trim_end_matches('\n'));
             joined.push('\n');
         }
+        if cmdblock.requires_whole_body() {
+            joined = apply_cmd_to_encoded(&joined, false, sid, store, cmdblock, &mut blocked);
+        }
         joined
     } else if c.contains("event-stream") {
         let mut blocks = Vec::new();
@@ -183,6 +245,9 @@ pub fn process_whole(
         let tail = crate::stream::sse::flush_pending(sid, store, Framing::Sse, &mut stats);
         if !tail.is_empty() {
             joined = format!("{}\n\n{}", joined.trim_end_matches('\n'), tail);
+        }
+        if cmdblock.requires_whole_body() {
+            joined = apply_cmd_to_encoded(&joined, true, sid, store, cmdblock, &mut blocked);
         }
         joined
     } else if c.starts_with("text/") || c.contains("xml") || c.trim().is_empty() {
@@ -284,43 +349,74 @@ fn restore_non_json_body(
     }
 }
 
+/// 会话释放守卫：Drop 时清 `inflight` 并删除会话。
+///
+/// 可 `disarm()` 移交所有权（例如从 handler 移交到 `forward_inner`）。
+/// 流式路径必须把 **armed 的 guard 按值移入生成器**：若先 disarm 再依赖
+/// 生成器内部构造，而响应 Body 从未被 poll（客户端已断开、hyper 直接丢弃），
+/// 生成器体从未执行 → 两个守卫都不存在 → 会话永久泄漏。
+pub struct SessionGuard {
+    sid: String,
+    store: &'static SessionStore,
+    armed: bool,
+}
+
+impl SessionGuard {
+    pub(crate) fn new(sid: impl Into<String>, store: &'static SessionStore) -> Self {
+        Self {
+            sid: sid.into(),
+            store,
+            armed: true,
+        }
+    }
+
+    pub(crate) fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for SessionGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Some(mut sess) = self.store.get_mut(&self.sid) {
+            sess.inflight = false;
+        }
+        self.store.drop_session(&self.sid);
+    }
+}
+
 /// 流式处理上游响应 body（逐 chunk 还原后下发）。
 ///
 /// 用 `Body::from_stream` 把处理后的 chunk 直接下发 —— 首字延迟不等待整段生成。
+#[allow(clippy::too_many_arguments)] // 上游/回调/会话/上下文参数天然多；已用结构体承载 meta
 pub fn stream_response(
     body: Incoming,
     framing: Framing,
     sid: String,
     store: &'static SessionStore,
+    guard: SessionGuard,
+    mut decoder: Option<crate::stream::decode::StreamDecoder>,
     cmdblock: std::sync::Arc<crate::cmdblock::CmdBlockEngine>,
     bus: std::sync::Arc<EventBus>,
     meta: StreamMeta,
 ) -> axum::body::Body {
     let mut state = StreamState::new(framing);
-    // 会话释放守卫：流正常结束、客户端中途断开、body 被直接 drop、panic ——
-    // 任何退出路径都会释放。`inflight=true` 会让 sweep 跳过该会话，
-    // 漏释放就是**永久**内存泄漏（长会话每轮 stream:true，sessions 表无界增长）。
-    struct SessionGuard {
-        sid: String,
-        store: &'static SessionStore,
-    }
-    impl Drop for SessionGuard {
-        fn drop(&mut self) {
-            if let Some(mut sess) = self.store.get_mut(&self.sid) {
-                sess.inflight = false;
-            }
-            self.store.drop_session(&self.sid);
-        }
-    }
     let stream = async_stream::stream! {
-        // ⚠️ 守卫必须**活在生成器内部**：若建在 stream_response() 的局部，
-        // 函数 return 时就 drop 了 → 会话在流被消费前消失 → 流式还原全部失效
-        // （占位符原样下发）。放进生成器才能覆盖「消费完 / 断连 / 被丢弃」三种结束。
-        let _session_guard = SessionGuard { sid: sid.clone(), store };
+        // 守卫按值捕获在生成器状态里：正常结束、断连、未 poll 即丢弃、panic
+        // 任一情况都会 Drop 并释放会话。`inflight=true` 会让 sweep 跳过该会话，
+        // 漏释放就是**永久**内存泄漏。
+        let _session_guard = guard;
         let mut stats_total = RestoreStats::default();
         let mut usage_total = crate::store::usage::Usage::default();
+        let mut out_total = 0usize;
+        let mut first_byte_ms = 0u64;
+        let stream_t0 = std::time::Instant::now();
         let mut s = body;
-        let mut blocked = false;
+        // 流式路径已不允许 rewrite/block（forward_inner 会先分流为整包），
+        // 这里只保留 observe 扫描，blocked 恒为 false。
+        let blocked = false;
         // 完整报文诊断环：累积上游原始响应 + 下发给客户端的还原后响应。
         // 两边各自封顶（`trace_max`），超出后仍继续计数 `*_total`，但不再追加内容。
         let trace_max = meta.trace_max_bytes;
@@ -331,20 +427,37 @@ pub fn stream_response(
         let mut trace_truncated = false;
         while let Some(frame) = s.frame().await {
             let Ok(f) = frame else { break };
-            let Some(data) = f.data_ref() else { continue };
+            let Some(raw) = f.data_ref() else { continue };
             if trace_max > 0 {
-                trace_raw_total += data.len();
+                trace_raw_total += raw.len();
                 if trace_raw.len() < trace_max {
-                    let n = (trace_max - trace_raw.len()).min(data.len());
-                    trace_raw.extend_from_slice(&data[..n]);
-                    if n < data.len() {
+                    let n = (trace_max - trace_raw.len()).min(raw.len());
+                    trace_raw.extend_from_slice(&raw[..n]);
+                    if n < raw.len() {
                         trace_truncated = true;
                     }
                 } else {
                     trace_truncated = true;
                 }
             }
+            // 流式解压（gzip/deflate）：解出的明文再交给 SSE/NDJSON 状态机。
+            let decoded_buf: Vec<u8>;
+            let data: &[u8] = if let Some(dec) = decoder.as_mut() {
+                let mut buf = Vec::new();
+                if let Err(e) = dec.push(raw, &mut buf) {
+                    tracing::warn!("[decode] 流式解压失败: {e}；流将中断");
+                    break;
+                }
+                decoded_buf = buf;
+                &decoded_buf
+            } else {
+                raw
+            };
             let (out, stats) = state.push(data, &sid, store);
+            if first_byte_ms == 0 && !out.is_empty() {
+                first_byte_ms =
+                    meta.upstream_ms + stream_t0.elapsed().as_millis() as u64;
+            }
             // 逐块采集 usage（流末 usage 只出现在最后几块，不受文本留存上限影响）
             if !out.is_empty() {
                 let text = String::from_utf8_lossy(data);
@@ -353,14 +466,10 @@ pub fn stream_response(
             // 计数与样本一起合并：只加计数会让流式响应永远没有未还原样本，
             // 控制台只能显示「未还原 N 处」而看不到具体字符串。
             stats_total.merge(&stats);
-            // 命令拦截（流式：逐帧处理 pending 缓冲）
-            let out = if !blocked {
-                let (o, b) = cmdblock.process_stream_bytes(&out, &sid, store, false);
-                blocked = b;
-                o
-            } else {
-                Vec::new()
-            };
+            out_total += out.len();
+            // 命令拦截：observe 模式按真实槽位记录；rewrite/block 已在
+            // forward_inner 强制整包处理，不会进入流式路径。
+            cmdblock.scan_encoded_output(&out, &sid, store);
             if trace_max > 0 && !out.is_empty() {
                 trace_out_total += out.len();
                 if trace_out.len() < trace_max {
@@ -377,31 +486,65 @@ pub fn stream_response(
                 yield Ok::<Bytes, std::io::Error>(Bytes::from(out));
             }
         }
+        // 流末：先刷解压器尾部（gzip 的 trailer/残留明文），再 flush 状态机残余
+        if let Some(dec) = decoder.as_mut() {
+            let mut tail_bytes = Vec::new();
+            match dec.finish(&mut tail_bytes) {
+                Ok(()) if !tail_bytes.is_empty() => {
+                    let (out, stats) = state.push(&tail_bytes, &sid, store);
+                    stats_total.merge(&stats);
+                    out_total += out.len();
+                    if first_byte_ms == 0 && !out.is_empty() {
+                        first_byte_ms =
+                            meta.upstream_ms + stream_t0.elapsed().as_millis() as u64;
+                    }
+                    cmdblock.scan_encoded_output(&out, &sid, store);
+                    if trace_max > 0 && !out.is_empty() {
+                        trace_out_total += out.len();
+                        if trace_out.len() < trace_max {
+                            let n = (trace_max - trace_out.len()).min(out.len());
+                            trace_out.extend_from_slice(&out[..n]);
+                            if n < out.len() {
+                                trace_truncated = true;
+                            }
+                        } else {
+                            trace_truncated = true;
+                        }
+                    }
+                    if !out.is_empty() {
+                        yield Ok::<Bytes, std::io::Error>(Bytes::from(out));
+                    }
+                }
+                Ok(()) => {}
+                Err(e) => tracing::warn!("[decode] 流式解压收尾失败: {e}"),
+            }
+        }
         // 流末：flush 残余
         let (tail, stats) = state.push(b"", &sid, store);
         stats_total.merge(&stats);
-        if !tail.is_empty() && !blocked {
-            let (o, _) = cmdblock.process_stream_bytes(&tail, &sid, store, true);
-            if trace_max > 0 && !o.is_empty() {
-                trace_out_total += o.len();
+        out_total += tail.len();
+        if !tail.is_empty() {
+            cmdblock.scan_encoded_output(&tail, &sid, store);
+            if trace_max > 0 {
+                trace_out_total += tail.len();
                 if trace_out.len() < trace_max {
-                    let n = (trace_max - trace_out.len()).min(o.len());
-                    trace_out.extend_from_slice(&o[..n]);
-                    if n < o.len() {
+                    let n = (trace_max - trace_out.len()).min(tail.len());
+                    trace_out.extend_from_slice(&tail[..n]);
+                    if n < tail.len() {
                         trace_truncated = true;
                     }
                 } else {
                     trace_truncated = true;
                 }
             }
-            if !o.is_empty() {
-                yield Ok(Bytes::from(o));
-            }
+            yield Ok(Bytes::from(tail));
         }
         // RESTORE 事件 + 响应扫描
         // dialog 取 state.kept —— 那是**还原后**的正文（上游回的是占位符，
         // 用户看到的是原文，事件里也该记原文）。
         let mut rmeta = meta.clone();
+        rmeta.resp_bytes = out_total;
+        rmeta.first_byte_ms = first_byte_ms.max(meta.upstream_ms);
         rmeta.resp_dialog = dialog_for_log(&state.kept, meta.keep_plaintext, &meta.secret_prefixes);
         emit_restore(&bus, &sid, &rmeta, &stats_total, store, blocked, "stream");
 
@@ -432,6 +575,16 @@ pub fn stream_response(
 
         if let Some(hook) = USAGE_HOOK.get() {
             hook(&meta.model, &usage_total);
+        }
+        if meta.response_scan {
+            let findings = scan_response_pii(
+                &state.kept,
+                &sid,
+                store,
+                &meta.builtin_rules,
+                meta.keep_plaintext,
+            );
+            emit_scanwarn(&bus, &sid, &meta, findings);
         }
         crate::audit::on_response(&bus, &sid, store, &state.kept, &meta);
     };
@@ -468,6 +621,45 @@ pub struct StreamMeta {
     pub trace_budget: usize,
     /// 客户端请求头（随 RESTORE 事件落库，与同请求的 MASK 事件同一份）。
     pub request_headers: Vec<(String, String)>,
+    /// 响应侧 PII 扫描开关（配置快照）。
+    pub response_scan: bool,
+    /// 内置规则开关快照（响应扫描用，避免热路径读配置锁）。
+    pub builtin_rules: std::collections::BTreeMap<String, bool>,
+    /// 审计配置快照（门控 + 信号过滤 + 严重度门槛）。
+    pub audit_enabled: bool,
+    pub audit_passive: bool,
+    pub audit_signals: std::collections::BTreeMap<String, bool>,
+    pub audit_floor: crate::audit::Severity,
+    /// 响应体字节数 / 上游等待毫秒 / 首字节毫秒（事件计量）。
+    pub resp_bytes: usize,
+    pub upstream_ms: u64,
+    pub first_byte_ms: u64,
+}
+
+/// 发 SCANWARN 事件（响应侧幻觉/泄漏 PII）。
+fn emit_scanwarn(bus: &EventBus, sid: &str, meta: &StreamMeta, findings: Vec<EventItem>) {
+    if findings.is_empty() {
+        return;
+    }
+    let ev = Event {
+        id: 0,
+        ts: 0.0,
+        event_type: EventType::ScanWarn,
+        method: meta.method.clone(),
+        path: meta.path.clone(),
+        status: meta.status,
+        reason: "response_pii".into(),
+        protocol: meta.protocol.clone(),
+        model: meta.model.clone(),
+        session_id: sid.into(),
+        req_bytes: meta.req_bytes,
+        count: findings.len(),
+        items: findings,
+        request_headers: meta.request_headers.clone(),
+        message: "response_scan".into(),
+        ..Default::default()
+    };
+    bus.emit(ev);
 }
 
 /// 发 RESTORE 事件（对齐 `_emit_restore_summary`）。
@@ -502,13 +694,13 @@ pub fn emit_restore(
         model: meta.model.clone(),
         session_id: sid.into(),
         mask_ms: store.get(sid).map(|s| s.mask_ms),
-        first_byte_ms: None,
-        upstream_ms: None,
+        first_byte_ms: (meta.first_byte_ms > 0).then_some(meta.first_byte_ms as f64),
+        upstream_ms: (meta.upstream_ms > 0).then_some(meta.upstream_ms as f64),
         req_bytes: meta.req_bytes,
-        resp_bytes: 0,
+        resp_bytes: meta.resp_bytes,
         items,
         new_count: 0,
-        reused_count: 0,
+        reused_count: store.get(sid).map(|s| s.reused_count).unwrap_or(0),
         unresolved: unresolved as usize,
         unresolved_samples: stats.samples.iter().take(5).cloned().collect(),
         unknown_shape: false,
@@ -552,7 +744,7 @@ fn build_restore_items(
             preview: crate::mask::engine::preview(orig, &label),
             length: orig.chars().count(),
             hash: crate::mask::placeholder::token_suffix(token),
-            restored: false,
+            restored,
         };
         if cred {
             item.digest = crate::mask::validators::cred_digest(orig);
@@ -583,6 +775,7 @@ pub fn process_and_emit(
 ) -> ResponseOutcome {
     let outcome = process_whole(body, ct, sid, store, cmdblock);
     let mut meta = meta.clone();
+    meta.resp_bytes = outcome.body.len();
     // 非流式：dialog = **还原后**的助手回复
     meta.resp_dialog = serde_json::from_slice::<serde_json::Value>(&outcome.body)
         .map(|v| crate::mask::tree::extract_dialog_text(&v))
@@ -637,6 +830,11 @@ pub fn process_and_emit(
     }
     // 响应侧 PII 扫描 + 审计
     let text = String::from_utf8_lossy(&outcome.body).to_string();
+    if meta.response_scan {
+        let findings =
+            scan_response_pii(&text, sid, store, &meta.builtin_rules, meta.keep_plaintext);
+        emit_scanwarn(bus, sid, meta, findings);
+    }
     crate::audit::on_response(bus, sid, store, &text, meta);
     outcome
 }
@@ -672,12 +870,8 @@ pub fn scan_response_pii(
         })
         .unwrap_or_default();
     drop(s);
-    // 扫描前段（对齐 _SCAN_BODY_MAX = 512KB）
-    let scan_text = if text.len() > 512 * 1024 {
-        &text[..512 * 1024]
-    } else {
-        text
-    };
+    // 扫描前段（对齐 _SCAN_BODY_MAX = 512KB）；按字符边界截断，避免 CJK 响应 panic。
+    let scan_text = crate::util::truncate_utf8(text, 512 * 1024);
     let mut found: Vec<EventItem> = Vec::new();
     let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
     // 跨规则豁免集（CONNSTR 否决 → EMAIL 跳过）。
@@ -700,11 +894,15 @@ pub fn scan_response_pii(
             }
             if !rules::semantic_check(rule.label, orig, scan_text, m0, &caps) {
                 if rule.exempt_on_reject && exempt_conn.len() < 512 {
-                    exempt_conn.push(m0.as_str().to_string());
+                    exempt_conn.push(rules::connstr_exempt_text(scan_text, m0));
                 }
                 continue;
             }
-            if rule.avoid_exempt && exempt_conn.iter().any(|s| rules::overlaps(s, m0.as_str())) {
+            if rule.avoid_exempt
+                && exempt_conn
+                    .iter()
+                    .any(|s| s.contains(m0.as_str()) || m0.as_str().contains(s))
+            {
                 continue;
             }
             if known.contains(orig) {
@@ -881,6 +1079,22 @@ mod tests {
     }
 
     #[test]
+    fn session_guard_releases_and_disarm_transfers() {
+        let store: &'static SessionStore = Box::leak(Box::new(SessionStore::new()));
+        store.new_session("g1");
+        {
+            let _g = SessionGuard::new("g1", store);
+        }
+        assert!(store.get("g1").is_none(), "guard Drop 应释放会话");
+        store.new_session("g2");
+        {
+            let mut g = SessionGuard::new("g2", store);
+            g.disarm();
+        }
+        assert!(store.get("g2").is_some(), "disarm 后不再释放（移交）");
+    }
+
+    #[test]
     fn response_scan_finds_hallucinated_pii() {
         let parts = setup();
         // 本会话只脱敏过一个号码；回复里出现另一个 → 幻觉
@@ -895,6 +1109,15 @@ mod tests {
         assert!(found
             .iter()
             .any(|i| i.label == "PHONE" && i.original == "13911112222"));
+    }
+
+    #[test]
+    fn response_scan_large_cjk_does_not_panic() {
+        let parts = setup();
+        // 525000 字节 > 512KiB，且 524288 % 3 = 2 → 旧实现切片落在汉字中间。
+        let text = "密".repeat(175_000);
+        let found = scan_response_pii(&text, "r", &parts.1, &parts.0.mask.builtin_rules, true);
+        assert!(found.is_empty());
     }
 
     #[test]

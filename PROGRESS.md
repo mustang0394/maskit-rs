@@ -737,3 +737,26 @@ cargo test 2>&1 | grep -E "test result" | awk '{s+=}'   # 只累加 passed
 - 截图确认设置页新面板布局（`backups/log-redesign-shots/dark-settings.png`）。
 
 **说明**：已被截断的历史 trace 无法恢复（数据在写入时就丢了），只对新请求生效。
+
+---
+
+## 2026-11-18 缺陷修复批次（40 项验证结论落地）
+
+按「高/中优先级缺陷验证 + 可行性审查」后的 v2 计划实施，分批可回滚：
+
+- **崩溃/数据完整性**：`util::truncate_utf8` 统一字符边界（cmdblock 8192、审计证据 80/120、响应扫描 512KiB、idcard18）；config 解析失败先备份 `.bad.<ts>` 再写默认；配置写入串行化 + 唯一 tmp + 0600 + fsync；`SessionGuard` 移入流生成器（never-polled 也释放）+ inflight 2h 兜底；事件 id 用 `meta.next_event_id` 同事务持久化并在启动续号。
+- **默认规则漏检**：CONNSTR→EMAIL 改双向包含，消除 1 字节误豁免；邮箱后英文句号放行；PHONE/LANDLINE 不跨行；假 data URI 尾部 PII 不再跳过；SECRET 支持 `DB_PASSWORD`/点分口令；Bearer/AWS marker 大小写；MAC 分隔符一致。
+- **流式/树**：SSE 先槽位后 flush；流末补分隔符；非对象 JSON 还原；splice form 去重 + 上限 256；`arguments/partial_json` 内层树脱敏并登记整串 splice；顶层业务键入 path；业务区数值不再豁免；还原深度 64 + 子树计数；observe 流式按真实槽位记录、rewrite/block 强制整包；gzip/deflate 流式解压。
+- **配置/鉴权/运维**：`update_with` 锁内读改写；空/非 ASCII token 保留旧值；`read_timeout_secs`、`custom_regexes`、`stream_response`、`response_scan` 生效；`record_plaintext_words` 移除；`/status` 显示实际监听地址；维护线程每轮读配置且无条件启动；`/health` 移除 upstream_target；clear events/audits 走写线程；demo 用局部 store。
+- **审计/事件**：`audit.enabled/passive/signals/severity_floor` 生效；接线 error_leak/sse_anomaly；移除无注入点的 tool_call_rewrite/cross_request_pollution；CMDHIT 事件可见；`SCANWARN` 接线；`item.restored` 与事件计量（resp_bytes/upstream_ms/first_byte_ms/reused_count）。
+
+**验证**：`cargo test --all-targets` 482 全绿；`clippy -D warnings`、`fmt --check` 通过。已知限制见 README「已知限制」。
+
+### 2026-11-18 glm-5.3 max 复审补丁
+
+- `connstr_exempt_text` 终止符补齐 `;` 与反引号（与 `parse_authority` 对齐），修复 `...@localhost;联系ops@corp.com` 误豁免（高）。
+- SSE 终止事件补发帧改插到本事件非 data 行（`event:`）之前，避免 flush 帧继承 event 类型；CRLF 跨 chunk 拆成 `\r`|`\n` 时保留一个 `\n`，不再漏帧。
+- gzip 串联多成员不再静默丢弃：成员结束后出现 >8 字节残留即报 `multi_member_or_trailing_data_unsupported`（可见截断，不静默）。
+- 配置写盘失败对 PUT/PATCH 调用方可见（warning）；启动期生成 token 但写盘失败直接中止，避免“令牌不可见 401”。
+- `ClearEvents/ClearAudits` 用 SAVEPOINT 包裹，失败回滚，不再半清。
+- 回归：488 测试全绿，clippy/fmt 通过。

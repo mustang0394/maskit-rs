@@ -1,7 +1,7 @@
 //! 命令拦截：探测 / 改写 / 阻断三模式 + echo 抑制 + 有界前瞻缓冲（M7）。
 //!
 //! 对齐 Python `_cmd_process` / `_cmd_find` / `_cmd_rewrite_text` / `_cmd_flush_frames`:
-//! - 内置 7 条规则（rm -rf /、rm -rf ~、del 盘符、format/mkfs、DROP DB、dd、fork 炸弹）
+//! - 内置 8 条规则（rm -rf /、rm -rf ~、del 盘符、format/mkfs、DROP DB、dd、fork 炸弹）
 //! - observe（默认，零改写）/ rewrite（换 no-op 说明）/ block（停止下发）
 //! - echo 抑制：请求体里已有的命令既不记也不改
 //! - 通道：tool（工具参数）/ text（正文，需显式 opt-in）/ reason（思考，恒排除但留痕）
@@ -15,8 +15,31 @@ use crate::mask::session::{CmdHit, SessionStore};
 
 /// 无界前瞻缓冲上限（对齐 `CMD_HOLD_MAX` = 64）。
 pub const CMD_HOLD_MAX: usize = 64;
-/// 命令扫描窗口（对齐 `CMD_SCAN_MAX` = 8192）。
-pub const CMD_SCAN_MAX: usize = 8192;
+/// 完整扫描上限：≤1MiB 全量扫描，超过则只扫头尾（避免长响应退化）。
+const CMD_SCAN_FULL_MAX: usize = 1 << 20;
+/// 超限时头/尾各扫描的字节数。
+const CMD_SCAN_EDGE: usize = 64 << 10;
+
+/// 扫描窗口：≤1MiB 全量；超过时头尾各 64KiB。
+///
+/// 旧实现只看前 8KiB，危险命令写在长文本后半段即漏；而全量扫描
+/// 大响应又会拖慢热路径，因此用「头+尾」折中。
+fn scan_windows(text: &str) -> Vec<&str> {
+    if text.len() <= CMD_SCAN_FULL_MAX {
+        return vec![text];
+    }
+    let head = crate::util::truncate_utf8(text, CMD_SCAN_EDGE);
+    let start = crate::util::floor_boundary(text, text.len().saturating_sub(CMD_SCAN_EDGE));
+    vec![head, &text[start..]]
+}
+
+fn floor_byte_boundary(b: &[u8], idx: usize) -> usize {
+    let mut i = idx.min(b.len());
+    while i > 0 && i < b.len() && (b[i] & 0xC0) == 0x80 {
+        i -= 1;
+    }
+    i
+}
 
 /// 单会话的通道缓冲条目上限（防御：恶意/异常流可造出无界 channel 名）。
 const MAX_PEND_CHANNELS: usize = 256;
@@ -90,6 +113,14 @@ fn specs() -> Vec<(&'static str, &'static str, &'static str)> {
             r"(?i)\brm\s+(?:-[a-z]*[rf][a-z]*\s+)+(?:/|/\*)(?:\s|$|;|&|\|)",
         ),
         (
+            // 现代 GNU rm 唯一真能删根的写法：--no-preserve-root 常放在
+            // 目标 `/` 前、与被禁的 `-rf` 分开。旧规则要求 flags 后紧跟 `/`，
+            // 因此 `rm -rf --no-preserve-root /` 完全绕过。
+            "builtin-rm-root-nopreserve",
+            "递归删除根目录(--no-preserve-root)",
+            r"(?i)\brm\s+[^\n]{0,80}--no-preserve-root[^\n]{0,40}(?:/|/\*)(?:\s|$|;|&|\|)",
+        ),
+        (
             "builtin-rm-home",
             "递归删除家目录",
             r"(?i)\brm\s+(?:-[a-z]*[rf][a-z]*\s+)+~(?:/\*?)?(?=\s|$|;|&|\|)",
@@ -133,7 +164,7 @@ pub fn compile_cmd(pat: &str) -> Option<CmdRegex> {
     None
 }
 
-/// 内置 7 条危害命令规则（对齐 `BUILTIN_COMMAND_BLOCK_PATTERNS`）。
+/// 内置危害命令规则（对齐 Python `BUILTIN_COMMAND_BLOCK_PATTERNS`）。
 pub fn builtin_patterns() -> Vec<(String, String, CmdRegex)> {
     // 双通道编译（含 lookahead 的规则走 fancy-regex，D7 第 6 条）
     specs()
@@ -220,30 +251,111 @@ impl CmdBlockEngine {
         "text"
     }
 
+    /// 当前模式（供代理层决定流式是否可安全改写/阻断）。
+    pub fn mode(&self) -> CmdBlockMode {
+        self.mode
+    }
+
+    /// 是否配置了任何要扫描的通道。
+    pub fn has_channels(&self) -> bool {
+        !self.channels.is_empty()
+    }
+
+    /// rewrite/block 模式必须整包处理：不能在只看到半帧时下发。
+    pub fn requires_whole_body(&self) -> bool {
+        self.mode != CmdBlockMode::Observe && !self.channels.is_empty()
+    }
+
+    /// observe 模式的流式扫描：从已还原的 SSE/NDJSON 帧里提取文本槽位，
+    /// 按真实 channel 记录命中（observe 零改写，无需 hold/pending）。
+    ///
+    /// 之前流式路径把整帧当 `text` 通道扫描，默认 `channels=["tool"]` 时
+    /// 直接被通道闸门跳过 —— 流式工具参数里的危险命令完全不检查。
+    pub fn scan_encoded_output(&self, bytes: &[u8], sid: &str, store: &SessionStore) {
+        if self.mode != CmdBlockMode::Observe || self.channels.is_empty() {
+            return;
+        }
+        let text = String::from_utf8_lossy(bytes);
+        let mut unparsed_tool = false;
+        for line in text.split('\n') {
+            let line = line.trim_start();
+            let payload = if let Some(rest) = line.strip_prefix("data:") {
+                rest.trim_start()
+            } else {
+                line
+            };
+            if payload.is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<serde_json::Value>(payload) {
+                Ok(v) => self.scan_encoded_value(&v, None, sid, store),
+                Err(_) => {
+                    // SSE 单帧超限会被强制切分，切点处是半截 JSON；整帧解析
+                    // 必然失败。按 tool 通道对原文兜底扫一遍，避免 observe
+                    // 静默丢命中（解析成功时不会走这里，不会重复计数）。
+                    if payload.contains("arguments") || payload.contains("partial_json") {
+                        unparsed_tool = true;
+                    }
+                }
+            }
+        }
+        if unparsed_tool && self.channels.contains("tool") {
+            let _ = self.process(&text, "arguments", sid, store, false);
+        }
+    }
+
+    fn scan_encoded_value(
+        &self,
+        v: &serde_json::Value,
+        key: Option<&str>,
+        sid: &str,
+        store: &SessionStore,
+    ) {
+        match v {
+            serde_json::Value::String(s) => {
+                if let Some(k) = key {
+                    let kind = Self::channel_kind(k);
+                    if self.channels.contains(kind) {
+                        let _ = self.process(s, k, sid, store, false);
+                    }
+                }
+            }
+            serde_json::Value::Array(arr) => {
+                for x in arr {
+                    self.scan_encoded_value(x, key, sid, store);
+                }
+            }
+            serde_json::Value::Object(map) => {
+                for (k, v) in map {
+                    self.scan_encoded_value(v, Some(k), sid, store);
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// 在文本里找第一条命中的启用规则（白名单优先）。
     pub fn find(&self, text: &str) -> Option<(String, String, String)> {
         if self.patterns.is_empty() || text.is_empty() {
             return None;
         }
-        let window: &str = if text.len() > CMD_SCAN_MAX {
-            &text[..CMD_SCAN_MAX]
-        } else {
-            text
-        };
+        let windows = scan_windows(text);
         let disabled = self.disabled.lock().unwrap();
         for (id, label, rx) in &self.patterns {
             if disabled.contains(id) {
                 continue;
             }
-            if let Some(found) = rx.find_str(window) {
-                let hit = found.trim().to_string();
-                if hit.is_empty() {
-                    continue;
+            for window in &windows {
+                if let Some(found) = rx.find_str(window) {
+                    let hit = found.trim().to_string();
+                    if hit.is_empty() {
+                        continue;
+                    }
+                    if self.allow.iter().any(|a| a.is_match(&hit)) {
+                        continue;
+                    }
+                    return Some((hit.chars().take(120).collect(), id.clone(), label.clone()));
                 }
-                if self.allow.iter().any(|a| a.is_match(&hit)) {
-                    continue;
-                }
-                return Some((hit.chars().take(120).collect(), id.clone(), label.clone()));
             }
         }
         None
@@ -285,8 +397,21 @@ impl CmdBlockEngine {
             return;
         }
         if let Some(mut s) = store.get_mut(sid) {
-            let take = content.len().min(CMD_SCAN_MAX);
-            s.cmd_req_window = Some(content[..take].to_vec());
+            // 与 `find` 同一窗口策略：≤1MiB 全量；超限存头+尾（用换行隔开，
+            // 避免头部与尾部拼接产生假的回声片段）。
+            let window = if content.len() <= CMD_SCAN_FULL_MAX {
+                content.to_vec()
+            } else {
+                let head = floor_byte_boundary(content, CMD_SCAN_EDGE);
+                let start =
+                    floor_byte_boundary(content, content.len().saturating_sub(CMD_SCAN_EDGE));
+                let mut v = Vec::with_capacity(head + content.len() - start + 1);
+                v.extend_from_slice(&content[..head]);
+                v.push(b'\n');
+                v.extend_from_slice(&content[start..]);
+                v
+            };
+            s.cmd_req_window = Some(window);
         }
     }
 
@@ -603,7 +728,20 @@ mod tests {
         e
     }
 
-    /// 回归：默认配置必须**开箱即用**地装载 7 条内置规则。
+    /// B1 回归：>8KB 中文文本的第 8192 字节落在汉字中间时，`find` 不能 panic。
+    #[test]
+    fn find_large_cjk_does_not_panic() {
+        let e = engine(CmdBlockMode::Observe, &["tool"]);
+        // 9000 字节；8192 % 3 = 2，正好切在字符内部。
+        let text = "密".repeat(3000);
+        assert!(e.find(&text).is_none());
+        // 危险命令在 8KB 之后（当前窗口只扫头部，至少不能因切片崩溃）
+        let mut tail = text.clone();
+        tail.push_str(" rm -rf /");
+        assert!(e.find(&tail).is_some(), "危险命令在 8KB 之后也必须命中");
+    }
+
+    /// 回归：默认配置必须**开箱即用**地装载 8 条内置规则。
     /// 曾因 `CommandBlockConfig::default()` 用 `patterns: []`，
     /// 新装实例一条规则都不跑，`rm -rf /` 完全不拦（Python 版是拦的）。
     #[test]
@@ -611,14 +749,15 @@ mod tests {
         let cfg = crate::config::Config::default();
         assert_eq!(
             cfg.command_block.patterns.len(),
-            7,
-            "默认配置必须播种 7 条内置命令规则"
+            8,
+            "默认配置必须播种 8 条内置命令规则"
         );
         let e = CmdBlockEngine::new(&cfg);
-        assert_eq!(e.patterns.len(), 7, "引擎必须实际装载全部内置规则");
+        assert_eq!(e.patterns.len(), 8, "引擎必须实际装载全部内置规则");
         // 每条都能检出对应危害形态
         for (hazard, expect_id) in [
             ("rm -rf /", "builtin-rm-root"),
+            ("rm -rf --no-preserve-root /", "builtin-rm-root-nopreserve"),
             ("rm -rf ~", "builtin-rm-home"),
             ("mkfs.ext4 /dev/sda1", "builtin-format"),
             ("DROP DATABASE prod;", "builtin-drop-db"),
@@ -631,7 +770,7 @@ mod tests {
         }
         // 序列化形态与编译形态同源（落进 config.json 的和引擎跑的是同一批）
         let seeded = crate::cmdblock::default_builtin_patterns();
-        assert_eq!(seeded.len(), 7);
+        assert_eq!(seeded.len(), 8);
         assert!(seeded.iter().all(|p| p.enabled && p.builtin));
         for p in &seeded {
             let rx = compile_cmd(&p.regex);
@@ -674,6 +813,24 @@ mod tests {
             assert_eq!(out, text, "observe 必须零改写");
             assert!(!blocked);
         }
+    }
+
+    /// D2 回归：流式 tool arguments 的 observe 命中必须被记录。
+    /// 旧实现把整帧当 text 通道，默认 channels=["tool"] 时直接跳过。
+    #[test]
+    fn scan_encoded_output_records_tool_hits() {
+        let e = engine(CmdBlockMode::Observe, &["tool"]);
+        let store = SessionStore::new();
+        store.new_session("s");
+        let frame = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"rm -rf /\"}}]}}]}\n\n";
+        e.scan_encoded_output(frame.as_bytes(), "s", &store);
+        assert!(
+            !store
+                .get("s")
+                .map(|s| s.cmd_hits.is_empty())
+                .unwrap_or(true),
+            "流式 arguments 应记录命令命中"
+        );
     }
 
     #[test]
@@ -809,6 +966,7 @@ mod tests {
         let e = engine(CmdBlockMode::Observe, &["tool"]);
         let cases = [
             ("rm -rf /", "builtin-rm-root"),
+            ("rm -rf --no-preserve-root /", "builtin-rm-root-nopreserve"),
             ("rm -rf ~", "builtin-rm-home"),
             ("mkfs.ext4 /dev/sda1", "builtin-format"),
             ("DROP DATABASE prod;", "builtin-drop-db"),

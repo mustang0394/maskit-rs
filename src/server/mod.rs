@@ -39,6 +39,8 @@ pub struct AppState {
     cmdblock: std::sync::RwLock<Arc<crate::cmdblock::CmdBlockEngine>>,
     /// 自定义词/正则引擎(配置变更时重建)
     custom_words: std::sync::RwLock<Arc<CustomWords>>,
+    /// 实际监听地址（bind 发生在 AppState 构造之后，由 main 回填）。
+    bound: std::sync::OnceLock<(String, u16)>,
 }
 
 impl AppState {
@@ -67,6 +69,8 @@ impl AppState {
         sessions: &'static SessionStore,
     ) -> Self {
         let cfg = config.get();
+        // 内存映射 TTL 跟随 mapping_ttl（启动即对齐，热更新在 rebuild_runtime 中再对齐）。
+        sessions.set_ttl(cfg.mask.mapping_ttl);
         let custom = Arc::new(CustomWords::build(&cfg));
         // 播种自定义词确定性占位符(跨重启稳定)。注意：写的是**本实例的**
         // store，不是全局 STORE —— 否则并发用例会互相删词。
@@ -95,7 +99,17 @@ impl AppState {
             event_store,
             custom_words: std::sync::RwLock::new(custom),
             cmdblock: std::sync::RwLock::new(cmdblock),
+            bound: std::sync::OnceLock::new(),
         }
+    }
+
+    /// 记录实际监听地址（main 在 bind 成功后调用）。
+    pub fn set_bound_addr(&self, host: String, port: u16) {
+        let _ = self.bound.set((host, port));
+    }
+
+    pub fn bound_addr(&self) -> Option<&(String, u16)> {
+        self.bound.get()
     }
 
     /// 取当前上游客户端。
@@ -119,6 +133,7 @@ impl AppState {
     /// （真实冒烟实测：改配置后请求仍打到启动时的占位上游 → 502）。
     pub fn rebuild_runtime(&self) {
         let cfg = self.config.get();
+        self.sessions.set_ttl(cfg.mask.mapping_ttl);
         let custom = Arc::new(CustomWords::build(&cfg));
         // 配置热更新后必须重新播种自定义词映射：
         // 新增/改名/删除的敏感词要同步进 custom_fwd/custom_rev（永久映射），
@@ -367,7 +382,7 @@ pub async fn passthrough(
                 let h = out.headers_mut().unwrap();
                 for (k, v) in resp_headers {
                     if let Some(name) = k {
-                        h.insert(name, v);
+                        h.append(name, v);
                     }
                 }
             }

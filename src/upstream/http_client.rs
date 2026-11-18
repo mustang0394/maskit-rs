@@ -90,6 +90,8 @@ pub struct UpstreamClient {
     pub target: TargetParts,
     pub extra_headers: Vec<(HeaderName, HeaderValue)>,
     connect_timeout: Duration,
+    /// 等待响应头的超时（0 = 300s 安全上限）
+    read_timeout_secs: u64,
 }
 
 impl UpstreamClient {
@@ -132,6 +134,7 @@ impl UpstreamClient {
             target,
             extra_headers: extra,
             connect_timeout: Duration::from_secs(cfg.connect_timeout_secs.max(1)),
+            read_timeout_secs: cfg.read_timeout_secs,
         })
     }
 
@@ -148,13 +151,10 @@ impl UpstreamClient {
         headers: &HeaderMap,
         body: Bytes,
     ) -> Result<Request<http_body_util::Full<Bytes>>, String> {
+        let host = bracketed_host(&self.target.host);
         let uri = format!(
             "{}://{}:{}{}{}",
-            self.target.scheme,
-            self.target.host,
-            self.target.port,
-            self.target.path_prefix,
-            client_path,
+            self.target.scheme, host, self.target.port, self.target.path_prefix, client_path,
         );
         let uri: hyper::Uri = uri.parse().map_err(|e| format!("上游 URI 非法: {e}"))?;
         let body_len = body.len();
@@ -168,9 +168,9 @@ impl UpstreamClient {
         let host_hdr = if self.target.port == 443 && self.target.scheme == "https"
             || self.target.port == 80 && self.target.scheme == "http"
         {
-            self.target.host.clone()
+            host.clone()
         } else {
-            format!("{}:{}", self.target.host, self.target.port)
+            format!("{}:{}", host, self.target.port)
         };
         if let Ok(v) = HeaderValue::from_str(&host_hdr) {
             req.headers_mut().insert(hyper::header::HOST, v);
@@ -181,7 +181,7 @@ impl UpstreamClient {
                 .insert(hyper::header::CONTENT_LENGTH, HeaderValue::from(body_len));
         }
         for (k, v) in &self.extra_headers {
-            req.headers_mut().insert(k, v.clone());
+            req.headers_mut().append(k.clone(), v.clone());
         }
         Ok(req)
     }
@@ -192,10 +192,16 @@ impl UpstreamClient {
         &self,
         req: Request<http_body_util::Full<Bytes>>,
     ) -> Result<hyper::Response<Incoming>, String> {
-        // 连接级超时通过 tokio::time::timeout 包裹（仅 connect 阶段预算严格；
-        // 读取阶段读超时配置为 0 表示不限——SSE 长流需要）。
+        // 外层预算 = 连接预算 + 等待响应头预算。
+        // `read_timeout_secs=0` 保持旧的 300s 安全上限（SSE 的 body 读取不受
+        // 此超时影响：http.request() 在响应头到达时即完成）。
+        let read = if self.read_timeout_secs == 0 {
+            Duration::from_secs(300)
+        } else {
+            Duration::from_secs(self.read_timeout_secs)
+        };
         let fut = self.http.request(req);
-        match tokio::time::timeout(self.connect_timeout.max(Duration::from_secs(300)), fut).await {
+        match tokio::time::timeout(self.connect_timeout + read, fut).await {
             Ok(Ok(resp)) => Ok(resp),
             Ok(Err(e)) => Err(format!("上游请求失败: {e}")),
             Err(_) => Err("上游请求超时".into()),
@@ -335,9 +341,24 @@ pub fn forward_headers(headers: &HeaderMap) -> HeaderMap {
         if is_hop_by_hop_header(k.as_str()) {
             continue;
         }
-        out.insert(k, v.clone());
+        // append 保留同名多值（多个 accept / set-cookie），insert 会压成最后一个
+        out.append(k.clone(), v.clone());
     }
     out
+}
+
+/// IPv6 字面量在 URI/Host 中必须加方括号；域名/IPv4 原样。
+pub fn bracketed_host(host: &str) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    }
+}
+
+/// `host:port` 形式（IPv6 自动加方括号），供 TCP connect / 展示使用。
+pub fn authority(host: &str, port: u16) -> String {
+    format!("{}:{}", bracketed_host(host), port)
 }
 
 #[cfg(test)]
@@ -366,6 +387,22 @@ mod tests {
         let t = parse_target("http://[::1]:9000").unwrap();
         assert_eq!(t.host, "::1");
         assert_eq!(t.port, 9000);
+        assert_eq!(bracketed_host(&t.host), "[::1]");
+        assert_eq!(authority(&t.host, t.port), "[::1]:9000");
+    }
+
+    #[test]
+    fn forward_headers_preserves_multi_values() {
+        let mut h = HeaderMap::new();
+        h.append("set-cookie", "a=1".parse().unwrap());
+        h.append("set-cookie", "b=2".parse().unwrap());
+        let out = forward_headers(&h);
+        let vals: Vec<_> = out
+            .get_all("set-cookie")
+            .iter()
+            .map(|v| v.to_str().unwrap().to_string())
+            .collect();
+        assert_eq!(vals, vec!["a=1", "b=2"]);
     }
 
     #[test]

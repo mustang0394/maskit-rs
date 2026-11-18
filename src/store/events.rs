@@ -378,10 +378,18 @@ const RING_CAPACITY: usize = 2000;
 
 impl EventBus {
     pub fn new() -> Arc<Self> {
+        Self::new_with_start(1)
+    }
+
+    /// 以指定起始 id 创建总线。
+    ///
+    /// 生产启动时传入 `EventStore::initial_event_id()`：内存 id 每进程从 1
+    /// 重新开始会与库里的历史事件 id 冲突，详情页可能打开另一条旧事件。
+    pub fn new_with_start(start_id: u64) -> Arc<Self> {
         Arc::new(Self {
             ring: Mutex::new(VecDeque::with_capacity(RING_CAPACITY)),
             audits: Mutex::new(VecDeque::new()),
-            next_id: Mutex::new(1),
+            next_id: Mutex::new(start_id.max(1)),
             next_audit_id: Mutex::new(1),
             capacity: RING_CAPACITY,
             counters: Mutex::new(Counters::default()),
@@ -518,8 +526,8 @@ impl EventBus {
         host: &str,
         method: &str,
         path: &str,
+        floor: crate::audit::Severity,
     ) {
-        let floor = crate::audit::Severity::Medium; // 默认 severity_floor
         let always = crate::audit::ALWAYS_RECORD.contains(&f.signal.as_str());
         if f.severity < floor && !always {
             return;
@@ -644,6 +652,15 @@ mod tests {
         let c = bus.counters();
         assert_eq!(c.requests, 2);
         assert_eq!(c.masked, 1);
+    }
+
+    #[test]
+    fn new_with_start_continues_ids() {
+        let bus = EventBus::new_with_start(100);
+        let ev = bus.emit(sample(EventType::Mask));
+        assert_eq!(ev.id, 100);
+        let ev2 = bus.emit(sample(EventType::Pass));
+        assert_eq!(ev2.id, 101);
     }
 
     #[test]

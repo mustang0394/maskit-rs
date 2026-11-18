@@ -101,6 +101,228 @@ pub fn decode(body: &[u8], content_encoding: &str) -> Result<Option<Vec<u8>>, St
     }
 }
 
+/// 可流式解码的编码。br/zstd 仍走整包（增量 API 复杂，先保证 gzip/deflate）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StreamDecodeKind {
+    Gzip,
+    /// Content-Encoding: deflate —— 可能是 zlib 包装，也可能是裸 deflate，
+    /// 收到前两字节后按 RFC1950 头判定。
+    Deflate,
+}
+
+pub fn streaming_decodable(content_encoding: &str) -> Option<StreamDecodeKind> {
+    match content_encoding.trim().to_ascii_lowercase().as_str() {
+        "gzip" | "x-gzip" => Some(StreamDecodeKind::Gzip),
+        // deflate 两种 flavor 都真实存在；延迟到收到前两字节再判定。
+        "deflate" => Some(StreamDecodeKind::Deflate),
+        _ => None,
+    }
+}
+
+/// 增量解压器：逐 chunk 解出明文，供 SSE 流式还原。
+///
+/// gzip：手动剥离 10 字节头与可选字段后用 raw deflate 增量解码
+/// （miniz_oxide 后端没有 gzip 构造器）；zlib：直接 zlib 头。
+/// 解压失败无法回退回「原样透传」（已经 yield 过明文），调用方只能中断流并
+/// 记日志；这是流式化的固有代价，gzip 流损坏本就极罕见。
+pub struct StreamDecoder {
+    kind: StreamDecodeKind,
+    /// None = gzip/deflate 头还没收全。
+    d: Option<flate2::Decompress>,
+    header: Vec<u8>,
+    done: bool,
+    /// 成员结束后的已见字节数（gzip trailer 最多 8 字节）。
+    post_done: usize,
+}
+
+impl StreamDecoder {
+    pub fn new(kind: StreamDecodeKind) -> Self {
+        Self {
+            kind,
+            d: None,
+            header: Vec::new(),
+            done: false,
+            post_done: 0,
+        }
+    }
+
+    /// 喂入压缩字节，把可解出的明文追加到 `out`。
+    pub fn push(&mut self, input: &[u8], out: &mut Vec<u8>) -> Result<(), String> {
+        if self.done {
+            self.post_done += input.len();
+            if self.post_done > 8 {
+                return Err("multi_member_or_trailing_data_unsupported".into());
+            }
+            return Ok(());
+        }
+        if self.d.is_none() {
+            self.header.extend_from_slice(input);
+            match self.kind {
+                StreamDecodeKind::Gzip => {
+                    let Some(hlen) = parse_gzip_header(&self.header)? else {
+                        if self.header.len() > 64 * 1024 {
+                            return Err("gzip_header_too_large".into());
+                        }
+                        return Ok(());
+                    };
+                    let rest = self.header.split_off(hlen);
+                    self.d = Some(flate2::Decompress::new(false));
+                    let d = self.d.as_mut().expect("just set");
+                    let consumed = feed_deflate(d, &rest, out, &mut self.done)?;
+                    return self.check_trailing(&rest[consumed..]);
+                }
+                StreamDecodeKind::Deflate => {
+                    if self.header.len() < 2 {
+                        return Ok(());
+                    }
+                    // RFC1950 zlib 头：CM=8 且 (CMF<<8|FLG) % 31 == 0
+                    let zlib = (self.header[0] & 0x0f) == 8
+                        && ((self.header[0] as u16) << 8 | self.header[1] as u16)
+                            .is_multiple_of(31);
+                    self.d = Some(flate2::Decompress::new(zlib));
+                    let rest = std::mem::take(&mut self.header);
+                    let d = self.d.as_mut().expect("just set");
+                    let consumed = feed_deflate(d, &rest, out, &mut self.done)?;
+                    return self.check_trailing(&rest[consumed..]);
+                }
+            }
+        }
+        let d = self.d.as_mut().expect("gzip header initialized");
+        let consumed = feed_deflate(d, input, out, &mut self.done)?;
+        self.check_trailing(&input[consumed..])
+    }
+
+    /// 成员结束后检查是否有未消费字节。
+    ///
+    /// gzip 的 raw deflate 在 StreamEnd 时剩下 8 字节 trailer；超过 8 字节是
+    /// 串联多成员（RFC1952 允许），当前实现不支持。**明确报错**，避免静默
+    /// 丢弃第二个成员（调用方会 warn 并截断，至少可见）；不是静默成功。
+    fn check_trailing(&self, rest: &[u8]) -> Result<(), String> {
+        if !self.done {
+            return Ok(());
+        }
+        let allowed = match self.kind {
+            StreamDecodeKind::Gzip => 8,
+            StreamDecodeKind::Deflate => 0,
+        };
+        if rest.len() > allowed {
+            return Err("multi_member_or_trailing_data_unsupported".into());
+        }
+        Ok(())
+    }
+
+    /// 流结束：刷出尾部并校验完整性。
+    pub fn finish(&mut self, out: &mut Vec<u8>) -> Result<(), String> {
+        use flate2::{FlushDecompress, Status};
+        if self.done {
+            return Ok(());
+        }
+        let Some(d) = self.d.as_mut() else {
+            return Err("gzip_header_incomplete".into());
+        };
+        let mut buf = [0u8; 64 * 1024];
+        loop {
+            let out_before = d.total_out();
+            let status = d
+                .decompress(&[], &mut buf, FlushDecompress::Finish)
+                .map_err(|e| format!("decode_error: {e}"))?;
+            let produced = (d.total_out() - out_before) as usize;
+            if d.total_out() as usize > MAX_DECODED_BYTES {
+                return Err(format!("decoded_too_large: >{MAX_DECODED_BYTES}"));
+            }
+            out.extend_from_slice(&buf[..produced]);
+            if matches!(status, Status::StreamEnd) {
+                self.done = true;
+                return Ok(());
+            }
+            if produced == 0 {
+                return Err("decode_truncated".into());
+            }
+        }
+    }
+}
+
+/// 解析 gzip 头（含 FEXTRA/FNAME/FCOMMENT/FHCRC），返回头长度。
+fn parse_gzip_header(b: &[u8]) -> Result<Option<usize>, String> {
+    if b.len() < 10 {
+        return Ok(None);
+    }
+    if b[0] != 0x1f || b[1] != 0x8b || b[2] != 8 {
+        return Err("gzip_bad_header".into());
+    }
+    let flg = b[3];
+    let mut pos = 10usize;
+    if flg & 0x04 != 0 {
+        // FEXTRA
+        if b.len() < pos + 2 {
+            return Ok(None);
+        }
+        let xlen = u16::from_le_bytes([b[pos], b[pos + 1]]) as usize;
+        pos += 2 + xlen;
+        if b.len() < pos {
+            return Ok(None);
+        }
+    }
+    for bit in [0x08u8, 0x10u8] {
+        // FNAME / FCOMMENT：零结尾
+        if flg & bit != 0 {
+            loop {
+                if pos >= b.len() {
+                    return Ok(None);
+                }
+                let c = b[pos];
+                pos += 1;
+                if c == 0 {
+                    break;
+                }
+            }
+        }
+    }
+    if flg & 0x02 != 0 {
+        // FHCRC
+        pos += 2;
+        if b.len() < pos {
+            return Ok(None);
+        }
+    }
+    Ok(Some(pos))
+}
+
+/// raw deflate 增量喂入，返回解出的明文。
+fn feed_deflate(
+    d: &mut flate2::Decompress,
+    mut input: &[u8],
+    out: &mut Vec<u8>,
+    done: &mut bool,
+) -> Result<usize, String> {
+    use flate2::{FlushDecompress, Status};
+    let mut buf = [0u8; 64 * 1024];
+    let mut consumed = 0usize;
+    while !input.is_empty() {
+        let in_before = d.total_in();
+        let out_before = d.total_out();
+        let status = d
+            .decompress(input, &mut buf, FlushDecompress::None)
+            .map_err(|e| format!("decode_error: {e}"))?;
+        let used = (d.total_in() - in_before) as usize;
+        let produced = (d.total_out() - out_before) as usize;
+        if d.total_out() as usize > MAX_DECODED_BYTES {
+            return Err(format!("decoded_too_large: >{MAX_DECODED_BYTES}"));
+        }
+        out.extend_from_slice(&buf[..produced]);
+        input = &input[used..];
+        consumed += used;
+        if matches!(status, Status::StreamEnd) {
+            *done = true;
+            break;
+        }
+        if used == 0 && produced == 0 {
+            return Err("decode_stalled".into());
+        }
+    }
+    Ok(consumed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,6 +365,45 @@ mod tests {
         assert!(is_decodable("x-gzip"));
         let out = decode(&enc, "gzip").unwrap().unwrap();
         assert_eq!(out, orig);
+    }
+
+    #[test]
+    fn streaming_gzip_decodes_split_chunks() {
+        let orig = "data: {\"choices\":[{\"delta\":{\"content\":\"你好\"}}]}\n\n".repeat(64);
+        let enc = gzip(orig.as_bytes());
+        let mut dec = StreamDecoder::new(StreamDecodeKind::Gzip);
+        let mut out = Vec::new();
+        for chunk in enc.chunks(7) {
+            dec.push(chunk, &mut out).unwrap();
+        }
+        dec.finish(&mut out).unwrap();
+        assert_eq!(out, orig.as_bytes());
+    }
+
+    #[test]
+    fn streaming_zlib_decodes_split_chunks() {
+        let orig = "{\"message\":{\"content\":\"电话 13800138000\"}}\n".repeat(32);
+        let enc = zlib(orig.as_bytes());
+        let mut dec = StreamDecoder::new(StreamDecodeKind::Deflate);
+        let mut out = Vec::new();
+        for chunk in enc.chunks(5) {
+            dec.push(chunk, &mut out).unwrap();
+        }
+        dec.finish(&mut out).unwrap();
+        assert_eq!(out, orig.as_bytes());
+    }
+
+    #[test]
+    fn streaming_raw_deflate_decodes_split_chunks() {
+        let orig = "{\"message\":{\"content\":\"裸 deflate 也要能还原\"}}\n".repeat(16);
+        let enc = raw_deflate(orig.as_bytes());
+        let mut dec = StreamDecoder::new(StreamDecodeKind::Deflate);
+        let mut out = Vec::new();
+        for chunk in enc.chunks(3) {
+            dec.push(chunk, &mut out).unwrap();
+        }
+        dec.finish(&mut out).unwrap();
+        assert_eq!(out, orig.as_bytes());
     }
 
     #[test]

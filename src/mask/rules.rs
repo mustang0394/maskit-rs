@@ -53,7 +53,7 @@ fn is_cjk(c: char) -> bool {
     ('\u{4e00}'..='\u{9fff}').contains(&c)
 }
 fn is_secret_value_char(c: char) -> bool {
-    c.is_ascii_alphanumeric() || "!@#$%^&*_~+=-".contains(c)
+    c.is_ascii_alphanumeric() || "!@#$%^&*_~+=.:/#-".contains(c)
 }
 
 // ---------------------------------------------------------------------------
@@ -168,11 +168,23 @@ fn email_l(text: &str, m: Match<'_>, _c: &Captures<'_>) -> bool {
     }
 }
 
-/// 邮箱右边界：后一字符不是 [A-Za-z0-9._%+-]
+/// 邮箱右边界：只有后随字符**会延长邮箱 token** 时才拒绝。
+///
+/// 旧实现把 `.` 一律当拒绝字符，于是英文句号结尾的邮箱
+/// （`alice@example.com. Thanks`）整条漏检。现在区分「标点」与「标识符延续」：
+/// - 后随字母数字 → 拒绝；
+/// - 后随 `._%+-` 且再下一个是字母数字 → 拒绝（`a@b.com_x` 是标识符）；
+/// - 后随 `._%+-` 但后面不是字母数字（或已到结尾）→ 放行（句号/破折号标点）。
 fn email_r(text: &str, m: Match<'_>, _c: &Captures<'_>) -> bool {
-    match text[m.end()..].chars().next() {
-        Some(c) => !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '%' | '+' | '-')),
+    let mut it = text[m.end()..].chars();
+    match it.next() {
         None => true,
+        Some(c) if c.is_ascii_alphanumeric() => false,
+        Some('.' | '_' | '%' | '+' | '-') => !it
+            .next()
+            .map(|next| next.is_ascii_alphanumeric())
+            .unwrap_or(false),
+        Some(_) => true,
     }
 }
 
@@ -194,25 +206,34 @@ fn alpha_l(text: &str, m: Match<'_>, _c: &Captures<'_>) -> bool {
     check_not_preceded_by(text, m, |c| c.is_ascii_alphabetic())
 }
 
-/// 两段原文片段是否**区间重叠**（仅靠文本，不需坐标）。
+/// CONNSTR 被否决时，EMAIL 豁免所需的文本片段：命中串 + 紧随其后的 authority。
 ///
-/// 为什么需要它：CONNSTR 被否决时要豁免其中的 `pass@host`，但 CONNSTR 命中
-/// 形如 `scheme://user:pass@`，而 EMAIL 命中形如 `pass@host` —— 二者是
-/// **后缀/前缀部分重叠**（既非包含也非被包含），所以需要真正的前后缀重叠判定。
-///
-/// 为什么不用坐标：每条规则命中后会 splice 改写 `out`，占位符长度 ≠ 原文，
-/// 后继规则的坐标空间已偏移；用坐标会误判（CONNSTR 同时有命中与否决时
-/// 必然错位）。文本重叠与坐标无关，因此不受影响。
-pub fn overlaps(a: &str, b: &str) -> bool {
-    if a.is_empty() || b.is_empty() {
-        return false;
+/// 仅用 CONNSTR 命中串（`scheme://user:pass@`）不够——真实 userinfo 可能继续
+/// 到 host（`...@host.tld`）。这里把 authority 尾部一并纳入，但豁免只做
+/// **双向包含**判定，绝不能再拿 1 字节前后缀相似度当重叠：后者会让
+/// `mysql://user:pass@` 误豁免同段文本里所有以 `m` 结尾的邮箱（`.com` 全中）。
+pub fn connstr_exempt_text(text: &str, m: Match<'_>) -> String {
+    let start = m.start();
+    let rest = &text[m.end()..];
+    let stop = rest
+        .char_indices()
+        .find(|(_, c)| {
+            c.is_whitespace()
+                || matches!(
+                    c,
+                    '/' | '?' | '#' | ';' | '`' | '"' | '\'' | ',' | '}' | ']' | ')' | '<' | '>'
+                )
+        })
+        .map(|(i, _)| i)
+        .unwrap_or(rest.len());
+    let mut end = m.end() + stop;
+    if end.saturating_sub(start) > 256 {
+        end = start + 256;
+        while end > start && !text.is_char_boundary(end) {
+            end -= 1;
+        }
     }
-    if a.contains(b) || b.contains(a) {
-        return true;
-    }
-    let (ab, bb) = (a.as_bytes(), b.as_bytes());
-    let max = ab.len().min(bb.len());
-    (1..=max).any(|k| ab[ab.len() - k..] == bb[..k] || bb[bb.len() - k..] == ab[..k])
+    text[start..end].to_string()
 }
 
 /// 钉钉 AppKey 后缀必须含至少一位数字（下沉 `(?=[a-z0-9]*[0-9])`；
@@ -264,25 +285,42 @@ fn secret_r(text: &str, _m: Match<'_>, caps: &Captures<'_>) -> bool {
     }
 }
 
-/// SECRET 值域断言 `(?=[A-Za-z0-9!@#$%^&*_~+=-]*[0-9!@#$%^&*])`：
-/// 值必须含数字或特殊符号（纯字母标识符不误报）。
+/// SECRET 值域断言：值必须像口令，而不是普通标识符。
+///
+/// 接受两类：
+/// 1. 含数字或强符号（`!@#$%^&*`）；
+/// 2. 纯小写 + `.`/`_`/`-` 分隔的形态（`correct.horse.battery`、`my_pass`）——
+///    这类没有数字但显然不是代码标识符。
+///
+/// 拒绝 `ModelUtils.toStringSafe` 这类含大写的点分表达式。
 fn secret_value_charset(text: &str, m: Match<'_>, caps: &Captures<'_>) -> bool {
     let value = caps.get(1).unwrap().as_str();
     let _ = (text, m);
-    // 值字符类内的字符必须含 [0-9!@#$%^&*]
-    value
+    if value
         .chars()
         .any(|c| c.is_ascii_digit() || "!@#$%^&*".contains(c))
+    {
+        return true;
+    }
+    value.chars().count() >= 8
+        && value.chars().any(|c| matches!(c, '.' | '_' | '-'))
+        && value
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || matches!(c, '.' | '_' | '-'))
 }
 
-/// SECRET 键名左边界：[A-Za-z0-9_.]（英文关键词）
+/// SECRET 键名左边界：不得紧跟在字母数字之后。
+///
+/// `_`/`.` 必须放行：`DB_PASSWORD=`、`db_password:`、`client_secret=`、
+/// `access_token=` 是配置/.env 里最常见的键名形态；旧实现把它们全部否决，
+/// 导致开启 SECRET 后仍漏检。
 fn secret_key_l(text: &str, m: Match<'_>, caps: &Captures<'_>) -> bool {
     let _ = caps;
     if m.start() == 0 {
         return true;
     }
     match text[..m.start()].chars().next_back() {
-        Some(c) => !(c.is_ascii_alphanumeric() || c == '_' || c == '.'),
+        Some(c) => !c.is_ascii_alphanumeric(),
         None => true,
     }
 }
@@ -717,7 +755,7 @@ pub static RULES: Lazy<Vec<Rule>> = Lazy::new(|| {
             exempt = false,
             avoid = false,
             markers = ["aws", "AWS"],
-            ci = false
+            ci = true
         ),
         // JWT
         rule!(
@@ -739,7 +777,7 @@ pub static RULES: Lazy<Vec<Rule>> = Lazy::new(|| {
             exempt = false,
             avoid = false,
             markers = ["Bearer", "bearer", "BEARER"],
-            ci = false
+            ci = true
         ),
         // SECRET 键值对（值组 1；左边界/值域/右边界/`(?!/)` 全部下沉）
         // 键名就是关键词本身（左右边界由 secret_key_l/r 下沉），不贪吃前后缀
@@ -749,7 +787,7 @@ pub static RULES: Lazy<Vec<Rule>> = Lazy::new(|| {
                 r"(?i)(?:password|passwd|pwd|secret|token|api[_\-]?key|access[_\-]?key|private[_\-]?key",
                 r"|(?:密码|口令|令牌|密钥|秘钥|密匙|凭据|凭证|私钥|授权码|访问密钥|接口密钥))",
                 r#"[\"'“”「」]?\s*[:=：＝]\s*[\"'“”「」]?"#,
-                r"([A-Za-z0-9!@#$%^&*_~+=\-]{6,64})"
+                r"([A-Za-z0-9!@#$%^&*_~+=.:/#\-]{6,64})"
             ),
             1,
             [
@@ -779,7 +817,7 @@ pub static RULES: Lazy<Vec<Rule>> = Lazy::new(|| {
         // ① 前缀（+86/0086/(86)）+ 裸 11 位  ② 裸 11 位  ③ 带分隔（- 或空格，单种）
         rule!(
             "PHONE",
-            r"(?:\+?86|0086|[\(（]\+?86[\)）])[\s\-]?1[3-9][0-9][0-9]{8}|1[3-9][0-9][0-9]{8}|1[3-9][0-9][\- ][0-9]{4}[\- ][0-9]{4}|1[3-9][0-9][\- ][0-9]{4}[ ][0-9]{4}|1[3-9][0-9][ ][0-9]{4}[\- ][0-9]{4}|1[3-9][0-9][ ][0-9]{4}[ ][0-9]{4}",
+            r"(?:\+?86|0086|[\(（]\+?86[\)）])[ \t\-]?1[3-9][0-9][0-9]{8}|1[3-9][0-9][0-9]{8}|1[3-9][0-9][\- ][0-9]{4}[\- ][0-9]{4}|1[3-9][0-9][\- ][0-9]{4}[ ][0-9]{4}|1[3-9][0-9][ ][0-9]{4}[\- ][0-9]{4}|1[3-9][0-9][ ][0-9]{4}[ ][0-9]{4}",
             0,
             [phone_plain_l, phone_sep_consistent, phone_r],
             exempt = false,
@@ -810,7 +848,7 @@ pub static RULES: Lazy<Vec<Rule>> = Lazy::new(|| {
         // （只有带 `+86`/`86`/`(86)` 前缀才命中）—— 默认开启的规则实际形同虚设。
         rule!(
             "LANDLINE",
-            r"(?:(?:\+?86|0086|[\(（]\+?86[\)）])[\s\-]?)?(?:[\(（]0(?:10|2[0-9]|[3-9][0-9]{2})[\)）][\s\-]?[2-9][0-9]{6,7}|0(?:10|2[0-9]|[3-9][0-9]{2})[\-\s][2-9][0-9]{6,7})(?:[\-\s]?(?:转|分机|ext|x|#)[\-\s]?[0-9]{1,5})?",
+            r"(?:(?:\+?86|0086|[\(（]\+?86[\)）])[ \t\-]?)?(?:[\(（]0(?:10|2[0-9]|[3-9][0-9]{2})[\)）][ \t\-]?[2-9][0-9]{6,7}|0(?:10|2[0-9]|[3-9][0-9]{2})[\- \t][2-9][0-9]{6,7})(?:[\- \t]?(?:转|分机|ext|x|#)[\- \t]?[0-9]{1,5})?",
             0,
             [landline_l, landline_r],
             exempt = false,
@@ -965,10 +1003,10 @@ pub static RULES: Lazy<Vec<Rule>> = Lazy::new(|| {
             markers = [],
             ci = false
         ),
-        // MAC（Python 同款 6 组 5 分隔符；分隔符一致性由正则展开锁定单一分隔符形态）
+        // MAC（6 组；分隔符必须全程一致：冒号版或短横版，不允许混用）
         rule!(
             "MAC",
-            r"[0-9A-Fa-f]{2}[:-][0-9A-Fa-f]{2}[:-][0-9A-Fa-f]{2}[:-][0-9A-Fa-f]{2}[:-][0-9A-Fa-f]{2}[:-][0-9A-Fa-f]{2}",
+            r"(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}|(?:[0-9A-Fa-f]{2}-){5}[0-9A-Fa-f]{2}",
             0,
             [mac_l, mac_r],
             exempt = false,
@@ -1490,10 +1528,91 @@ mod tests {
         assert!(!mask_hits("EMAIL", "收件人:bob@corp.cn").is_empty());
     }
 
+    /// C2 回归：邮箱后接英文句号（句子标点）不得整条漏检；
+    /// 但 `._%+-` 后接字母数字（标识符延续）仍必须拒绝。
+    #[test]
+    fn email_trailing_sentence_period_is_masked() {
+        assert_eq!(
+            mask_hits("EMAIL", "联系 alice@example.com. 谢谢"),
+            vec!["alice@example.com"]
+        );
+        assert_eq!(
+            mask_hits("EMAIL", "alice@example.com."),
+            vec!["alice@example.com"]
+        );
+        assert!(mask_hits("EMAIL", "alice@example.com_x").is_empty());
+        assert!(mask_hits("EMAIL", "a@b.com-1").is_empty());
+    }
+
+    /// C3 回归：PHONE/LANDLINE 的 `\s` 曾匹配换行，跨行拼出号码并吞掉换行。
+    #[test]
+    fn phone_and_landline_do_not_cross_lines() {
+        // 前缀后的换行不能被吞；裸号码本身仍应识别
+        assert_eq!(mask_hits("PHONE", "+86\n13812345678"), vec!["13812345678"]);
+        assert_eq!(
+            mask_hits("PHONE", "+86 13812345678"),
+            vec!["+86 13812345678"]
+        );
+        assert!(mask_hits("LANDLINE", "010\n62345678").is_empty());
+        assert_eq!(mask_hits("LANDLINE", "010-62345678"), vec!["010-62345678"]);
+    }
+
+    /// C5 回归：`_`/`.` 前缀的键名与含 `.`/`:`/`#` 的口令值都必须命中。
+    #[test]
+    fn secret_matches_env_style_keys_and_dotted_values() {
+        assert_eq!(
+            mask_hits("SECRET", "DB_PASSWORD=Hn8x!qW2zLm9pR"),
+            vec!["Hn8x!qW2zLm9pR"]
+        );
+        assert_eq!(
+            mask_hits("SECRET", "db_password: Passw0rd.suffix"),
+            vec!["Passw0rd.suffix"]
+        );
+        assert_eq!(
+            mask_hits("SECRET", "password = correct.horse.battery"),
+            vec!["correct.horse.battery"]
+        );
+        // 纯字母标识符仍不得误报
+        assert!(mask_hits("SECRET", "password = correcthorse").is_empty());
+    }
+
+    /// C5 回归：Bearer/AWS Secret 的 `(?i)` 必须传递到 marker 预筛，
+    /// 混合大小写不能整条被 `may_hit` 跳过。
+    #[test]
+    fn mixed_case_bearer_and_aws_markers_hit() {
+        assert_eq!(
+            mask_hits(
+                "TOKEN",
+                "Authorization: BeArEr abcdefghijklmnopqrstuvwxyz1234"
+            ),
+            vec!["abcdefghijklmnopqrstuvwxyz1234"]
+        );
+        assert_eq!(
+            mask_hits(
+                "ACCESS_KEY",
+                "Aws_Secret_Access_Key=Abcdefghijklmnopqrstuvwxyz0123456789ABCD"
+            ),
+            vec!["Abcdefghijklmnopqrstuvwxyz0123456789ABCD"]
+        );
+    }
+
+    /// C6 回归：MAC 分隔符必须全程一致，混合写法不是 MAC。
+    #[test]
+    fn mac_requires_consistent_separator() {
+        assert!(mask_hits("MAC", "00:11-22:33-44:55").is_empty());
+        assert_eq!(
+            mask_hits("MAC", "00:11:22:33:44:55"),
+            vec!["00:11:22:33:44:55"]
+        );
+        assert_eq!(
+            mask_hits("MAC", "00-11-22-33-44-55"),
+            vec!["00-11-22-33-44-55"]
+        );
+    }
+
     /// P3：TLD 采用同质交替，中文正文不得被粘进邮箱。
     #[test]
     fn email_tld_stops_at_script_boundary() {
-        // 尾部中文正文必须保留
         assert_eq!(
             mask_hits("EMAIL", "zhangsan@qq.com请查收"),
             vec!["zhangsan@qq.com"]
@@ -1523,19 +1642,19 @@ mod tests {
         );
     }
 
-    /// `overlaps`：前缀/后缀部分重叠必须判真（CONNSTR ↔ EMAIL 豁免依赖它）。
+    /// CONNSTR 豁免片段只覆盖「匹配串 + authority」，不能把同段文本里
+    /// 不相关的邮箱也算进去（旧 1 字节 overlaps 会误豁免所有 `.com`）。
     #[test]
-    fn overlaps_semantics() {
-        // CONNSTR 命中 vs EMAIL 命中：后缀/前缀部分重叠
-        assert!(overlaps("redis://user:password@", "password@example.com"));
-        assert!(overlaps("password@example.com", "redis://user:password@"));
-        // 包含
-        assert!(overlaps("abcdef", "bcd"));
-        assert!(overlaps("bcd", "abcdef"));
-        // 不相干
-        assert!(!overlaps("abcdef", "xyz"));
-        assert!(!overlaps("", "abc"));
-        assert!(!overlaps("abc", ""));
+    fn connstr_exempt_text_covers_authority_only() {
+        let text = "mysql://user:pass@host.example:3306/db 联系 alice@example.com";
+        let rule = RULES.iter().find(|r| r.label == "CONNSTR").unwrap();
+        let m = rule.rx.find(text).unwrap();
+        let ex = connstr_exempt_text(text, m);
+        assert!(ex.contains("host.example"), "应包含 authority: {ex}");
+        assert!(
+            !ex.contains("alice@example.com"),
+            "不得把后续无关邮箱纳入豁免: {ex}"
+        );
     }
 
     /// PRIVATE_KEY 必须覆盖 PKCS#8 **加密**私钥（`ENCRYPTED PRIVATE KEY`）。

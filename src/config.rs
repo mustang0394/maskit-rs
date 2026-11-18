@@ -8,7 +8,8 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::RwLock;
+use std::sync::{Mutex, RwLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// 凭据类标签（对齐 Python `credential_labels.CREDENTIAL_LABELS`）。
 /// 这些标签的原文**永不落库**，只记 preview + sha256 摘要 + 长度。
@@ -285,10 +286,6 @@ pub struct MaskConfig {
     /// NER 预留位（PLAN §11：一期不实现，置 true 时告警）
     #[serde(default)]
     pub ner_enabled: bool,
-    /// 凭据/自定义词命中记录原文（对齐 Python record_plaintext_words；
-    /// 凭据类无论如何永不落库）
-    #[serde(default = "default_true")]
-    pub record_plaintext_words: bool,
     /// 多模态 / 编码载荷（base64）跳过策略（C 方案：解析前外置 + 原字节拼回）
     #[serde(default)]
     pub multimodal_blob: MultimodalBlobConfig,
@@ -329,7 +326,6 @@ impl Default for MaskConfig {
             session_ttl: default_session_ttl(),
             mapping_ttl: default_mapping_ttl(),
             ner_enabled: false,
-            record_plaintext_words: true,
             multimodal_blob: Default::default(),
         }
     }
@@ -380,6 +376,13 @@ pub struct CommandBlockConfig {
     pub allow_patterns: Vec<String>,
     #[serde(default)]
     pub patterns: Vec<CmdPattern>,
+    /// 内置规则播种版本：老配置缺省为 1，normalized 时补齐 v2 新增规则。
+    #[serde(default = "default_builtin_seed_version")]
+    pub builtin_seed_version: u32,
+}
+
+fn default_builtin_seed_version() -> u32 {
+    1
 }
 
 fn default_cmd_channels() -> Vec<String> {
@@ -388,7 +391,7 @@ fn default_cmd_channels() -> Vec<String> {
 
 impl Default for CommandBlockConfig {
     fn default() -> Self {
-        // **开箱即用**：首次启动即播种 7 条内置危害命令规则
+        // **开箱即用**：首次启动即播种 8 条内置危害命令规则
         // （对齐 Python `panel._normalize_command_block`：`patterns` 键缺失时灌种子，
         //  键存在（哪怕是 `[]`）才尊重用户显式清空）。
         //
@@ -399,6 +402,7 @@ impl Default for CommandBlockConfig {
             channels: default_cmd_channels(),
             allow_patterns: Default::default(),
             patterns: crate::cmdblock::default_builtin_patterns(),
+            builtin_seed_version: 2,
         }
     }
 }
@@ -649,11 +653,8 @@ impl Config {
         let default_signals = [
             "error_leak",
             "identity_swap",
-            "tool_call_rewrite",
             "sse_anomaly",
             "response_poison",
-            "cross_request_pollution",
-            "credential_echo",
             "dangerous_action",
         ];
         for s in default_signals {
@@ -663,12 +664,43 @@ impl Config {
     }
 }
 
+/// 老配置迁移（仅在启动加载时执行一次，不能在 `normalized()` 里做）：
+/// v2 新增 `--no-preserve-root` 规则。
+///
+/// 放进 `normalized()` 会让任何不回写 `builtin_seed_version` 的 PUT/PATCH
+/// 把用户删掉的规则重新塞回去；显式 `patterns: []` 也必须尊重，不能借迁移
+/// 复活内置规则。
+fn migrate_builtin_rules(c: &mut Config) -> bool {
+    if c.command_block.builtin_seed_version >= 2 {
+        return false;
+    }
+    if !c.command_block.patterns.is_empty()
+        && !c
+            .command_block
+            .patterns
+            .iter()
+            .any(|p| p.id == "builtin-rm-root-nopreserve")
+    {
+        if let Some(p) = crate::cmdblock::default_builtin_patterns()
+            .into_iter()
+            .find(|p| p.id == "builtin-rm-root-nopreserve")
+        {
+            c.command_block.patterns.push(p);
+        }
+    }
+    c.command_block.builtin_seed_version = 2;
+    true
+}
+
 // ---------------------------------------------------------------------------
 // 运行时配置中心（Arc<RwLock> + 热更新通知）
 // ---------------------------------------------------------------------------
 
 pub struct ConfigCenter {
     inner: RwLock<Config>,
+    /// 配置写入串行化锁：`update`/`update_with`/`patch` 全部经此排队，
+    /// 避免 get→改→整体 update 的读-改-写丢更新；写盘也在锁内完成。
+    mutate: Mutex<()>,
     /// 原子镜像：热路径免锁读取的少量字段
     fail_closed: AtomicBool,
     paused: AtomicBool,
@@ -681,36 +713,92 @@ impl ConfigCenter {
     pub fn load_or_init(
         data_dir: &Path,
     ) -> std::io::Result<(std::sync::Arc<Self>, Vec<ConfigWarning>)> {
+        let created = !data_dir.exists();
         fs::create_dir_all(data_dir)?;
+        if created {
+            restrict_dir(data_dir);
+        }
         let path = data_dir.join("config.json");
+        // 是否允许把内存中的默认配置写回磁盘。
+        // 解析失败且无法备份原文件时**绝不覆盖**，避免把用户的配置冲掉。
+        let mut may_write = true;
         let (mut cfg, mut warnings) = if path.exists() {
             let raw = fs::read_to_string(&path)?;
             match serde_json::from_str::<Config>(&raw) {
                 Ok(c) => (c, Vec::new()),
-                Err(e) => (
-                    Config::default(),
-                    vec![ConfigWarning(format!(
-                        "config.json 解析失败（{}），已回退默认配置",
-                        e
-                    ))],
-                ),
+                Err(e) => {
+                    // B4：坏配置先改名保留，rename 成功才允许写回默认配置。
+                    let bad = data_dir.join(format!("config.json.bad.{}", now_unix()));
+                    match fs::rename(&path, &bad) {
+                        Ok(()) => (
+                            Config::default(),
+                            vec![ConfigWarning(format!(
+                                "config.json 解析失败（{}），原文件已备份为 {}，已使用默认配置",
+                                e,
+                                bad.display()
+                            ))],
+                        ),
+                        Err(re) => {
+                            may_write = false;
+                            (
+                                Config::default(),
+                                vec![ConfigWarning(format!(
+                                    "config.json 解析失败（{}），且备份失败（{}），已使用内存默认配置且未覆盖原文件",
+                                    e, re
+                                ))],
+                            )
+                        }
+                    }
+                }
             }
         } else {
-            let c = Config::default();
-            // 生成默认配置文件
-            let body = serde_json::to_string_pretty(&c).unwrap_or_else(|_| "{}".into());
-            fs::write(&path, body)?;
-            (c, Vec::new())
+            (Config::default(), Vec::new())
         };
         warnings.extend(cfg.validate());
+        let migrated = migrate_builtin_rules(&mut cfg);
         cfg = cfg.normalized();
-        if cfg.panel_token.is_empty() {
+        // 解析失败且无法备份原文件：继续启动只会生成一个无法落盘、也无法从磁盘
+        // 读取的令牌（所有管理 API 401 且每次重启都变）。直接报错退出，让用户先
+        // 修复数据目录权限；绝不覆盖原文件。
+        if !may_write {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "{} 解析失败且无法改名备份，拒绝覆盖；请修复数据目录权限后重启",
+                    path.display()
+                ),
+            ));
+        }
+        // 空值/非法值一律重新生成；不把令牌打印到日志（避免令牌进入日志/截图）。
+        if !is_valid_panel_token(&cfg.panel_token) {
+            let why = if cfg.panel_token.is_empty() {
+                "panel_token 未设置"
+            } else {
+                "panel_token 含非 ASCII 或空白字符"
+            };
             let tok = generate_token();
-            tracing::warn!(token = %tok, "panel_token 未设置，已生成随机令牌（重启会变，请在控制台设置固定值）");
+            tracing::warn!(
+                "{}，已生成随机令牌并写入 config.json（请从数据目录读取）",
+                why
+            );
             cfg.panel_token = tok;
-            // 回写，保证重启后令牌稳定
-            let body = serde_json::to_string_pretty(&cfg).unwrap_or_else(|_| "{}".into());
-            let _ = fs::write(&path, body);
+            if let Err(e) = write_config_private(&path, &cfg) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!(
+                        "panel_token 已生成但无法写入 {}（{}）；继续启动会导致控制台令牌不可见且每次重启变化，已中止",
+                        path.display(),
+                        e
+                    ),
+                ));
+            }
+        }
+        if migrated {
+            if let Err(e) = write_config_private(&path, &cfg) {
+                warnings.push(ConfigWarning(format!(
+                    "内置命令规则迁移已生效，但写入 config.json 失败：{e}"
+                )));
+            }
         }
         let center = std::sync::Arc::new(Self {
             fail_closed: AtomicBool::new(cfg.fail_closed),
@@ -718,6 +806,7 @@ impl ConfigCenter {
             max_body_bytes: AtomicU64::new(cfg.mask.max_body_bytes as u64),
             version: AtomicU64::new(1),
             inner: RwLock::new(cfg.clone()),
+            mutate: Mutex::new(()),
             data_dir: data_dir.to_path_buf(),
         });
         // 启动时同步一次 blob 策略镜像（响应侧还原链路使用）。
@@ -726,7 +815,7 @@ impl ConfigCenter {
     }
 
     pub fn get(&self) -> Config {
-        self.inner.read().unwrap().clone()
+        self.inner.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     #[allow(dead_code)] // M9+ 使用
@@ -734,16 +823,83 @@ impl ConfigCenter {
         &self.data_dir
     }
 
-    /// 整体替换配置（POST /config）。校验失败的字段回退默认并返回告警。
+    /// 整体替换配置（PUT /config）。串行化写入，避免并发覆盖。
     pub fn update(&self, new_cfg: Config) -> Vec<ConfigWarning> {
+        let _guard = self.lock_mutate();
+        self.apply_locked(new_cfg)
+    }
+
+    /// 在**当前配置**上做局部修改（pause/resume/rotate/patch 等）。
+    ///
+    /// 锁内完成“读→改→写→持久化”，避免 get→改→整体 update 的丢更新。
+    pub fn update_with<F>(&self, f: F) -> Vec<ConfigWarning>
+    where
+        F: FnOnce(&mut Config),
+    {
+        let _guard = self.lock_mutate();
+        let mut cfg = self.get();
+        f(&mut cfg);
+        self.apply_locked(cfg)
+    }
+
+    fn update_with_try<F>(&self, f: F) -> Result<Vec<ConfigWarning>, String>
+    where
+        F: FnOnce(&mut Config) -> Result<(), String>,
+    {
+        let _guard = self.lock_mutate();
+        let mut cfg = self.get();
+        f(&mut cfg)?;
+        Ok(self.apply_locked(cfg))
+    }
+
+    fn lock_mutate(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.mutate.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// 调用方必须已持有 `mutate` 锁。
+    fn apply_locked(&self, mut new_cfg: Config) -> Vec<ConfigWarning> {
         let mut warnings = new_cfg.validate();
-        let cfg = new_cfg.normalized();
+        let current = self.get();
+        // 端口/bind 只在启动时绑定监听器；热更新无法 rebind，必须明确告警。
+        if current.server.port != new_cfg.server.port || current.server.bind != new_cfg.server.bind
         {
-            let mut w = self.inner.write().unwrap();
-            *w = cfg;
+            warnings.push(ConfigWarning(
+                "server.port/bind 变更需重启进程后生效（当前监听地址不变）".into(),
+            ));
         }
-        self.sync_atomics();
-        self.persist();
+        // panel_token 为空/非法时保留旧值：否则 auth 中间件会拒绝全部请求，
+        // 控制台被锁死且无法通过 API 恢复。
+        let token = new_cfg.panel_token.trim().to_string();
+        if token.is_empty() {
+            new_cfg.panel_token = current.panel_token.clone();
+            warnings.push(ConfigWarning("panel_token 不能为空，已保留原令牌".into()));
+        } else if !is_valid_panel_token(&token) {
+            new_cfg.panel_token = current.panel_token.clone();
+            warnings.push(ConfigWarning(
+                "panel_token 只能包含可打印 ASCII 且不含空白，已保留原令牌".into(),
+            ));
+        } else {
+            new_cfg.panel_token = token;
+        }
+        let mut cfg = new_cfg.normalized();
+        // 单调版本：旧客户端/PUT 不回写该字段时 serde 缺省为 1，若直接落盘，
+        // 下次启动会再次执行 v2 迁移，把用户删掉的内置规则复活。
+        cfg.command_block.builtin_seed_version = cfg
+            .command_block
+            .builtin_seed_version
+            .max(current.command_block.builtin_seed_version);
+        {
+            let mut w = self.inner.write().unwrap_or_else(|e| e.into_inner());
+            *w = cfg.clone();
+        }
+        // 一律消费快照：sync_atomics/persist 不再回读 inner。
+        // 这既避免未来的 RwLock 重入死锁，也让写盘内容与原子镜像严格同源。
+        self.sync_atomics(&cfg);
+        if !self.persist_snapshot(&cfg) {
+            warnings.push(ConfigWarning(
+                "配置已在内存生效，但写入 config.json 失败；重启后会回退到磁盘旧配置".into(),
+            ));
+        }
         warnings.extend(self.hot_apply_warnings());
         self.version.fetch_add(1, Ordering::Release);
         warnings
@@ -783,73 +939,69 @@ impl ConfigCenter {
         if segs.is_empty() {
             return Err("patch path 不能为空".into());
         }
-        let segs: Vec<&str> = segs.iter().map(String::as_str).collect();
-        let shown = segs.join(".");
-        let mut cfg_json = serde_json::to_value(self.get()).map_err(|e| e.to_string())?;
-        // 构造 JSON Pointer（`~` → `~0`，`/` → `~1` 转义）
-        let pointer = format!(
-            "/{}",
-            segs.iter()
-                .map(|s| s.replace('~', "~0").replace('/', "~1"))
-                .collect::<Vec<_>>()
-                .join("/")
-        );
-        // 顶层键允许不存在（新建）；中间键必须存在，否则报错（避免静默建错层级）
-        if segs.len() == 1 {
-            let obj = cfg_json
-                .as_object_mut()
-                .ok_or_else(|| "配置根不是对象".to_string())?;
-            if value.is_null() {
-                obj.remove(segs[0]);
+        let segs_owned: Vec<String> = segs.to_vec();
+        self.update_with_try(move |cfg| {
+            let segs: Vec<&str> = segs_owned.iter().map(String::as_str).collect();
+            let shown = segs.join(".");
+            let mut cfg_json = serde_json::to_value(&*cfg).map_err(|e| e.to_string())?;
+            // 顶层键允许不存在（新建）；中间键必须存在，否则报错（避免静默建错层级）
+            if segs.len() == 1 {
+                let obj = cfg_json
+                    .as_object_mut()
+                    .ok_or_else(|| "配置根不是对象".to_string())?;
+                if value.is_null() {
+                    obj.remove(segs[0]);
+                } else {
+                    obj.insert(segs[0].to_string(), value);
+                }
             } else {
-                obj.insert(segs[0].to_string(), value);
+                let parent_ptr = format!(
+                    "/{}",
+                    segs[..segs.len() - 1]
+                        .iter()
+                        .map(|s| s.replace('~', "~0").replace('/', "~1"))
+                        .collect::<Vec<_>>()
+                        .join("/")
+                );
+                let parent = cfg_json
+                    .pointer_mut(&parent_ptr)
+                    .ok_or_else(|| format!("路径 {shown} 的父级不存在"))?;
+                let obj = parent
+                    .as_object_mut()
+                    .ok_or_else(|| format!("路径 {shown} 的父级不是对象"))?;
+                if value.is_null() {
+                    obj.remove(segs[segs.len() - 1]);
+                } else {
+                    obj.insert(segs[segs.len() - 1].to_string(), value);
+                }
             }
-        } else {
-            let parent_ptr = format!(
-                "/{}",
-                segs[..segs.len() - 1]
-                    .iter()
-                    .map(|s| s.replace('~', "~0").replace('/', "~1"))
-                    .collect::<Vec<_>>()
-                    .join("/")
-            );
-            let parent = cfg_json
-                .pointer_mut(&parent_ptr)
-                .ok_or_else(|| format!("路径 {shown} 的父级不存在"))?;
-            let obj = parent
-                .as_object_mut()
-                .ok_or_else(|| format!("路径 {shown} 的父级不是对象"))?;
-            if value.is_null() {
-                obj.remove(segs[segs.len() - 1]);
-            } else {
-                obj.insert(segs[segs.len() - 1].to_string(), value);
-            }
-        }
-        let _ = pointer;
-        let new_cfg: Config =
-            serde_json::from_value(cfg_json).map_err(|e| format!("补丁后配置非法: {e}"))?;
-        Ok(self.update(new_cfg))
+            *cfg = serde_json::from_value(cfg_json).map_err(|e| format!("补丁后配置非法: {e}"))?;
+            Ok(())
+        })
     }
 
-    /// 持久化当前配置到磁盘（原子写：tmp + rename，避免同路径覆盖写坏文件）。
+    /// 持久化当前配置（外部入口；内部写盘走 `persist_snapshot`）。
     pub fn persist(&self) {
+        let _guard = self.lock_mutate();
         let cfg = self.get();
-        let body = match serde_json::to_string_pretty(&cfg) {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::error!("配置序列化失败: {e}");
-                return;
-            }
-        };
+        let _ = self.persist_snapshot(&cfg);
+    }
+
+    /// 原子写：唯一 tmp → 0600 → fsync → rename。
+    ///
+    /// 并发写不会共用同一个 tmp 文件；即使 rename 失败，也不会覆盖原文件。
+    fn persist_snapshot(&self, cfg: &Config) -> bool {
         let path = self.data_dir.join("config.json");
-        let tmp = self.data_dir.join(".config.json.tmp");
-        if let Err(e) = fs::write(&tmp, body).and_then(|_| fs::rename(&tmp, &path)) {
-            tracing::error!("配置写盘失败: {e}");
+        match write_config_private(&path, cfg) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::error!("配置写盘失败: {e}");
+                false
+            }
         }
     }
 
-    fn sync_atomics(&self) {
-        let cfg = self.get();
+    fn sync_atomics(&self, cfg: &Config) {
         self.fail_closed.store(cfg.fail_closed, Ordering::Release);
         self.paused.store(cfg.paused, Ordering::Release);
         self.max_body_bytes
@@ -891,6 +1043,61 @@ fn generate_token() -> String {
     (0..24)
         .map(|_| CHARS[rng.gen_range(0..CHARS.len())] as char)
         .collect()
+}
+
+/// 面板令牌必须能安全放进 `Authorization: Bearer` / `x-panel-token` 头。
+///
+/// 只接受可打印 ASCII（拒绝空白、控制字符、中文等）——否则
+/// `HeaderValue::to_str()` 失败会让所有管理 API 返回 401，把控制台锁死。
+fn is_valid_panel_token(t: &str) -> bool {
+    !t.is_empty() && t.bytes().all(|b| b.is_ascii_graphic())
+}
+
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// 原子写配置文件：唯一临时名 + 0600 + fsync + rename。
+fn write_config_private(path: &Path, cfg: &Config) -> std::io::Result<()> {
+    use std::io::Write;
+    let body = serde_json::to_string_pretty(cfg)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let tmp = dir.join(format!(
+        ".config.json.{}.{}.tmp",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(&tmp)?;
+    f.write_all(body.as_bytes())?;
+    f.sync_all()?;
+    drop(f);
+    fs::rename(&tmp, path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
+}
+
+fn restrict_dir(dir: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+    }
 }
 
 /// 按 '.' 分段路径从 JSON 值中取子值（保留给测试与诊断用）。
@@ -1021,14 +1228,142 @@ mod tests {
         let (center2, _) = ConfigCenter::load_or_init(dir.path()).unwrap();
         assert_eq!(center2.get().panel_token.len(), 512);
 
-        // 留空仍然走自动生成
+        // 留空：保留旧令牌并告警（不能把 auth 锁死）
+        let before = center2.get().panel_token;
         let mut cfg = center2.get();
         cfg.panel_token = String::new();
         let w = center2.update(cfg);
-        assert!(
-            w.is_empty() || !w.iter().any(|x| x.0.contains("panel_token")),
-            "空令牌不应再触发长度告警"
+        assert_eq!(
+            center2.get().panel_token,
+            before,
+            "空令牌必须保留原令牌，不能把自己锁在控制台外"
         );
+        assert!(
+            w.iter().any(|x| x.0.contains("panel_token")),
+            "空令牌应产生显式告警"
+        );
+    }
+
+    #[test]
+    fn non_ascii_panel_token_rejected_and_old_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let (center, _) = ConfigCenter::load_or_init(dir.path()).unwrap();
+        let before = center.get().panel_token;
+        let mut cfg = center.get();
+        cfg.panel_token = "中文令牌".to_string();
+        let w = center.update(cfg);
+        assert_eq!(center.get().panel_token, before);
+        assert!(w.iter().any(|x| x.0.contains("panel_token")));
+        // 重启也不能把非 ASCII 令牌写进配置
+        let (center2, _) = ConfigCenter::load_or_init(dir.path()).unwrap();
+        assert!(center2
+            .get()
+            .panel_token
+            .bytes()
+            .all(|b| b.is_ascii_graphic()));
+    }
+
+    #[test]
+    fn corrupt_config_is_backed_up_not_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.json"), "{ this is not json").unwrap();
+        let (center, warnings) = ConfigCenter::load_or_init(dir.path()).unwrap();
+        assert!(!center.get().panel_token.is_empty());
+        assert!(warnings.iter().any(|w| w.0.contains("备份")));
+        let bads: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("config.json.bad.")
+            })
+            .collect();
+        assert_eq!(bads.len(), 1, "坏配置应保留一份 .bad.<ts> 备份");
+        // 新配置已落盘且可解析
+        let raw = std::fs::read_to_string(dir.path().join("config.json")).unwrap();
+        let cfg: Config = serde_json::from_str(&raw).unwrap();
+        assert!(!cfg.panel_token.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_file_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let _ = ConfigCenter::load_or_init(dir.path()).unwrap();
+        let mode = std::fs::metadata(dir.path().join("config.json"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "config.json 含 panel_token，必须是 0600");
+    }
+
+    #[test]
+    fn concurrent_update_with_keeps_all_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let (center, _) = ConfigCenter::load_or_init(dir.path()).unwrap();
+        let mut handles = Vec::new();
+        for i in 0..8 {
+            let c = center.clone();
+            handles.push(std::thread::spawn(move || {
+                c.update_with(|cfg| {
+                    cfg.mask
+                        .custom_words
+                        .insert(format!("并发词{i}"), "ORG".to_string());
+                });
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        let cfg = center.get();
+        for i in 0..8 {
+            assert!(
+                cfg.mask.custom_words.contains_key(&format!("并发词{i}")),
+                "并发 update_with 不应丢字段: 并发词{i}"
+            );
+        }
+        // 文件仍是完整 JSON
+        let raw = std::fs::read_to_string(dir.path().join("config.json")).unwrap();
+        let _: Config = serde_json::from_str(&raw).unwrap();
+    }
+
+    #[test]
+    fn builtin_migration_adds_rule_once_and_respects_explicit_empty() {
+        let mut c = Config::default();
+        c.command_block.patterns.clear();
+        c.command_block.builtin_seed_version = 1;
+        assert!(super::migrate_builtin_rules(&mut c));
+        assert_eq!(c.command_block.builtin_seed_version, 2);
+        assert!(
+            c.command_block.patterns.is_empty(),
+            "显式清空不得被迁移复活"
+        );
+        assert!(!super::migrate_builtin_rules(&mut c), "已迁移不得重复执行");
+
+        let mut c2 = Config::default();
+        c2.command_block
+            .patterns
+            .retain(|p| p.id != "builtin-rm-root-nopreserve");
+        c2.command_block.builtin_seed_version = 1;
+        assert!(super::migrate_builtin_rules(&mut c2));
+        assert!(c2
+            .command_block
+            .patterns
+            .iter()
+            .any(|p| p.id == "builtin-rm-root-nopreserve"));
+    }
+
+    #[test]
+    fn update_cannot_downgrade_builtin_seed_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let (center, _) = ConfigCenter::load_or_init(dir.path()).unwrap();
+        let mut cfg = center.get();
+        cfg.command_block.builtin_seed_version = 1;
+        center.update(cfg);
+        assert_eq!(center.get().command_block.builtin_seed_version, 2);
     }
 
     /// 纯空白令牌等同未设置（trim 后触发自动生成），不留「看不见的弱口令」。

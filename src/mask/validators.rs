@@ -151,7 +151,9 @@ pub fn idcard18_ok(num: &str) -> bool {
 /// 抽出 `now_year` 参数是为了让「上界随年份变化」这件事**可被确定性地测试**：
 /// 写死常量会让测试「碰巧在当前年通过」，等到次年才爆——这正是之前的 bug 形态。
 fn idcard18_ok_at(num: &str, now_year: i32) -> bool {
-    if num.len() != 18 || !num[..17].chars().all(|c| c.is_ascii_digit()) {
+    // 必须先确认全 ASCII 再按字节切片：否则 18 字节但含多字节字符时
+    // `num[..17]` 可能切在字符中间直接 panic。
+    if num.len() != 18 || !num.is_ascii() || !num[..17].chars().all(|c| c.is_ascii_digit()) {
         return false;
     }
     if !is_valid_province(&num[..2]) {

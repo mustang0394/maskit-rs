@@ -623,6 +623,55 @@ fn terminal_event_flushes_held_fragment_without_stream_end() {
     assert_eq!(left, 0, "补发后 pending 应为空");
 }
 
+/// D1 回归：终止事件自己携带**后半截**占位符时，必须先槽位还原再 flush。
+/// 旧顺序会把前半截当残片先补发，后半截再也拼不回去。
+#[test]
+fn terminal_event_completes_split_placeholder_before_flush() {
+    let (store, tok) = setup();
+    let (a, b) = tok.split_at(tok.len() / 2);
+    let first = format!("data: {{\"choices\":[{{\"delta\":{{\"content\":\"电话 {a}\"}}}}]}}\n\n");
+    let second = format!(
+        "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{b} 结束\"}},\"finish_reason\":\"stop\"}}]}}\n\n"
+    );
+    let mut st = StreamState::new(Framing::Sse);
+    let (o1, _) = st.push(first.as_bytes(), "s", &store);
+    let (o2, _) = st.push(second.as_bytes(), "s", &store);
+    let out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&o1),
+        String::from_utf8_lossy(&o2)
+    );
+    assert!(
+        out.contains("13800138000"),
+        "终止事件里的后半截应补齐并完整还原: {out}"
+    );
+    assert!(!out.contains(a), "不得把半截占位符当独立残片先补发: {out}");
+}
+
+/// CRLF 被 chunk 边界拆成 `\r` | `\n` 时仍要识别出完整 SSE 帧。
+#[test]
+fn crlf_split_across_chunks_keeps_sse_frame() {
+    let store = SessionStore::new();
+    store.new_session("s");
+    let mut st = StreamState::new(Framing::Sse);
+    let (o1, _) = st.push(
+        b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\r",
+        "s",
+        &store,
+    );
+    let (o2, _) = st.push(b"\n\r\n", "s", &store);
+    let out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&o1),
+        String::from_utf8_lossy(&o2)
+    );
+    assert!(out.contains("hi"), "CRLF 跨块后帧内容丢失: {out:?}");
+    assert!(
+        out.contains("data:") && (out.ends_with("\n\n") || out.ends_with("\n")),
+        "CRLF 跨块后未形成合法帧: {out:?}"
+    );
+}
+
 /// NDJSON 流式的 `done:true` 必须当场收尾全部通道（不能等流末 `push(b"")`）。
 #[test]
 fn ndjson_done_true_flushes_without_stream_end() {

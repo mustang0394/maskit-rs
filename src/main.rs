@@ -59,19 +59,8 @@ fn main() {
     // 上游客户端：target 未配置或非法时也不退出（反代路径返回 502）
     let upstream = Arc::new(upstream::UpstreamClient::new_or_placeholder(&cfg.upstream));
 
-    // 事件总线
-    let bus = store::events::EventBus::new();
-
-    let port = cfg.server.port;
-    // 容器内必须绑 0.0.0.0：Docker 的 `-p 宿主端口:18701` 是转发到容器
-    // **eth0 地址**（如 172.17.0.x），进程若绑 127.0.0.1 则该转发接不到，
-    // 表现为 curl: (52) Empty reply from server。
-    // 因此提供 MASKIT_RS_BIND 覆盖（Dockerfile/compose 已设为 0.0.0.0）；
-    // 宿主机侧的 `-p 127.0.0.1:18701:18701` 仍只暴露在回环，不对外网开放。
-    let bind = std::env::var("MASKIT_RS_BIND").unwrap_or_else(|_| cfg.server.bind.clone());
-    let token = cfg.panel_token.clone();
-
-    // SQLite 事件库（与 Python 版同 schema，可直接互读写）
+    // 事件库先打开：事件总线要用库中已用的最大 id 续号（见 new_with_start）。
+    // 之前 bus 先建、id 每进程从 1 开始，重启后新旧事件 id 冲突。
     let event_store = match store::db::EventStore::open(&data_dir) {
         Ok(s) => {
             tracing::info!("事件库: {:?}", s.path());
@@ -82,6 +71,19 @@ fn main() {
             None
         }
     };
+    // 事件总线
+    let bus = match &event_store {
+        Some(es) => store::events::EventBus::new_with_start(es.initial_event_id()),
+        None => store::events::EventBus::new(),
+    };
+
+    let port = cfg.server.port;
+    // 容器内必须绑 0.0.0.0：Docker 的 `-p 宿主端口:18701` 是转发到容器
+    // **eth0 地址**（如 172.17.0.x），进程若绑 127.0.0.1 则该转发接不到，
+    // 表现为 curl: (52) Empty reply from server。
+    // 因此提供 MASKIT_RS_BIND 覆盖（Dockerfile/compose 已设为 0.0.0.0）；
+    // 宿主机侧的 `-p 127.0.0.1:18701:18701` 仍只暴露在回环，不对外网开放。
+    let bind = std::env::var("MASKIT_RS_BIND").unwrap_or_else(|_| cfg.server.bind.clone());
 
     // token 用量落库（只统计数量，不做价格计算）
     if let Some(es) = event_store.clone() {
@@ -139,28 +141,37 @@ fn main() {
         port
     );
     tracing::info!("客户端 base_url: http://127.0.0.1:{}/<原路径>", port);
-    tracing::debug!(token = %token, "panel token");
 
-    // 后台维护任务：会话 sweep + 事件保留期清理
-    if let Some(es) = event_store.clone() {
-        let cfg2 = cfg.clone();
+    // 后台维护任务：无条件启动。以前只在 event_store 存在时 spawn，
+    // 纯内存降级模式下连会话 sweep 都不跑（inflight 兜底回收也失效）。
+    // 每轮重新读取配置：retention/session_ttl 热更新立即生效。
+    {
+        let cc = config_center.clone();
+        let es = event_store.clone();
         let store_static: &'static maskit_rs::mask::session::SessionStore =
             &maskit_rs::mask::session::STORE;
         std::thread::spawn(move || loop {
             std::thread::sleep(std::time::Duration::from_secs(30));
-            store_static.sweep(cfg2.mask.session_ttl as f64);
-            es.prune(cfg2.log_retention_days as i64);
-            // 过期占位符映射清理。不清理的话 placeholder_map 会无限增长
-            // （一次也不删），而它存的是**原文明文**，磁盘只增不减。
-            es.prune_mappings();
+            let cfg = cc.get();
+            store_static.sweep(cfg.mask.session_ttl as f64);
+            store_static.prune_expired();
+            if let Some(es) = &es {
+                es.prune(cfg.log_retention_days as i64);
+                // 过期占位符映射清理。不清理的话 placeholder_map 会无限增长
+                // （一次也不删），而它存的是**原文明文**，磁盘只增不减。
+                es.prune_mappings();
+            }
         });
     }
 
-    let app = server::build_router(state);
+    let app = server::build_router(state.clone());
     rt.block_on(async move {
         let listener = tokio::net::TcpListener::bind((bind.as_str(), port))
             .await
             .expect("绑定端口失败");
+        if let Ok(addr) = listener.local_addr() {
+            state.set_bound_addr(addr.ip().to_string(), addr.port());
+        }
         let shutdown = async {
             let _ = tokio::signal::ctrl_c().await;
             tracing::info!("收到退出信号，优雅关闭…");

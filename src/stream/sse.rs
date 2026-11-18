@@ -103,7 +103,14 @@ impl StreamState {
         } else {
             self.decode_chunk(data)
         };
-        self.buf.push_str(&text.replace("\r\n", "\n"));
+        // CRLF 可能被 chunk 边界拆成 `\r` | `\n`：只替换本次 text 会漏掉
+        // buf 末尾遗留的 `\r`，导致 \r\n\r\n 边界永远匹配不到。
+        let norm = text.replace("\r\n", "\n");
+        if self.buf.ends_with('\r') && norm.starts_with('\n') {
+            // 旧 buf 的 \r + 新块开头的 \n 组成一对 CRLF；去掉 \r，保留 \n
+            self.buf.pop();
+        }
+        self.buf.push_str(&norm);
 
         let mut out = String::new();
         let delim = match self.framing {
@@ -136,6 +143,11 @@ impl StreamState {
             if !self.buf.is_empty() {
                 let frame = std::mem::take(&mut self.buf);
                 out.push_str(&self.restore_frame(&frame, sid, store, &mut stats, true));
+                // 残余帧后面必须补分隔符，否则 flush_pending 的完整帧会粘在
+                // 这条不完整 data 行后面，被客户端当成同一个事件吞掉。
+                if !out.ends_with(delim) {
+                    out.push_str(delim);
+                }
             }
             out.push_str(&flush_pending(sid, store, self.framing, &mut stats));
         }
@@ -225,23 +237,18 @@ pub fn restore_sse_event(
                 continue;
             };
             if !data.is_object() {
-                out_lines.push(line.to_string());
+                // 合法但非对象的 JSON 载荷（数组/字符串/数字/null）同样要还原，
+                // 不能整行原样放行。
+                let mut st = RestoreStats::default();
+                let restored = crate::mask::tree::restore_tree(&data, sid, store, &mut st, 0);
+                stats.merge(&st);
+                out_lines.push(format!(
+                    "data: {}",
+                    serde_json::to_string(&restored).unwrap_or_else(|_| payload.to_string())
+                ));
                 continue;
             }
-            // 终止事件之前的滞留补发（见下方 `terminal` 处理说明）：必须在
-            // 本事件文本之前吐出，否则客户端在终止事件处就结束解析，残片丢失。
-            if !final_frame {
-                if let Some(prepend) = flush_on_terminal(&data, sid, store, Framing::Sse, stats) {
-                    out_lines.push(String::new());
-                    out_lines.extend(
-                        prepend
-                            .trim_end_matches('\n')
-                            .split('\n')
-                            .map(str::to_string),
-                    );
-                    out_lines.push(String::new());
-                }
-            }
+            // 终止事件之前的滞留补发放在**槽位还原之后**（见 D1 说明）。
             // 槽位还原
             let terminal = slots::terminal_prefixes(&data);
             let mut restored = data.clone();
@@ -303,6 +310,31 @@ pub fn restore_sse_event(
                 let mut st = RestoreStats::default();
                 restored = crate::mask::tree::restore_tree(&restored, sid, store, &mut st, 0);
                 stats.merge(&st);
+            }
+            // D1：槽位先行还原。若被扣住的半截占位符正好由本事件补齐，
+            // `restore_channel(final=...)` 会把它完整还原并从 pending 移除；
+            // 之后 flush 只处理**其他**仍未完成的通道。顺序反过来会把
+            // 半截残片先当独立帧吐出，原文永久拼不回。
+            if !final_frame {
+                if let Some(prepend) = flush_on_terminal(&data, sid, store, Framing::Sse, stats) {
+                    // 必须插在**本事件的非 data 行之前**（如 `event: message_delta`），
+                    // 否则 flush 帧会继承该 event 类型，真正的终止事件 data 行失去归属。
+                    let pos = out_lines
+                        .iter()
+                        .rposition(|l| l.is_empty())
+                        .map(|i| i + 1)
+                        .unwrap_or(0);
+                    let mut block = Vec::new();
+                    block.push(String::new());
+                    block.extend(
+                        prepend
+                            .trim_end_matches('\n')
+                            .split('\n')
+                            .map(str::to_string),
+                    );
+                    block.push(String::new());
+                    out_lines.splice(pos..pos, block);
+                }
             }
             out_lines.push(format!(
                 "data: {}",
@@ -386,7 +418,10 @@ pub fn restore_ndjson_line(
         return crate::mask::engine::restore_final(line, sid, false, store, stats);
     };
     if !obj.is_object() {
-        return line.to_string();
+        let mut st = RestoreStats::default();
+        let restored = crate::mask::tree::restore_tree(&obj, sid, store, &mut st, 0);
+        stats.merge(&st);
+        return serde_json::to_string(&restored).unwrap_or_else(|_| line.to_string());
     }
     let mut restored = obj.clone();
     let mut restored_before = String::new();

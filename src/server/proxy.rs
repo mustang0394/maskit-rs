@@ -93,7 +93,7 @@ fn build_decoded_response(
             if n.eq_ignore_ascii_case("content-encoding") && eff_enc.is_empty() {
                 continue;
             }
-            h.insert(name.clone(), v.clone());
+            h.append(name.clone(), v.clone());
         }
     }
     out.body(Body::from(outcome.body)).unwrap()
@@ -459,6 +459,10 @@ pub async fn handler(State(state): State<SharedState>, req: Request) -> Response
         };
         s.inflight = true;
     }
+    // 取消安全：从 new_session 起就持守卫。客户端在脱敏中/等上游头阶段断开
+    // 会让 handler future 被 drop，此前的裸路径不会执行任何清理 → 会话永久泄漏
+    // （sweep 跳过 inflight）。进入 forward_inner 前 disarm，由那边的守卫接管。
+    let mut early_guard = crate::server::response::SessionGuard::new(sid.clone(), store);
 
     let custom = state.custom_words();
     let config = state.config.clone();
@@ -590,7 +594,7 @@ pub async fn handler(State(state): State<SharedState>, req: Request) -> Response
         count: new_count.max(store.get(&sid).map(|s| s.last_hits.len()).unwrap_or(0)),
         masked_total: store.get(&sid).map(|s| s.fwd.len()).unwrap_or(0),
         new_count,
-        reused_count: 0,
+        reused_count: store.get(&sid).map(|s| s.reused_count).unwrap_or(0),
         unresolved: 0,
         unresolved_samples: vec![],
         unknown_shape,
@@ -659,6 +663,7 @@ pub async fn handler(State(state): State<SharedState>, req: Request) -> Response
         req_dialog,
         request_headers: log_headers,
     };
+    early_guard.disarm();
     forward_with_restore(&state, &method_str, &parts.uri, &headers, out_body, sess).await
 }
 
@@ -830,6 +835,11 @@ async fn forward_inner(
             state.sessions.drop_session(&s.sid);
         }
     };
+    // 守卫覆盖 forward_inner 的全部提前返回（build/send/聚合/解码失败）。
+    // 流式分支不 disarm，而是把所有权移入 stream_response 的生成器。
+    let mut session_guard = session
+        .as_ref()
+        .map(|s| crate::server::response::SessionGuard::new(s.sid.clone(), state.sessions));
     let req = match upstream.build_request(method, path_and_query, &fwd, body) {
         Ok(r) => r,
         Err(e) => {
@@ -840,8 +850,10 @@ async fn forward_inner(
             );
         }
     };
+    let send_t0 = std::time::Instant::now();
     match upstream.send(req).await {
         Ok(resp) => {
+            let upstream_ms = send_t0.elapsed().as_millis() as u64;
             // 用 Option 持有，body 只能被取一次（流式/整包/透传三选一）。
             let mut resp = Some(resp);
             let resp_ref = resp.as_ref().expect("刚赋值");
@@ -874,26 +886,44 @@ async fn forward_inner(
                 //
                 // 解码成功就**剥掉 content-encoding**（以明文下发）；
                 // 解码失败保持原样,退回「不可还原则透传」。
+                let stream_enabled = state.config.get().stream_response;
+                let mut stream_decoder: Option<crate::stream::decode::StreamDecoder> = None;
                 let (body_bytes, eff_enc): (Option<Bytes>, String) =
                     if crate::stream::decode::is_decodable(&enc) {
-                        let raw_body = resp.take().expect("body 未被取过").into_body();
-                        match crate::stream::sse::aggregate_stream(raw_body).await {
-                            Ok(raw) => match crate::stream::decode::decode(&raw, &enc) {
-                                Ok(Some(plain)) => (Some(Bytes::from(plain)), String::new()),
-                                Ok(None) => (Some(raw), enc.clone()),
+                        // gzip/deflate + 流式响应 + observe：边解压边还原，
+                        // 不再等整包；br/zstd 仍走整包（增量 API 复杂）。
+                        let try_stream = crate::server::response::is_streaming_response(&ct)
+                            && !state.cmdblock().requires_whole_body()
+                            && stream_enabled;
+                        let kind = if try_stream {
+                            crate::stream::decode::streaming_decodable(&enc)
+                        } else {
+                            None
+                        };
+                        if let Some(kind) = kind {
+                            pending_body = Some(resp.take().expect("body 未被取过").into_body());
+                            stream_decoder = Some(crate::stream::decode::StreamDecoder::new(kind));
+                            (None, String::new())
+                        } else {
+                            let raw_body = resp.take().expect("body 未被取过").into_body();
+                            match crate::stream::sse::aggregate_stream(raw_body).await {
+                                Ok(raw) => match crate::stream::decode::decode(&raw, &enc) {
+                                    Ok(Some(plain)) => (Some(Bytes::from(plain)), String::new()),
+                                    Ok(None) => (Some(raw), enc.clone()),
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            "[decode] 压缩体解码失败({enc}): {e};按原样透传"
+                                        );
+                                        (Some(raw), enc.clone())
+                                    }
+                                },
                                 Err(e) => {
-                                    tracing::warn!(
-                                        "[decode] 压缩体解码失败({enc}): {e};按原样透传"
+                                    state.sessions.drop_session(&sess.sid);
+                                    return error_response(
+                                        StatusCode::BAD_GATEWAY,
+                                        &format!("upstream_read_failed: {e}"),
                                     );
-                                    (Some(raw), enc.clone())
                                 }
-                            },
-                            Err(e) => {
-                                state.sessions.drop_session(&sess.sid);
-                                return error_response(
-                                    StatusCode::BAD_GATEWAY,
-                                    &format!("upstream_read_failed: {e}"),
-                                );
                             }
                         }
                     } else {
@@ -931,6 +961,15 @@ async fn forward_inner(
                         trace_keep,
                         trace_budget,
                         request_headers: sess.request_headers.clone(),
+                        response_scan: cfg_meta.response_scan,
+                        builtin_rules: cfg_meta.mask.builtin_rules.clone(),
+                        resp_bytes: 0,
+                        upstream_ms,
+                        first_byte_ms: upstream_ms,
+                        audit_enabled: cfg_meta.audit.enabled,
+                        audit_passive: cfg_meta.audit.passive,
+                        audit_signals: cfg_meta.audit.signals.clone(),
+                        audit_floor: crate::audit::Severity::parse(&cfg_meta.audit.severity_floor),
                     };
                     let cmdblock = state.cmdblock();
                     let store: &'static crate::mask::session::SessionStore = state.sessions;
@@ -944,7 +983,10 @@ async fn forward_inner(
                         store.drop_session(&sess.sid);
                         return build_decoded_response(status, outcome, &resp_headers, &eff_enc);
                     }
-                    if crate::server::response::is_streaming_response(&ct) {
+                    if crate::server::response::is_streaming_response(&ct)
+                        && !cmdblock.requires_whole_body()
+                        && stream_enabled
+                    {
                         let framing = crate::server::response::framing_of(&ct)
                             .unwrap_or(crate::stream::sse::Framing::Sse);
                         let bus = state.bus.clone();
@@ -953,6 +995,10 @@ async fn forward_inner(
                             framing,
                             sess.sid.clone(),
                             store,
+                            session_guard
+                                .take()
+                                .expect("流式分支必有已 armed 的会话守卫"),
+                            stream_decoder.take(),
                             cmdblock.clone(),
                             bus,
                             meta,
@@ -966,7 +1012,13 @@ async fn forward_inner(
                                     if name.as_str().eq_ignore_ascii_case("content-length") {
                                         continue;
                                     }
-                                    h.insert(name, v);
+                                    // 流式解压后已是明文：必须剥掉 content-encoding
+                                    if eff_enc.is_empty()
+                                        && name.as_str().eq_ignore_ascii_case("content-encoding")
+                                    {
+                                        continue;
+                                    }
+                                    h.append(name, v);
                                 }
                             }
                         }
@@ -1014,7 +1066,7 @@ async fn forward_inner(
                                         if name.as_str().eq_ignore_ascii_case("content-length") {
                                             continue;
                                         }
-                                        h.insert(name, v);
+                                        h.append(name, v);
                                     }
                                 }
                             }
@@ -1038,7 +1090,7 @@ async fn forward_inner(
                     {
                         let h = out.headers_mut().unwrap();
                         for (name, v) in resp_headers.iter() {
-                            h.insert(name.clone(), v.clone());
+                            h.append(name.clone(), v.clone());
                         }
                     }
                     return out.body(Body::from(raw)).unwrap();
@@ -1057,7 +1109,7 @@ async fn forward_inner(
                         let h = out.headers_mut().unwrap();
                         for (k, v) in resp_headers {
                             if let Some(name) = k {
-                                h.insert(name, v);
+                                h.append(name, v);
                             }
                         }
                     }

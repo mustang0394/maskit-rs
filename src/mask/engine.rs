@@ -353,6 +353,34 @@ impl CustomWords {
                 regex_words.push((pat.to_string(), l.clone(), compiled));
             }
         }
+        // 配置里的自定义正则（{name, pattern}）：与 `re:` 词同一通道，
+        // label 取自 name（非法字符经 safe_label 归一）。
+        for cr in &cfg.mask.custom_regexes {
+            if cr.pattern.trim().is_empty() {
+                continue;
+            }
+            let label = crate::mask::placeholder::safe_label(if cr.name.trim().is_empty() {
+                "CUSTOM"
+            } else {
+                cr.name.trim()
+            });
+            let compiled = match regex::Regex::new(&cr.pattern) {
+                Ok(r) => CompiledUserRegex::Linear(r),
+                Err(_) => match fancy_regex::Regex::new(&cr.pattern) {
+                    Ok(f) => CompiledUserRegex::Fancy(f),
+                    Err(e) => {
+                        tracing::warn!(
+                            name = %cr.name,
+                            pattern = %cr.pattern,
+                            error = %e,
+                            "自定义正则编译失败，已跳过"
+                        );
+                        continue;
+                    }
+                },
+            };
+            regex_words.push((cr.pattern.clone(), label, compiled));
+        }
         // 需要加边界的词：① 单字词（防「密」吃掉「密码」）
         //               ② 用户显式开启整词匹配的词（`sensitive_word_whole`）
         // 边界类分档对齐 Python：单字词含 CJK（「密」不应命中「密码」），
@@ -501,6 +529,10 @@ pub struct MaskCtx<'a> {
     /// token，会把半成品发给上游。集合由 handler 注入，客户端无法预知
     /// 随机 nonce，因此不存在「伪造 token 绕过扫描」的入口。
     blob_tokens: std::collections::HashSet<String>,
+    /// JSON 文本字段（arguments/partial_json）内层脱敏后，整串的
+    /// 「原文 → 脱敏后文本」映射。只用于字节级 splice，不进会话映射表
+    /// （整串不是敏感值，不能落库为占位符映射）。
+    splice_extra: std::sync::Mutex<std::collections::HashMap<String, String>>,
     /// 前缀规则正则：**构造时预编译一次**。
     /// 早期在每个字符串叶子都重算（join 前缀数组 + 取锁 + clone），
     /// 实测 3000 条消息的请求里这一项就占 10ms。
@@ -522,7 +554,23 @@ impl<'a> MaskCtx<'a> {
             custom,
             blob: super::blob::BlobPolicy::from_config(&cfg.mask.multimodal_blob),
             blob_tokens: std::collections::HashSet::new(),
+            splice_extra: std::sync::Mutex::new(std::collections::HashMap::new()),
             prefix_rx,
+        }
+    }
+
+    /// 记录 JSON 文本字段内层改写后的整串映射（供 splice 保前缀缓存）。
+    pub fn record_splice_pair(&self, orig: String, masked: String) {
+        if let Ok(mut m) = self.splice_extra.lock() {
+            m.insert(orig, masked);
+        }
+    }
+
+    /// 取出本请求积累的整串 splice 映射。
+    pub fn take_splice_extra(&self) -> std::collections::HashMap<String, String> {
+        match self.splice_extra.lock() {
+            Ok(mut g) => std::mem::take(&mut *g),
+            Err(_) => std::collections::HashMap::new(),
         }
     }
 
@@ -680,15 +728,19 @@ impl<'a> MaskCtx<'a> {
                 }
                 // 语义校验
                 if !rules::semantic_check(rule.label, orig, &out, m0, &caps) {
-                    // CONNSTR 被否决 → 记下**原文片段**（该段不会被替换，
-                    // 因此后续规则看到的仍是同一段文本）
+                    // CONNSTR 被否决 → 记下「匹配串 + authority 尾部」作为 EMAIL 的
+                    // 豁免区（该段不会被替换，后续规则看到的仍是同一段文本）。
                     if rule.exempt_on_reject && exempt_conn.len() < 512 {
-                        exempt_conn.push(m0.as_str().to_string());
+                        exempt_conn.push(rules::connstr_exempt_text(&out, m0));
                     }
                     continue;
                 }
-                // EMAIL 与任一豁免片段重叠 → 跳过（文本重叠判定，与坐标无关）
-                if rule.avoid_exempt && exempt_conn.iter().any(|s| rules::overlaps(s, m0.as_str()))
+                // EMAIL 落入被否决 CONNSTR 的 userinfo/authority → 跳过。
+                // 只做双向包含；1 字节前后缀相似度会误豁免无关邮箱。
+                if rule.avoid_exempt
+                    && exempt_conn
+                        .iter()
+                        .any(|s| s.contains(m0.as_str()) || m0.as_str().contains(s))
                 {
                     continue;
                 }
@@ -699,7 +751,10 @@ impl<'a> MaskCtx<'a> {
                             self.store.new_session(&self.sid);
                         }
                         let mut session = self.store.get_mut(&self.sid).unwrap();
-                        self.store.remember(&mut session, orig, rule.label, &taken);
+                        let reused = self.store.remember(&mut session, orig, rule.label, &taken);
+                        if reused {
+                            session.reused_count += 1;
+                        }
                         session.fwd.get(orig).cloned().unwrap_or_default()
                     };
                     if token.is_empty() {
@@ -1510,6 +1565,44 @@ mod tests {
         assert!(!masked.contains("Xk9mQ2zR"));
         // 不应出现残缺占位（EMAIL 吃一半）
         assert!(!masked.contains("@prod-db.internal:6379}}"));
+    }
+
+    /// H3 回归：被否决的 dummy CONNSTR 不得凭 1 字节前后缀相似度，
+    /// 把同段文本里完全无关的 `.com` 邮箱一起豁免掉。
+    #[test]
+    fn dummy_connstr_does_not_exempt_unrelated_email() {
+        let parts = test_ctx(&[]);
+        let masked = mask_with(&parts, "mysql://user:pass@host 联系 alice@example.com");
+        assert!(
+            !masked.contains("alice@example.com"),
+            "无关邮箱不得被 CONNSTR 豁免漏掉: {masked}"
+        );
+    }
+
+    #[test]
+    fn dummy_connstr_before_semicolon_does_not_exempt_email() {
+        let parts = test_ctx(&[]);
+        let masked = mask_with(
+            &parts,
+            "mysql://admin:{password}@localhost;联系ops@corp.com",
+        );
+        assert!(
+            !masked.contains("ops@corp.com"),
+            "分号后的邮箱不得被 DSN 豁免吞掉: {masked}"
+        );
+    }
+
+    #[test]
+    fn dummy_connstr_in_json_does_not_exempt_following_email() {
+        let parts = test_ctx(&[]);
+        let masked = mask_with(
+            &parts,
+            r#"{"dsn":"mysql://user:pass@host","contact":"alice@example.com"}"#,
+        );
+        assert!(
+            !masked.contains("alice@example.com"),
+            "同一行 JSON 里的后续邮箱不得被 DSN 豁免吞掉: {masked}"
+        );
     }
 
     #[test]

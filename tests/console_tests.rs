@@ -1377,8 +1377,8 @@ fn audit_hook_fires_once_per_finding_with_unique_ids() {
         evidence: "CANARY_0_a1b2c3d4".into(),
         kind: "poison".into(),
     };
-    bus.emit_audit(&f, "sid", "h", "POST", "/x");
-    bus.emit_audit(&f, "sid", "h", "POST", "/x");
+    bus.emit_audit(&f, "sid", "h", "POST", "/x", Severity::Medium);
+    bus.emit_audit(&f, "sid", "h", "POST", "/x", Severity::Medium);
     let ids = seen.lock().unwrap().clone();
     assert_eq!(
         ids.len(),

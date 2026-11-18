@@ -124,7 +124,12 @@ fn ascii_lower(b: u8) -> u8 {
     b.to_ascii_lowercase()
 }
 
-/// `data:` 开头且前 `DATA_URI_PROBE` 字节内出现 `;base64,`（大小写不敏感）。
+/// `data:` 开头且前 `DATA_URI_PROBE` 字节内出现 `;base64,`（大小写不敏感），
+/// 且其后**确实全部是 base64 载荷**（字符集/空白校验）。
+///
+/// 只查前缀会让 `"data:image/png;base64,AAAA 联系 alice@example.com"` 这种
+/// 「假 data URI + 尾部明文 PII」整串跳过脱敏——客户端的任何字符串都能借此
+/// 绕过扫描。这里要求 marker 之后的每个字符都属于 base64 字母表/空白/填充。
 fn looks_like_base64_data_uri(b: &[u8]) -> bool {
     if b.len() < 5 || !b[..5].eq_ignore_ascii_case(b"data:") {
         return false;
@@ -132,8 +137,23 @@ fn looks_like_base64_data_uri(b: &[u8]) -> bool {
     let probe = b.len().min(DATA_URI_PROBE);
     let needle = b";base64,";
     let hay = &b[..probe];
-    hay.windows(needle.len())
-        .any(|w| w.iter().zip(needle).all(|(x, y)| ascii_lower(*x) == *y))
+    let Some(pos) = (0..=hay.len().saturating_sub(needle.len())).find(|&i| {
+        hay[i..i + needle.len()]
+            .iter()
+            .zip(needle)
+            .all(|(x, y)| ascii_lower(*x) == *y)
+    }) else {
+        return false;
+    };
+    let payload = &b[pos + needle.len()..];
+    if payload.is_empty() {
+        return false;
+    }
+    payload.iter().all(|&c| {
+        c.is_ascii_alphanumeric()
+            || matches!(c, b'+' | b'/' | b'=' | b'-' | b'_')
+            || c.is_ascii_whitespace()
+    })
 }
 
 /// 大块裸 base64 形态判定。
@@ -524,6 +544,18 @@ mod tests {
         let ex = extract(raw.as_bytes(), &p).unwrap();
         let masked = String::from_utf8(ex.body.clone()).unwrap();
         assert_eq!(reinject(&masked, &ex.blobs), raw);
+    }
+
+    /// C4 回归：假 data URI + 尾部明文 PII 不得整串跳过。
+    #[test]
+    fn fake_data_uri_with_trailing_pii_is_not_skipped() {
+        let p = BlobPolicy::default();
+        assert!(!is_skippable_str(
+            "data:image/png;base64,AAAA 联系 alice@example.com",
+            &p
+        ));
+        assert!(is_skippable_str("data:image/png;base64,AAAA", &p));
+        assert!(!is_skippable_str("data:image/png;base64,", &p));
     }
 
     #[test]
