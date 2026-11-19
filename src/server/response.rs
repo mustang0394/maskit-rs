@@ -236,7 +236,10 @@ pub fn process_whole(
         joined
     } else if c.contains("event-stream") {
         let mut blocks = Vec::new();
-        for block in text.split("\n\n") {
+        // 上游可能用合法 CRLF 事件边界（\r\n\r\n）；不归一化会导致整个
+        // 响应被当成一个 block，多个事件的 JSON 被拼进同一个 SSE 事件。
+        let normalized = text.replace("\r\n", "\n");
+        for block in normalized.split("\n\n") {
             blocks.push(crate::stream::sse::restore_sse_event(
                 block, sid, store, &mut stats, false,
             ));
@@ -297,7 +300,10 @@ fn restore_non_json_body(
     match sniff_framing(text) {
         Some(Framing::Sse) => {
             let mut blocks = Vec::new();
-            for block in text.split("\n\n") {
+            // 与 event-stream 声明分支同口径：声明成 JSON 但实际是 CRLF SSE
+            // 的回退体也必须先归一化，否则整个响应被当成一个事件。
+            let normalized = text.replace("\r\n", "\n");
+            for block in normalized.split("\n\n") {
                 blocks.push(crate::stream::sse::restore_sse_event(
                     block, sid, store, stats, false,
                 ));
@@ -1031,6 +1037,42 @@ mod tests {
         assert!(s.contains("13800138000"));
         assert!(s.contains("[DONE]"));
         assert_eq!(out.restored, 1);
+    }
+
+    #[test]
+    fn whole_sse_crlf_restores_as_separate_events() {
+        let parts = setup();
+        let masked = mask_and_register(&parts, "电话13800138000");
+        let body = format!(
+            "data: {}\r\n\r\ndata: {}\r\n\r\n",
+            serde_json::json!({"choices": [{"delta": {"content": masked}}]}),
+            serde_json::json!({"choices": [{"delta": {"content": masked}}]})
+        );
+        let cmd = crate::cmdblock::CmdBlockEngine::new(&parts.0);
+        let out = process_whole(body.as_bytes(), "text/event-stream", "r", &parts.1, &cmd);
+        let text = String::from_utf8_lossy(&out.body);
+        assert!(
+            text.contains("\n\n"),
+            "CRLF 事件边界应还原成两个 SSE 事件: {text:?}"
+        );
+        assert_eq!(out.restored, 2);
+    }
+
+    #[test]
+    fn non_json_body_crlf_sse_restores_as_separate_events() {
+        let parts = setup();
+        let masked = mask_and_register(&parts, "电话13800138000");
+        let body = format!(
+            "data: {}\r\n\r\ndata: {}\r\n\r\n",
+            serde_json::json!({"choices": [{"delta": {"content": masked}}]}),
+            serde_json::json!({"choices": [{"delta": {"content": masked}}]})
+        );
+        let cmd = crate::cmdblock::CmdBlockEngine::new(&parts.0);
+        let mut stats = crate::mask::engine::RestoreStats::default();
+        let mut blocked = false;
+        let out = restore_non_json_body(&body, "r", &parts.1, &mut stats, &cmd, &mut blocked);
+        assert!(out.contains("\n\n"), "CRLF SSE 回退应保留两个事件: {out:?}");
+        assert_eq!(stats.restored, 2);
     }
 
     #[test]

@@ -27,10 +27,24 @@ fn response_channel(data: &Value, kind: &str) -> String {
         .get("output_index")
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    if ci > 0 {
+    let base = if ci > 0 {
         format!("r{oi}.{ci}.{kind}")
     } else {
         format!("r{oi}.{kind}")
+    };
+    // 部分中转不发 output_index，多个工具调用会全部落到 r0.args 互相串流。
+    // item_id 是同一事件的稳定标识；有它时并入通道，至少不会把两个工具的
+    // 半截占位符拼到一起（缺失 output_index 时 r0 仍只是兜底）。
+    match data
+        .get("item_id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    {
+        Some(id) => {
+            let id: String = id.chars().take(64).collect();
+            format!("{base}@{id}")
+        }
+        None => base,
     }
 }
 
@@ -76,6 +90,92 @@ pub fn is_generic_field(field: &str) -> Option<&str> {
     field.strip_prefix(GENERIC_CHANNEL_PREFIX)
 }
 
+/// 合并同一 delta 内 **相同 index** 的 tool_calls。
+///
+/// 部分中转把 id/name 与 arguments 拆成两条 `index: 0` 的条目（trace 7544），
+/// 若原样下发，客户端按 index 合并时会得到 `{...}{...}`；若只修通道，跨 delta
+/// 的条目数变化又会让半截占位符换通道。这里先按 index 归一化成一条逻辑条目：
+/// id/name 取首个非空值，arguments 按数组顺序拼接。客户端视角等价（它本来
+/// 也要按 index 拼接），但后续槽位与 pending 都变得稳定。
+pub fn merge_duplicate_tool_calls(data: &mut Value) {
+    let Some(choices) = data.get_mut("choices").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for c in choices.iter_mut() {
+        let Some(delta) = c.get_mut("delta").and_then(Value::as_object_mut) else {
+            continue;
+        };
+        let Some(tcs) = delta.get_mut("tool_calls").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        let old = std::mem::take(tcs);
+        let mut merged: Vec<Value> = Vec::new();
+        let mut pos_by_index: std::collections::HashMap<usize, usize> =
+            std::collections::HashMap::new();
+        for (array_pos, tc) in old.into_iter().enumerate() {
+            let key = tc
+                .get("index")
+                .and_then(Value::as_u64)
+                .map(|v| v as usize)
+                .unwrap_or(array_pos);
+            if let Some(&mi) = pos_by_index.get(&key) {
+                merge_tool_call(&mut merged[mi], tc);
+            } else {
+                pos_by_index.insert(key, merged.len());
+                merged.push(tc);
+            }
+        }
+        *tcs = merged;
+    }
+}
+
+fn blank_value(v: Option<&Value>) -> bool {
+    match v {
+        None => true,
+        Some(Value::Null) => true,
+        Some(Value::String(s)) => s.is_empty(),
+        _ => false,
+    }
+}
+
+fn merge_tool_call(dst: &mut Value, src: Value) {
+    let (Some(d), Some(s)) = (dst.as_object_mut(), src.as_object()) else {
+        return;
+    };
+    for (k, v) in s {
+        if k == "function" {
+            let Some(sf) = v.as_object() else { continue };
+            match d.get_mut("function").and_then(Value::as_object_mut) {
+                Some(df) => {
+                    for (fk, fv) in sf {
+                        if fk == "arguments" {
+                            let old = df
+                                .get("arguments")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_string();
+                            let add = fv.as_str().unwrap_or("");
+                            if !old.is_empty() || add.is_empty() {
+                                df.insert("arguments".into(), Value::String(format!("{old}{add}")));
+                            } else {
+                                df.insert("arguments".into(), fv.clone());
+                            }
+                        } else if blank_value(df.get(fk)) {
+                            // 首个非空值：首条 id/name 为空串时不能挡住后续有效值。
+                            df.insert(fk.clone(), fv.clone());
+                        }
+                    }
+                }
+                None => {
+                    d.insert("function".into(), Value::Object(sf.clone()));
+                }
+            }
+        } else if blank_value(d.get(k)) {
+            d.insert(k.clone(), v.clone());
+        }
+    }
+}
+
 /// 列出 SSE 事件里的增量文本槽位。
 pub fn text_slots(data: &Value) -> Vec<Slot> {
     let mut slots = Vec::new();
@@ -119,18 +219,22 @@ pub fn text_slots(data: &Value) -> Vec<Slot> {
                             .and_then(Value::as_u64)
                             .map(|v| v as usize)
                             .unwrap_or(tidx);
+                        // 无论本条是否带 arguments 都要占位：首条可能是纯
+                        // id/name（无 arguments 键），否则第二条会被错当成
+                        // 「第一条」，还原结果写进元数据条目、参数条目漏还原。
+                        let n = seen.entry(slot_no).or_insert(0);
+                        let occurrence = *n;
+                        *n += 1;
                         if let Some(args) = tc
                             .get("function")
                             .and_then(|f| f.get("arguments"))
                             .and_then(Value::as_str)
                         {
-                            let n = seen.entry(slot_no).or_insert(0);
-                            let channel = if *n == 0 {
+                            let channel = if occurrence == 0 {
                                 format!("c{idx}.tool{slot_no}")
                             } else {
                                 format!("c{idx}.tool{slot_no}@{tidx}")
                             };
-                            *n += 1;
                             slots.push((channel, args.to_string(), true));
                         }
                     }
@@ -406,6 +510,7 @@ pub fn set_slot(data: &mut Value, channel: &str, text: &str) {
                             .and_then(Value::as_array_mut)
                         {
                             let mut written = false;
+                            let mut fallback: Option<usize> = None;
                             for (tidx, tc) in tcs.iter_mut().enumerate() {
                                 if let Some(pos) = only_pos {
                                     if tidx != pos {
@@ -417,19 +522,44 @@ pub fn set_slot(data: &mut Value, channel: &str, text: &str) {
                                     .and_then(Value::as_u64)
                                     .map(|v| v as usize)
                                     .unwrap_or(tidx);
-                                if slot_no == n {
-                                    if let Some(f) =
-                                        tc.get_mut("function").and_then(Value::as_object_mut)
-                                    {
-                                        f.insert("arguments".into(), Value::String(text.into()));
-                                    }
-                                    written = true;
-                                    if only_pos.is_none() {
-                                        break; // 只写第一条，避免复制到重复 index 条目
+                                if slot_no != n {
+                                    continue;
+                                }
+                                // 无后缀时优先写「带 arguments 字段」的条目；
+                                // 首条可能只是 id/name，不能把参数塞进去。
+                                let has_args = tc
+                                    .get("function")
+                                    .and_then(|f| f.get("arguments"))
+                                    .and_then(Value::as_str)
+                                    .is_some();
+                                if only_pos.is_none() && !has_args {
+                                    fallback.get_or_insert(tidx);
+                                    continue;
+                                }
+                                if let Some(f) =
+                                    tc.get_mut("function").and_then(Value::as_object_mut)
+                                {
+                                    f.insert("arguments".into(), Value::String(text.into()));
+                                }
+                                written = true;
+                                if only_pos.is_none() {
+                                    break;
+                                }
+                            }
+                            if !written {
+                                if let Some(tidx) = fallback {
+                                    if let Some(tc) = tcs.get_mut(tidx) {
+                                        if let Some(f) =
+                                            tc.get_mut("function").and_then(Value::as_object_mut)
+                                        {
+                                            f.insert(
+                                                "arguments".into(),
+                                                Value::String(text.into()),
+                                            );
+                                        }
                                     }
                                 }
                             }
-                            let _ = written;
                         }
                     }
                     // 通用增量通道：`x{原字段名}` → 按原字段名回写（见 `GENERIC_CHANNEL_PREFIX`）。
@@ -502,34 +632,54 @@ mod tests {
     #[test]
     fn duplicate_tool_call_index_does_not_duplicate_arguments() {
         // 中转把 id/name 与 arguments 拆成两条 index=0 的 tool_calls；
-        // 旧 set_slot 会把还原结果写进两条，客户端合并后得到 `{...}{...}`。
+        // 先合并成一条逻辑条目，再按单通道还原。
         let mut v = json!({"choices": [{"index": 0, "delta": {"tool_calls": [
             {"index": 0, "id": "call_1", "function": {"name": "glob", "arguments": ""}},
             {"index": 0, "function": {"arguments": "{\"pattern\":\"x\"}"}}
         ]}}]});
+        merge_duplicate_tool_calls(&mut v);
+        let tcs = v["choices"][0]["delta"]["tool_calls"].as_array().unwrap();
+        assert_eq!(tcs.len(), 1, "重复 index 必须合并为一条: {v}");
+        assert_eq!(tcs[0]["function"]["arguments"], "{\"pattern\":\"x\"}");
         let slots = text_slots(&v);
-        assert_eq!(slots.len(), 2);
+        assert_eq!(slots.len(), 1);
         assert_eq!(slots[0].0, "c0.tool0");
-        assert_eq!(slots[1].0, "c0.tool0@1");
-        set_slot(&mut v, &slots[1].0, "RESTORED");
+        set_slot(&mut v, &slots[0].0, "RESTORED");
         assert_eq!(
             v["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"],
-            ""
-        );
-        assert_eq!(
-            v["choices"][0]["delta"]["tool_calls"][1]["function"]["arguments"],
             "RESTORED"
         );
-        // 无位置后缀只写第一条，绝不复制到重复 index 条目
-        set_slot(&mut v, "c0.tool0", "FIRST");
-        assert_eq!(
-            v["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"],
-            "FIRST"
-        );
-        assert_eq!(
-            v["choices"][0]["delta"]["tool_calls"][1]["function"]["arguments"],
-            "RESTORED"
-        );
+    }
+
+    #[test]
+    fn merge_handles_first_entry_without_arguments_field() {
+        // A1：首条只有 id/name（无 arguments 键）时，第二条才是参数。
+        let mut v = json!({"choices": [{"index": 0, "delta": {"tool_calls": [
+            {"index": 0, "id": "", "function": {"name": ""}},
+            {"index": 0, "id": "call_B", "function": {"name": "glob", "arguments": "{\"pattern\":\"y\"}"}}
+        ]}}]});
+        merge_duplicate_tool_calls(&mut v);
+        let tcs = v["choices"][0]["delta"]["tool_calls"].as_array().unwrap();
+        assert_eq!(tcs.len(), 1);
+        // 首个非空值：空 id/name 不得挡住第二条有效值
+        assert_eq!(tcs[0]["id"], "call_B");
+        assert_eq!(tcs[0]["function"]["name"], "glob");
+        assert_eq!(tcs[0]["function"]["arguments"], "{\"pattern\":\"y\"}");
+        let slots = text_slots(&v);
+        assert_eq!(slots.len(), 1);
+        assert_eq!(slots[0].0, "c0.tool0");
+    }
+
+    #[test]
+    fn responses_channels_use_item_id_when_output_index_missing() {
+        let a = json!({"type": "response.function_call_arguments.delta", "item_id": "item_a", "delta": "x"});
+        let b = json!({"type": "response.function_call_arguments.delta", "item_id": "item_b", "delta": "y"});
+        let sa = text_slots(&a);
+        let sb = text_slots(&b);
+        assert_eq!(sa.len(), 1);
+        assert_eq!(sb.len(), 1);
+        assert_ne!(sa[0].0, sb[0].0, "不同 item_id 不得共用 r0.args 通道");
+        assert!(sa[0].0.starts_with("r0.args@"));
     }
 
     #[test]

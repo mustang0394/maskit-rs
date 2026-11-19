@@ -2,7 +2,7 @@
 //!
 //! 对齐 Python `_sse_stream_factory` / `_restore_sse_event` / `_flush_pending`:
 //! - 事件按 `\n\n` 分帧（CRLF → LF 归一）
-//! - 缓冲超限（4MB）强制按最后换行切分
+//! - 单事件 >64MB 时丢弃并发合法错误帧（绝不切半截 JSON）
 //! - per-channel 半截占位符扣留（`_PARTIAL_RX`，上限 48 字节）
 //! - 流末补发（`_flush_pending`）
 //! - **中途块无输出时绝不发空 chunk**（Python 版实测踩坑：空块 = chunked 终止块）
@@ -16,8 +16,12 @@ use crate::mask::placeholder;
 use crate::mask::session::SessionStore;
 use crate::stream::slots;
 
-/// SSE 半事件缓冲上限（对齐 Python `_SSE_BUF_MAX` = 4MB）。
-pub const SSE_BUF_MAX: usize = 4 * 1024 * 1024;
+/// 单条 SSE/NDJSON 事件的缓冲硬上限。
+///
+/// **不能**在 4MB 处强制切帧：半截 JSON 会被当成完整事件下发，客户端解析
+/// 直接失败（`write` 工具单条 delta 可达数 MB）。这里允许缓冲到 64MB，
+/// 超过后丢弃该事件并发一个**合法 JSON** 错误帧，绝不切出半截结构。
+pub const SSE_BUF_MAX: usize = 64 * 1024 * 1024;
 
 /// 流式还原状态。
 pub struct StreamState {
@@ -125,17 +129,28 @@ impl StreamState {
             out.push_str(&restored);
             out.push_str(delim);
         }
-        // 缓冲超限：强制切分（对齐 Python：按最后换行切，无换行整段处理）
+        // 缓冲硬上限：绝不把半截 JSON 当事件下发。超限说明单事件 >64MB，
+        // 丢弃它并回一个合法 JSON 错误帧（客户端能解析、能报错，不会崩在
+        // `Unexpected non-whitespace character`）。
         if self.buf.len() > SSE_BUF_MAX {
-            if let Some(idx) = self.buf.rfind('\n') {
-                let frame: String = self.buf[..idx].to_string();
-                self.buf = self.buf[idx + 1..].to_string();
-                out.push_str(&self.restore_frame(&frame, sid, store, &mut stats, true));
-                out.push_str(delim);
-            } else {
-                let frame = std::mem::take(&mut self.buf);
-                out.push_str(&self.restore_frame(&frame, sid, store, &mut stats, true));
-                out.push_str(delim);
+            tracing::error!(
+                "单条流事件超过 {} MiB，已丢弃；这通常意味着上游把超大工具参数塞进一个 delta",
+                SSE_BUF_MAX / 1024 / 1024
+            );
+            self.buf.clear();
+            match self.framing {
+                Framing::Sse => {
+                    out.push_str(
+                        "data: {\"error\":{\"message\":\"maskit: single SSE event exceeds 64MiB\"}}",
+                    );
+                    out.push_str(delim);
+                }
+                Framing::Ndjson => {
+                    out.push_str(
+                        "{\"error\":{\"message\":\"maskit: single NDJSON line exceeds 64MiB\"}}",
+                    );
+                    out.push_str(delim);
+                }
             }
         }
         // 流末：吐出残余 + flush pending
@@ -252,6 +267,9 @@ pub fn restore_sse_event(
             // 槽位还原
             let terminal = slots::terminal_prefixes(&data);
             let mut restored = data.clone();
+            // 同一 delta 内重复 index 的 tool_calls 先合并成一条逻辑条目：
+            // 否则文本槽位/输出结构都会按数组位置漂移，跨 delta 无法稳定。
+            slots::merge_duplicate_tool_calls(&mut restored);
             // 收集每个槽位的置空模板（用于 flush）
             let slot_list = slots::text_slots(&restored);
             if !slot_list.is_empty() {
@@ -424,6 +442,7 @@ pub fn restore_ndjson_line(
         return serde_json::to_string(&restored).unwrap_or_else(|_| line.to_string());
     }
     let mut restored = obj.clone();
+    slots::merge_duplicate_tool_calls(&mut restored);
     let mut restored_before = String::new();
     let slot_list = slots::text_slots(&restored);
     if !slot_list.is_empty() {

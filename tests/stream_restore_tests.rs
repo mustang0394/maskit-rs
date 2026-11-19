@@ -671,6 +671,59 @@ fn duplicate_tool_call_index_is_not_duplicated_on_restore() {
     );
 }
 
+/// 同一逻辑工具调用的参数跨两个 delta：首个 delta 拆成「元数据 + 前半参数」，
+/// 第二个 delta 只带后半参数。合并归一化后必须继续扣留并拼回半截占位符。
+#[test]
+fn split_tool_call_arguments_across_deltas_restore_once() {
+    let (store, tok) = setup();
+    let a = &tok[..tok.len() / 2];
+    let b = &tok[tok.len() / 2..];
+    let first = format!(
+        "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"tool_calls\":[{{\"index\":0,\"id\":\"call_1\",\"function\":{{\"name\":\"glob\"}}}},{{\"index\":0,\"function\":{{\"arguments\":\"{a}\"}}}}]}}}}]}}\n\n"
+    );
+    let second = format!(
+        "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"tool_calls\":[{{\"index\":0,\"function\":{{\"arguments\":\"{b}\"}}}}]}}}}]}}\n\n"
+    );
+    let out = run_stream(&store, Framing::Sse, &[&first, &second]);
+    assert!(
+        out.contains("13800138000"),
+        "跨 delta 半截占位符未拼回: {out}"
+    );
+    assert!(!out.contains(a), "不得把半截占位符原样下发: {out}");
+}
+
+/// 首条同 index 条目没有 arguments 字段（A1）：合并后参数仍要还原一次。
+#[test]
+fn first_tool_call_without_arguments_field_restores_once() {
+    let (store, tok) = setup();
+    let ev = format!(
+        "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"tool_calls\":[{{\"index\":0,\"id\":\"call_1\",\"function\":{{\"name\":\"glob\"}}}},{{\"index\":0,\"function\":{{\"arguments\":\"{tok}\"}}}}]}}}}]}}\n\n"
+    );
+    let out = run_stream(&store, Framing::Sse, &[&ev]);
+    assert!(out.contains("13800138000"), "参数条目未还原: {out}");
+    assert_eq!(
+        out.matches("13800138000").count(),
+        1,
+        "参数不得被复制到两条同 index 条目: {out}"
+    );
+}
+
+/// 单条 SSE 事件 >4MB 不能切半截 JSON，客户端必须能解析完整事件。
+#[test]
+fn oversized_single_sse_event_stays_valid_json() {
+    let store = SessionStore::new();
+    store.new_session("s");
+    let mut st = StreamState::new(Framing::Sse);
+    let big = "a".repeat(5 * 1024 * 1024);
+    let ev =
+        format!("data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"{big}\"}}}}]}}\n\n");
+    let (out, _) = st.push(ev.as_bytes(), "s", &store);
+    let text = String::from_utf8_lossy(&out);
+    let payload = text.trim().strip_prefix("data: ").expect("应下发 data: 帧");
+    let parsed: serde_json::Value = serde_json::from_str(payload).expect("完整事件必须是合法 JSON");
+    assert_eq!(parsed["choices"][0]["delta"]["content"], big);
+}
+
 /// CRLF 被 chunk 边界拆成 `\r` | `\n` 时仍要识别出完整 SSE 帧。
 #[test]
 fn crlf_split_across_chunks_keeps_sse_frame() {
