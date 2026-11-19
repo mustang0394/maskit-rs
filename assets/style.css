@@ -1186,3 +1186,9 @@ table.cmp tr:hover td { background: var(--panel-2); }
   /* 7 张指标卡：最后一张（今日 token）占满整行，避免半格悬空 */
   .cards .card:last-child { grid-column: 1 / -1; min-height: 84px; }
 }
+
+/* 登录输入框 / 白名单文本域：撑满容器（回滚上一版布局后仅保留的宽度修复） */
+.login-card .field,
+.login-card input { display: block; width: 100%; box-sizing: border-box; }
+.login-card input { min-height: 44px; padding: 0 12px; font-size: 16px; }
+#allowValues { display: block; width: 100%; box-sizing: border-box; }
