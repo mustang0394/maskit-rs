@@ -288,7 +288,7 @@
     document.querySelectorAll('.tab').forEach(t => {
       const on = t.dataset.page === name;
       t.classList.toggle('active', on);
-      t.setAttribute('aria-selected', on ? 'true' : 'false');
+      t.setAttribute('aria-current', on ? 'page' : 'false');
     });
     document.querySelectorAll('.page').forEach(p => p.classList.toggle('active', p.id === 'page-' + name));
     // 刷新/回退后仍停在当前页（用 replaceState，不往历史里堆垃圾条目）
@@ -308,7 +308,6 @@
     const p = hashPage();
     if (p && p !== currentPage) switchPage(p);
   });
-
   /* ==================== 概览 ==================== */
   async function loadDashboard() {
     const [status, today] = await Promise.all([api('/status'), api('/stats/today')]);
@@ -327,9 +326,16 @@
       ['fail-closed', status.fail_closed ? '开启' : '关闭'],
       ['配置版本', status.config_version],
       ['活跃会话', status.sessions],
-      ['今日请求', today.requests],
-      ['今日告警', today.alerts],
     ].map(([k, v]) => `<tr><td>${esc(k)}</td><td class="mono">${esc(v)}</td></tr>`).join('');
+
+    const todayTable = $('todayTable');
+    if (todayTable) {
+      todayTable.innerHTML = [
+        ['今日请求', today.requests],
+        ['今日告警', today.alerts],
+        ['今日 token', today.tokens_total],
+      ].map(([k, v]) => `<tr><td>${esc(k)}</td><td class="mono">${esc(v == null ? 0 : v)}</td></tr>`).join('');
+    }
 
     const el = $('topStatus');
     el.textContent = (status.paused ? '已暂停脱敏 · ' : '') +
@@ -1040,8 +1046,8 @@
         ? `<span class="lrow-flag">流式不符(${esc(e.stream_mode)}→${esc(actual)})</span>`
         : esc(e.stream_mode));
     }
-    return `<button class="lrow ${log.sel === e.id ? 'active' : ''}" data-log-id="${e.id}" role="option"
-              aria-selected="${log.sel === e.id ? 'true' : 'false'}">
+    return `<button class="lrow ${log.sel === e.id ? 'active' : ''}" data-log-id="${e.id}"
+              aria-current="${log.sel === e.id ? 'true' : 'false'}">
         <span class="lrow-line1">
           <span class="lrow-time">${esc(fmtTime(e.ts))}</span>
           <span class="badge ${esc(t)}">${esc(t)}</span>
@@ -1355,8 +1361,8 @@
   const audit = { sev: '', q: '', rows: [], sel: null };
 
   function auditRowHtml(a) {
-    return `<button class="lrow ${audit.sel === a.id ? 'active' : ''}" data-audit-id="${a.id}" role="option"
-              aria-selected="${audit.sel === a.id ? 'true' : 'false'}">
+    return `<button class="lrow ${audit.sel === a.id ? 'active' : ''}" data-audit-id="${a.id}"
+              aria-current="${audit.sel === a.id ? 'true' : 'false'}">
         <span class="lrow-top">
           <span class="lrow-time">${esc(fmtTime(a.ts))}</span>
           <span class="sev sev-${esc(a.severity)}">${esc(a.severity)}</span>

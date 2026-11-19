@@ -18,9 +18,22 @@
 </head>
 <body>
 
-<!-- ========== 登录页（无令牌时显示） ========== -->
+<svg class="svg-sprite" aria-hidden="true" xmlns="http://www.w3.org/2000/svg">
+  <symbol id="i-grid" viewBox="0 0 24 24"><rect x="3.5" y="3.5" width="7" height="7" rx="2"/><rect x="13.5" y="3.5" width="7" height="7" rx="2"/><rect x="3.5" y="13.5" width="7" height="7" rx="2"/><rect x="13.5" y="13.5" width="7" height="7" rx="2"/></symbol>
+  <symbol id="i-sliders" viewBox="0 0 24 24"><path d="M4 7h7M15 7h5M4 17h5M13 17h7"/><circle cx="13" cy="7" r="2.2"/><circle cx="11" cy="17" r="2.2"/></symbol>
+  <symbol id="i-list" viewBox="0 0 24 24"><path d="M9 6h11M9 12h11M9 18h11"/><circle cx="4.5" cy="6" r="1.2"/><circle cx="4.5" cy="12" r="1.2"/><circle cx="4.5" cy="18" r="1.2"/></symbol>
+  <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 3.5 19 6v5.2c0 4.6-3 7.7-7 9.3-4-1.6-7-4.7-7-9.3V6l7-2.5Z"/><path d="m9 12 2 2 4-4"/></symbol>
+  <symbol id="i-flask" viewBox="0 0 24 24"><path d="M9 3.5h6M10 3.5v6.2l-5 8.1a2.2 2.2 0 0 0 1.9 3.2h10.2a2.2 2.2 0 0 0 1.9-3.2l-5-8.1V3.5"/><path d="M8.5 14h7"/></symbol>
+  <symbol id="i-gear" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3.2"/><path d="M12 3.5v2.2M12 18.3v2.2M3.5 12h2.2M18.3 12h2.2M6 6l1.6 1.6M16.4 16.4 18 18M18 6l-1.6 1.6M7.6 16.4 6 18"/></symbol>
+  <symbol id="i-arrow" viewBox="0 0 24 24"><path d="M5 12h14M14 7l5 5-5 5"/></symbol>
+  <symbol id="i-lock" viewBox="0 0 24 24"><rect x="5" y="10" width="14" height="10" rx="3"/><path d="M8.5 10V7.5a3.5 3.5 0 0 1 7 0V10"/></symbol>
+</svg>
+
+<!-- ========== 登录页 ========== -->
 <div class="login-screen" id="loginScreen" hidden>
-  <form class="login-card" id="loginForm" autocomplete="on">
+  <div class="login-glow" aria-hidden="true"></div>
+  <form class="login-card glass" id="loginForm" autocomplete="on">
+    <div class="login-mark" aria-hidden="true"><svg class="ico"><use href="#i-shield"/></svg></div>
     <div class="login-brand">Maskit<span>-RS</span></div>
     <p class="login-sub">本地 LLM 脱敏网关</p>
     <label class="field">
@@ -33,53 +46,127 @@
     </p>
     <div class="login-error" id="loginError" hidden></div>
     <button type="submit" class="btn btn-primary btn-block" id="loginBtn">进入控制台</button>
+    <p class="login-foot"><svg class="ico"><use href="#i-lock"/></svg> 令牌只在本机校验，不会离开此设备</p>
   </form>
 </div>
 
 <!-- ========== 主界面 ========== -->
 <div class="app" id="app" hidden>
-  <header class="topbar">
-    <div class="brand">Maskit<span>-RS</span></div>
-    <nav class="tabs" id="tabs" role="tablist">
-      <button class="tab active" data-page="dashboard" role="tab" aria-selected="true">概览</button>
-      <button class="tab" data-page="rules" role="tab" aria-selected="false">规则</button>
-      <button class="tab" data-page="logs" role="tab" aria-selected="false">日志</button>
-      <button class="tab" data-page="audit" role="tab" aria-selected="false">审计</button>
-      <button class="tab" data-page="test" role="tab" aria-selected="false">测试</button>
-      <button class="tab" data-page="settings" role="tab" aria-selected="false">设置</button>
-    </nav>
-    <div class="topbar-right">
-      <span class="status" id="topStatus">连接中…</span>
-      <button class="icon-btn" id="themeToggle" title="切换深色 / 浅色主题" aria-label="切换主题">
-        <span id="themeIcon">☀</span>
-      </button>
-      <button class="icon-btn" id="logoutBtn" title="退出登录" aria-label="退出登录">⎋</button>
+  <div class="ambient" aria-hidden="true">
+    <span class="orb orb-a"></span><span class="orb orb-b"></span><span class="orb orb-c"></span>
+  </div>
+
+  <aside class="sidebar glass">
+    <div class="side-brand">
+      <span class="brand-mark"><svg class="ico"><use href="#i-shield"/></svg></span>
+      <span class="brand">Maskit<span>-RS</span></span>
+      <span class="brand-chip">LOCAL</span>
     </div>
-  </header>
+
+    <div class="side-status">
+      <span class="status" id="topStatus">连接中…</span>
+      <span class="side-status-note">单端口 · 单上游</span>
+    </div>
+
+    <nav class="tabs" id="tabs" aria-label="主导航">
+      <button class="tab active" data-page="dashboard" aria-current="page">
+        <svg class="ico"><use href="#i-grid"/></svg><span>概览</span>
+      </button>
+      <button class="tab" data-page="rules" aria-current="false">
+        <svg class="ico"><use href="#i-sliders"/></svg><span>规则</span>
+      </button>
+      <button class="tab" data-page="logs" aria-current="false">
+        <svg class="ico"><use href="#i-list"/></svg><span>日志</span>
+      </button>
+      <button class="tab" data-page="audit" aria-current="false">
+        <svg class="ico"><use href="#i-shield"/></svg><span>审计</span>
+      </button>
+      <button class="tab" data-page="test" aria-current="false">
+        <svg class="ico"><use href="#i-flask"/></svg><span>测试</span>
+      </button>
+      <button class="tab" data-page="settings" aria-current="false">
+        <svg class="ico"><use href="#i-gear"/></svg><span>设置</span>
+      </button>
+    </nav>
+
+    <div class="sidebar-foot">
+      <div class="privacy-card">
+        <span class="privacy-dot"></span>
+        <div><b>本地隐私网关</b><small>映射与事件仅存本机</small></div>
+      </div>
+      <div class="side-actions">
+        <button class="icon-btn" id="themeToggle" title="切换深色 / 浅色主题" aria-label="切换主题">
+          <span id="themeIcon">☀</span>
+        </button>
+        <button class="icon-btn" id="logoutBtn" title="退出登录" aria-label="退出登录">⎋</button>
+      </div>
+    </div>
+  </aside>
 
   <main>
     <!-- ==================== 概览 ==================== -->
     <section class="page active" id="page-dashboard">
-      <div class="cards" id="statCards"></div>
-      <div class="panel">
-        <div class="panel-head"><h2>运行状态</h2></div>
-        <table class="kv" id="statusTable"></table>
-        <div class="row">
-          <button id="btnPause" class="btn btn-warn">暂停脱敏（纯透传）</button>
+      <div class="page-head">
+        <div class="page-head-copy">
+          <div class="eyebrow">MASKIT / OVERVIEW</div>
+          <h1>网关概览</h1>
+          <p>实时查看脱敏链路、上游连接与今日流量。</p>
+        </div>
+        <div class="page-actions">
+          <button id="btnPause" class="btn btn-warn">暂停脱敏</button>
           <button id="btnResume" class="btn btn-ok">恢复脱敏</button>
+        </div>
+      </div>
+
+      <div class="cards" id="statCards"></div>
+
+      <div class="dash-grid">
+        <div class="panel">
+          <div class="panel-head">
+            <div>
+              <h2>运行状态</h2>
+              <p class="panel-sub">网关监听、上游与安全策略</p>
+            </div>
+            <span class="live-pill"><span></span>LIVE</span>
+          </div>
+          <table class="kv" id="statusTable"></table>
+        </div>
+        <div class="panel">
+          <div class="panel-head">
+            <div>
+              <h2>今日</h2>
+              <p class="panel-sub">UTC 自然日统计</p>
+            </div>
+          </div>
+          <table class="kv" id="todayTable"></table>
+          <div class="hero-note">
+            <svg class="ico"><use href="#i-shield"/></svg>
+            <span>所有敏感值在离开本机前已替换为占位符。</span>
+          </div>
         </div>
       </div>
     </section>
 
     <!-- ==================== 规则 ==================== -->
     <section class="page" id="page-rules">
+      <div class="page-head">
+        <div class="page-head-copy">
+          <div class="eyebrow">MASKIT / RULES</div>
+          <h1>脱敏规则</h1>
+          <p>控制内置规则、值白名单与自定义敏感词。</p>
+        </div>
+        <div class="page-actions">
+          <span class="hint" id="ruleSummary"></span>
+          <button class="btn btn-sm" id="btnRulesAll">全部开启</button>
+          <button class="btn btn-sm" id="btnRulesDefault">恢复默认</button>
+        </div>
+      </div>
+
       <div class="panel">
         <div class="panel-head">
-          <h2>内置规则</h2>
-          <div class="panel-actions">
-            <span class="hint" id="ruleSummary"></span>
-            <button class="btn btn-sm" id="btnRulesAll">全部开启</button>
-            <button class="btn btn-sm" id="btnRulesDefault">恢复默认</button>
+          <div>
+            <h2>内置规则</h2>
+            <p class="panel-sub">每条规则可独立设置处置方式</p>
           </div>
         </div>
         <div class="rules-grid" id="ruleToggles"></div>
@@ -87,36 +174,41 @@
 
       <div class="panel">
         <div class="panel-head">
-          <h2>值白名单</h2>
-          <span class="hint">整值精确匹配，大小写不敏感；最多 200 条，每行一个</span>
+          <div>
+            <h2>值白名单</h2>
+            <p class="panel-sub">整值精确匹配，大小写不敏感；最多 200 条，每行一个</p>
+          </div>
         </div>
         <textarea id="allowValues" rows="5" spellcheck="false"
           placeholder="例如：13800138000&#10;test@example.com"></textarea>
-        <div class="row" style="margin-top:8px">
+        <div class="row">
           <button class="btn btn-primary" id="btnSaveAllow">保存白名单</button>
           <span class="hint" id="allowSummary"></span>
         </div>
       </div>
 
-      <!-- 自定义敏感词：分组是独立实体，先建组、再往里加词 -->
       <div class="panel">
         <div class="panel-head">
-          <h2>自定义敏感词</h2>
-          <span class="hint">
-            命中后替换为 <code>{{分组_xxxxxx}}</code>；原文本就在 <code>config.json</code> 里，
-            因此占位符跨重启稳定。以 <code>re:</code> 开头的词按正则处理。
-          </span>
+          <div>
+            <h2>自定义敏感词</h2>
+            <p class="panel-sub">命中后替换为占位符；以 <code>re:</code> 开头的词按正则处理</p>
+          </div>
         </div>
         <div class="split split-tall">
           <aside class="split-list cw-nav" id="cwNav" aria-label="敏感词分组"></aside>
           <section class="split-detail" id="cwMain"></section>
         </div>
+        <p class="hint panel-foot-note">
+          原文本保存在 <code>config.json</code>，因此占位符跨重启稳定。
+        </p>
       </div>
 
       <div class="panel">
         <div class="panel-head">
-          <h2>密钥前缀规则</h2>
-          <span class="hint">前缀 + 至少 8 位字符，如 <code>sk-</code></span>
+          <div>
+            <h2>密钥前缀规则</h2>
+            <p class="panel-sub">前缀 + 至少 8 位字符，如 <code>sk-</code></p>
+          </div>
         </div>
         <div class="row">
           <input id="newPrefix" placeholder="如 sk-" />
@@ -128,9 +220,20 @@
 
     <!-- ==================== 日志 ==================== -->
     <section class="page" id="page-logs">
-      <div class="panel">
+      <div class="page-head">
+        <div class="page-head-copy">
+          <div class="eyebrow">MASKIT / EVENTS</div>
+          <h1>事件日志</h1>
+          <p>按请求查看脱敏、还原、阻断与错误事件。</p>
+        </div>
+      </div>
+
+      <div class="panel panel-flush">
         <div class="panel-head logs-head">
-          <h2>事件日志</h2>
+          <div>
+            <h2>事件流</h2>
+            <p class="panel-sub">列表只含摘要，点开后再加载对话与请求头</p>
+          </div>
           <div class="panel-actions">
             <select id="logType" aria-label="事件类型">
               <option value="">全部类型</option>
@@ -152,13 +255,12 @@
           </div>
         </div>
         <p class="logs-hint">
-          列表只含摘要；点开某条才加载它的对话文本与请求头。
-          <strong>完整报文</strong>（原始字节，最多 4 侧）不在页面内联渲染，请在详情底部用「导出完整报文」下载。
+          <strong>完整报文</strong>不在页面内联渲染，请在详情底部用「导出完整报文」下载；
           凭据类受 <code>mask.log_credential_plaintext</code> 控制。
         </p>
         <div class="logs-body">
           <div class="logs-list-col">
-            <div class="split-list" id="logList" role="listbox" aria-label="事件列表"></div>
+            <div class="split-list" id="logList" aria-label="事件列表"></div>
             <div class="split-foot">
               <span class="hint" id="logMeta"></span>
               <span class="pager">
@@ -172,12 +274,22 @@
       </div>
     </section>
 
-
     <!-- ==================== 审计 ==================== -->
     <section class="page" id="page-audit">
-      <div class="panel">
+      <div class="page-head">
+        <div class="page-head-copy">
+          <div class="eyebrow">MASKIT / AUDIT</div>
+          <h1>审计事件</h1>
+          <p>被动检测凭据回流、响应投毒与危险命令等风险。</p>
+        </div>
+      </div>
+
+      <div class="panel panel-flush">
         <div class="panel-head">
-          <h2>审计事件</h2>
+          <div>
+            <h2>审计流</h2>
+            <p class="panel-sub">只记录信号与证据，不修改上游响应</p>
+          </div>
           <div class="panel-actions">
             <select id="auditSev" aria-label="严重度">
               <option value="">全部严重度</option>
@@ -192,11 +304,9 @@
             <button class="btn btn-sm btn-warn" id="auditClear">清空</button>
           </div>
         </div>
-        <p class="hint">
-          被动检测：错误泄露 / 换芯 / 工具重写 / 流异常 / 响应投毒 / 跨请求污染 / 凭据回流 / 危险命令。
-        </p>
+        <p class="hint panel-intro">错误泄露 / 换芯 / 工具重写 / 流异常 / 响应投毒 / 跨请求污染 / 凭据回流 / 危险命令。</p>
         <div class="split">
-          <div class="split-list" id="auditList" role="listbox" aria-label="审计列表"></div>
+          <div class="split-list" id="auditList" aria-label="审计列表"></div>
           <div class="split-detail" id="auditDetail"></div>
         </div>
         <div class="split-foot"><span class="hint" id="auditMeta"></span></div>
@@ -205,14 +315,15 @@
 
     <!-- ==================== 脱敏测试 ==================== -->
     <section class="page" id="page-test">
-      <div class="panel">
-        <div class="panel-head">
-          <h2>脱敏测试</h2>
-          <span class="hint">
-            与生产网关走<strong>同一套</strong>脱敏引擎。本测试使用<strong>独立的临时映射表</strong>，
-            运行结束即销毁 —— <strong>不写入数据库，也不进入内存映射</strong>，不会影响线上占位符的稳定性。
-          </span>
+      <div class="page-head">
+        <div class="page-head-copy">
+          <div class="eyebrow">MASKIT / PLAYGROUND</div>
+          <h1>脱敏测试</h1>
+          <p>与生产网关走同一套引擎；使用独立临时映射表，运行结束即销毁 —— 不写入数据库，也不进入内存映射。</p>
         </div>
+      </div>
+
+      <div class="panel">
         <div class="test-form">
           <label class="inline-field">
             <span class="field-label">模式</span>
@@ -249,7 +360,7 @@
 
       <div class="panel" id="testResult" hidden>
         <div class="panel-head">
-          <h2>结果</h2>
+          <div><h2>结果</h2></div>
           <span class="hint" id="testSummary"></span>
         </div>
         <div class="cmp2">
@@ -279,76 +390,99 @@
 
     <!-- ==================== 设置 ==================== -->
     <section class="page" id="page-settings">
-      <div class="panel">
-        <div class="panel-head"><h2>上游（单一上游，单端口）</h2></div>
-        <div class="row">
-          <label class="field-label" for="upstreamTarget">目标地址</label>
-          <input id="upstreamTarget" class="grow" placeholder="https://api.your-relay.com" />
+      <div class="page-head">
+        <div class="page-head-copy">
+          <div class="eyebrow">MASKIT / SETTINGS</div>
+          <h1>设置</h1>
+          <p>配置上游、行为、诊断与访问令牌。</p>
         </div>
-        <div class="row">
-          <label class="field-label" for="serverPort">监听端口</label>
-          <input id="serverPort" type="number" class="narrow" />
-          <label class="field-label" for="serverBind">绑定地址</label>
-          <input id="serverBind" class="narrow" />
-        </div>
-        <p class="hint">改端口 / 绑定地址需重启进程生效；改上游地址立即生效。</p>
       </div>
 
       <div class="panel">
-        <div class="panel-head"><h2>行为</h2></div>
+        <div class="panel-head">
+          <div><h2>上游</h2><p class="panel-sub">单端口、单上游</p></div>
+        </div>
+        <div class="setting-row">
+          <label class="setting-label" for="upstreamTarget">目标地址</label>
+          <div class="setting-control"><input id="upstreamTarget" class="grow" placeholder="https://api.your-relay.com" /></div>
+        </div>
+        <div class="setting-row">
+          <label class="setting-label" for="serverPort">监听端口</label>
+          <div class="setting-control"><input id="serverPort" type="number" class="narrow" /></div>
+        </div>
+        <div class="setting-row">
+          <label class="setting-label" for="serverBind">绑定地址</label>
+          <div class="setting-control"><input id="serverBind" class="narrow" /></div>
+        </div>
+        <p class="hint panel-foot-note">改端口 / 绑定地址需重启进程生效；改上游地址立即生效。</p>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <div><h2>行为</h2><p class="panel-sub">决定异常请求与响应如何被处理</p></div>
+        </div>
         <label class="switch"><input type="checkbox" id="failClosed" />
           <span>fail-closed：已识别协议脱敏异常时阻断（不放行未脱敏原文）</span></label>
         <label class="switch"><input type="checkbox" id="responseScan" />
           <span>响应侧 PII 扫描（模型幻觉泄漏告警）</span></label>
         <label class="switch"><input type="checkbox" id="streamResponse" />
           <span>SSE / NDJSON 流式还原</span></label>
-        <div class="row">
-          <label class="field-label" for="cmdMode">命令拦截模式</label>
-          <select id="cmdMode">
-            <option value="observe">observe — 只记录（默认）</option>
-            <option value="rewrite">rewrite — 改写为占位说明</option>
-            <option value="block">block — 停止下发</option>
-          </select>
+        <div class="setting-row">
+          <label class="setting-label" for="cmdMode">命令拦截模式</label>
+          <div class="setting-control">
+            <select id="cmdMode">
+              <option value="observe">observe — 只记录（默认）</option>
+              <option value="rewrite">rewrite — 改写为占位说明</option>
+              <option value="block">block — 停止下发</option>
+            </select>
+          </div>
         </div>
-        <div class="row">
-          <label class="field-label" for="retentionDays">日志保留（天）</label>
-          <input id="retentionDays" type="number" class="narrow" />
+        <div class="setting-row">
+          <label class="setting-label" for="retentionDays">日志保留</label>
+          <div class="setting-control">
+            <input id="retentionDays" type="number" class="narrow" />
+            <span class="hint">天</span>
+          </div>
         </div>
       </div>
 
       <div class="panel">
         <div class="panel-head">
-          <h2>完整报文（诊断环）</h2>
-          <span class="hint">原始字节，仅当 <code>mask.log_credential_plaintext=true</code> 时采集</span>
+          <div>
+            <h2>完整报文（诊断环）</h2>
+            <p class="panel-sub">原始字节，仅当 <code>mask.log_credential_plaintext=true</code> 时采集</p>
+          </div>
         </div>
-        <div class="row">
-          <label class="field-label" for="traceCount">保留条数</label>
-          <input id="traceCount" type="number" class="narrow" min="0" max="200" />
-          <label class="field-label" for="traceMaxMb">单侧上限</label>
-          <input id="traceMaxMb" type="number" class="narrow" min="1" max="32" step="1" />
-          <span class="hint">MiB（原文 / 脱敏后 / 上游响应 / 还原后，每侧单独算）</span>
+        <div class="setting-row">
+          <label class="setting-label" for="traceCount">保留条数</label>
+          <div class="setting-control"><input id="traceCount" type="number" class="narrow" min="0" max="200" /></div>
         </div>
-        <div class="row">
-          <label class="field-label" for="traceTotalMb">总预算</label>
-          <input id="traceTotalMb" type="number" class="narrow" min="16" max="4096" step="16" />
-          <span class="hint">MiB（超出后按最旧会话整组淘汰，防止磁盘被撑爆）</span>
+        <div class="setting-row">
+          <label class="setting-label" for="traceMaxMb">单侧上限</label>
+          <div class="setting-control"><input id="traceMaxMb" type="number" class="narrow" min="1" max="32" step="1" /><span class="hint">MiB / 每侧</span></div>
         </div>
-        <p class="hint">
-          单侧上限小于实际报文大小时，导出文件里会显示「存储时截断」—— 把它调到不小于最大请求体
-          即可导出完整报文。保留条数设为 <code>0</code> 会整体关闭诊断环（不落盘、不可导出）。
+        <div class="setting-row">
+          <label class="setting-label" for="traceTotalMb">总预算</label>
+          <div class="setting-control"><input id="traceTotalMb" type="number" class="narrow" min="16" max="4096" step="16" /><span class="hint">MiB，超出后按最旧会话淘汰</span></div>
+        </div>
+        <p class="hint panel-foot-note">
+          单侧上限小于实际报文大小时，导出文件会标注「存储时截断」。保留条数设为 <code>0</code> 会整体关闭诊断环。
         </p>
       </div>
 
       <div class="panel">
-        <div class="panel-head"><h2>访问令牌</h2></div>
-        <div class="row">
-          <input id="panelToken" type="password" class="grow mono"
-                 autocomplete="new-password" spellcheck="false" />
-          <button class="btn btn-sm" id="btnToggleToken" type="button" aria-label="显示令牌">显示</button>
-          <button class="btn" id="btnRotateToken">重新生成</button>
+        <div class="panel-head">
+          <div><h2>访问令牌</h2><p class="panel-sub">默认遮蔽显示，防止投屏或肩窥泄露</p></div>
         </div>
-        <p class="hint">默认遮蔽显示（防肩窥 / 投屏泄露），点「显示」可查看并复制。
-          修改后需重新登录；长度不限，留空则自动生成。令牌同时也写在数据目录的 <code>config.json</code>。</p>
+        <div class="setting-row">
+          <label class="setting-label" for="panelToken">Panel Token</label>
+          <div class="setting-control">
+            <input id="panelToken" type="password" class="grow mono" autocomplete="new-password" spellcheck="false" />
+            <button class="btn btn-sm" id="btnToggleToken" type="button" aria-label="显示令牌">显示</button>
+            <button class="btn btn-sm" id="btnRotateToken">重新生成</button>
+          </div>
+        </div>
+        <p class="hint panel-foot-note">修改后需重新登录；长度不限，留空则自动生成。</p>
       </div>
 
       <div class="row sticky-save">
