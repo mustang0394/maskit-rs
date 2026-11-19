@@ -648,6 +648,29 @@ fn terminal_event_completes_split_placeholder_before_flush() {
     assert!(!out.contains(a), "不得把半截占位符当独立残片先补发: {out}");
 }
 
+/// 同一 delta 里两条相同 index 的 tool_calls（id/name 与 arguments 拆开）：
+/// 还原只能写回各自条目，不能把 arguments 复制到第一条，否则客户端合并后
+/// 得到 `{...}{...}` 重复 JSON（真实 agent 报错）。
+#[test]
+fn duplicate_tool_call_index_is_not_duplicated_on_restore() {
+    let store = SessionStore::new();
+    store.new_session("s");
+    let mut st = StreamState::new(Framing::Sse);
+    let ev = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[",
+        "{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"glob\",\"arguments\":\"\"}},",
+        "{\"index\":0,\"type\":null,\"function\":{\"arguments\":\"{\\\"pattern\\\":\\\"budgetAggregate*.js\\\"}\"}}",
+        "]}}]}\n\n"
+    );
+    let (out, _) = st.push(ev.as_bytes(), "s", &store);
+    let text = String::from_utf8_lossy(&out);
+    assert_eq!(
+        text.matches("budgetAggregate").count(),
+        1,
+        "arguments 不得被复制到重复 index 的第一条: {text}"
+    );
+}
+
 /// CRLF 被 chunk 边界拆成 `\r` | `\n` 时仍要识别出完整 SSE 帧。
 #[test]
 fn crlf_split_across_chunks_keeps_sse_frame() {

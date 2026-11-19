@@ -107,6 +107,12 @@ pub fn text_slots(data: &Value) -> Vec<Slot> {
                     }
                 }
                 if let Some(tcs) = d.get("tool_calls").and_then(Value::as_array) {
+                    // 同一 delta 里可能有多条 **相同 index** 的 tool_calls（中转把
+                    // id/name 与 arguments 拆成两条，各自 index=0）。通道必须带
+                    // 数组位置，否则 set_slot 会把还原结果写进所有同 index 条目，
+                    // 客户端按 index 合并后得到 `{...}{...}` 重复 JSON。
+                    let mut seen: std::collections::HashMap<usize, usize> =
+                        std::collections::HashMap::new();
                     for (tidx, tc) in tcs.iter().enumerate() {
                         let slot_no = tc
                             .get("index")
@@ -118,7 +124,14 @@ pub fn text_slots(data: &Value) -> Vec<Slot> {
                             .and_then(|f| f.get("arguments"))
                             .and_then(Value::as_str)
                         {
-                            slots.push((format!("c{idx}.tool{slot_no}"), args.to_string(), true));
+                            let n = seen.entry(slot_no).or_insert(0);
+                            let channel = if *n == 0 {
+                                format!("c{idx}.tool{slot_no}")
+                            } else {
+                                format!("c{idx}.tool{slot_no}@{tidx}")
+                            };
+                            *n += 1;
+                            slots.push((channel, args.to_string(), true));
                         }
                     }
                 }
@@ -378,7 +391,13 @@ pub fn set_slot(data: &mut Value, channel: &str, text: &str) {
                         }
                     }
                     f if f.starts_with("tool") => {
-                        let Ok(n) = f[4..].parse::<usize>() else {
+                        // `tool{n}`：写第一条同 index 的条目；
+                        // `tool{n}@{pos}`：只写数组第 pos 条（同一 delta 内重复 index）。
+                        let (n_s, only_pos) = match f[4..].split_once('@') {
+                            Some((a, b)) => (a, b.parse::<usize>().ok()),
+                            None => (&f[4..], None),
+                        };
+                        let Ok(n) = n_s.parse::<usize>() else {
                             return;
                         };
                         if let Some(tcs) = c
@@ -386,7 +405,13 @@ pub fn set_slot(data: &mut Value, channel: &str, text: &str) {
                             .and_then(|d| d.get_mut("tool_calls"))
                             .and_then(Value::as_array_mut)
                         {
+                            let mut written = false;
                             for (tidx, tc) in tcs.iter_mut().enumerate() {
+                                if let Some(pos) = only_pos {
+                                    if tidx != pos {
+                                        continue;
+                                    }
+                                }
                                 let slot_no = tc
                                     .get("index")
                                     .and_then(Value::as_u64)
@@ -398,8 +423,13 @@ pub fn set_slot(data: &mut Value, channel: &str, text: &str) {
                                     {
                                         f.insert("arguments".into(), Value::String(text.into()));
                                     }
+                                    written = true;
+                                    if only_pos.is_none() {
+                                        break; // 只写第一条，避免复制到重复 index 条目
+                                    }
                                 }
                             }
+                            let _ = written;
                         }
                     }
                     // 通用增量通道：`x{原字段名}` → 按原字段名回写（见 `GENERIC_CHANNEL_PREFIX`）。
@@ -468,6 +498,39 @@ pub fn set_slot(data: &mut Value, channel: &str, text: &str) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn duplicate_tool_call_index_does_not_duplicate_arguments() {
+        // 中转把 id/name 与 arguments 拆成两条 index=0 的 tool_calls；
+        // 旧 set_slot 会把还原结果写进两条，客户端合并后得到 `{...}{...}`。
+        let mut v = json!({"choices": [{"index": 0, "delta": {"tool_calls": [
+            {"index": 0, "id": "call_1", "function": {"name": "glob", "arguments": ""}},
+            {"index": 0, "function": {"arguments": "{\"pattern\":\"x\"}"}}
+        ]}}]});
+        let slots = text_slots(&v);
+        assert_eq!(slots.len(), 2);
+        assert_eq!(slots[0].0, "c0.tool0");
+        assert_eq!(slots[1].0, "c0.tool0@1");
+        set_slot(&mut v, &slots[1].0, "RESTORED");
+        assert_eq!(
+            v["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"],
+            ""
+        );
+        assert_eq!(
+            v["choices"][0]["delta"]["tool_calls"][1]["function"]["arguments"],
+            "RESTORED"
+        );
+        // 无位置后缀只写第一条，绝不复制到重复 index 条目
+        set_slot(&mut v, "c0.tool0", "FIRST");
+        assert_eq!(
+            v["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"],
+            "FIRST"
+        );
+        assert_eq!(
+            v["choices"][0]["delta"]["tool_calls"][1]["function"]["arguments"],
+            "RESTORED"
+        );
+    }
 
     #[test]
     fn unregistered_delta_fields_get_generic_channels() {
