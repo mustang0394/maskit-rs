@@ -163,6 +163,12 @@ pub struct Event {
     pub new_count: usize,
     #[serde(default, skip_serializing_if = "is_zero_usize")]
     pub reused_count: usize,
+    /// 本次请求中被 `rule_actions=warn` 放行的命中次数（明文上行，按出现次数计）。
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub warned: usize,
+    /// 被 warn 放行的规则标签（排序去重）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warned_labels: Vec<String>,
     /// 未还原占位符数（响应侧）
     #[serde(default, skip_serializing_if = "is_zero_usize")]
     pub unresolved: usize,
@@ -234,6 +240,9 @@ pub struct EventSummary {
     pub item_count: usize,
     #[serde(skip_serializing_if = "is_zero_usize")]
     pub header_count: usize,
+    /// warn 放行次数（列表页打标用；详情里有 labels）。
+    #[serde(skip_serializing_if = "is_zero_usize")]
+    pub warned: usize,
 }
 
 impl EventSummary {
@@ -261,6 +270,7 @@ impl EventSummary {
             resp_bytes: e.resp_bytes,
             item_count: e.items.len(),
             header_count: e.request_headers.len(),
+            warned: e.warned,
         }
     }
 }
@@ -312,6 +322,8 @@ impl Default for Event {
             items: vec![],
             new_count: 0,
             reused_count: 0,
+            warned: 0,
+            warned_labels: vec![],
             unresolved: 0,
             unresolved_samples: vec![],
             unknown_shape: false,

@@ -78,6 +78,7 @@ MASKIT_RS_DATA_DIR=/var/lib/maskit-rs ./target/release/maskit-rs
   - **已知误报率（如实声明）**：`CARD`（银行卡）仅靠「位数 + Luhn 校验」判定，而 Luhn 是 1/10 的弱校验 —— 实测 13-19 位、`3-6` 开头的随机数字串有 **~10%** 会通过，即订单号 / 运单号会被误脱敏。这是 Luhn 方案的固有代价（Python 版同样），敏感数字串较多的场景建议**关掉 `CARD`**
   - **EMAIL 不做「保留中文正文」的裁剪（有意为之）**：`我的邮箱是zhangsan@qq.com` 会把邮箱前的中文一段一起遮住。看上去可以只遮邮箱本体、保留正文，但 CJK 前导段究竟是**正文**还是**姓名**（本地部分的一部分）无法区分 —— 一旦把前导 CJK 排除在替换范围外，名称就会残留明文（实测 `我的邮箱是张三2024@qq.com` → `张三` 留在明文）。按「漏检比误报更不能接受」的原则，宁可多遮几个中文字（可完整还原），也不把姓名发给上游
   - **已知取舍：短密钥 vs 标识符**。密钥前缀规则（`sk-`/`ah-` 等，可在控制台配置）对**尾部 8-19 位且不含数字**的串不再脱敏 —— `sk_learn_utils_loader`、`sk-forecast-model` 这类词首标识符与真钥形状完全相同（左边界拦不住），只能靠「真钥是随机串、几乎必含数字」区分。代价：全字母的短密钥（随机字母数字则约 6%）会漏检；尾部 ≥20 位不受影响。`TOKEN`（Bearer）同理要求值含数字或符号。
+- **规则三态与值白名单**：每条内置规则可单独设为 `mask`（默认）/ `warn`（只告警、不改写，**原文会发给上游**）/ `block`（照常脱敏但拒绝转发，返回 503 `shield_rule_blocked`）。`allow_values` 是整值、大小写不敏感的白名单，命中的完整值不脱敏（不会豁免其内部子串被其它规则命中）；最多 200 条、单条 256 字符。凭据类标签（API_KEY/TOKEN/SECRET/ACCESS_KEY/JWT/CONNSTR/PRIVATE_KEY）禁止 `warn`，配置层强制回退 `mask`。
 - **自定义敏感词分组**：分组是独立实体（`mask.custom_word_groups` 有序声明 + `mask.custom_words` 的 `{词: 分组}`），可以**只有名字没有词**——先建组、再往组里加词，不必每次重打分组名；支持组内搜索、重命名、整组/逐词启用、整词匹配、批量粘贴；以 `re:` 开头的词按正则处理
 - **多轮一致性**：同一原文在 TTL 内复用同一占位符（`session_ttl`，默认 600s）
 - **路径感知脱敏**：协议位置字段（`role`/`model`/`id` 等）不动，业务区（工具参数）强制扫描
@@ -95,6 +96,7 @@ MASKIT_RS_DATA_DIR=/var/lib/maskit-rs ./target/release/maskit-rs
   - **完整报文（诊断环）**：**只能在详情页点「导出完整报文」下载 `.txt`**，页面不再内联渲染 —— 它最多 4 侧 × 单侧上限（默认 32MiB），一次性塞进 DOM 会把浏览器卡死（这正是 2026-11 那次重构的起因）。导出文件分四节：原始请求 / 发给上游（已脱敏）/ 上游原始响应（占位符原样）/ 返回客户端（还原后），JSON 会自动缩进格式化（SSE 的 `data: {...}` 逐事件美化，超过 8MiB 的节原样输出以免文件过大），可在文件里直接搜索 `/` 对照。这是排查「脱敏了没还原」的关键证据：`dialog` 只是抽取后的对话文本，看不到上游回来的占位符原样。见配置 `full_trace_count`，端点 `GET /console/api/logs/trace/download?id=N`。注意：多模态载荷外置后，「发给上游」一节显示的是 token 形态（`kmb-…`），实际转发时已按原始字节拼回；「原始请求」一节仍是完整原始字节
   - **列表只回摘要**：`GET /api/logs` 不返回 `dialog` / `masked_dialog` / `items[]` / `request_headers` / 报文，只回十来个标量 + `item_count` / `header_count`（SQL 层 `json_extract` 投影，不反序列化整条 payload）。对话文本与请求头由 `GET /api/logs/detail?id=N` 按需返回 —— 列表一页 100 条带上这些字段能到数 MB。
   - **请求头日志**：`events[].request_headers`，为 `[[name, value], …]`（保序 + 保留同名重复头，如多个 `accept`）。头名统一转小写。凭据类（`authorization` / `cookie` / `x-api-key` 等）的值按 `mask.log_credential_plaintext` 决定是否显示为 `***`；导出（`/api/logs/export`，接 `q` / `event_type` 筛选，超过 5000 条回 `X-Maskit-Truncated: true`）**恒剔除**该字段。为防客户端用超大/超多头撑爆事件库，上限为 100 个、单值 2048 字符、合计 16KiB，超限截断并附 `x-shield-truncated` 标记
+- **`warn` 是显式例外**：它会让对应类型的原文上行，即使 `fail_closed=true`；只建议用于 PHONE/EMAIL 等非凭据类规则的误报观察。凭据类 `warn` 会被拒绝并回退 `mask`；`allow_values` 同样是用户显式放行，需自行确认值不敏感。
 - **凭据明文落盘（按设计）**：脱敏命中的映射表 `placeholder_map` 会无条件记录**所有**分类（含凭据类）的 `占位符 → 原文`，用于进程重启后还原历史对话里的占位符。
   因此「凭据类原文永不落库」**只对 `events` 表成立**（受 `mask.log_credential_plaintext` 控制），不适用于映射表；`config.json` 里的原始敏感词同理。**备份数据目录必须加密。**
 

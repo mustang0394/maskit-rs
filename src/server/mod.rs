@@ -392,6 +392,28 @@ pub async fn passthrough(
     }
 }
 
+/// rule_actions=block 的 503 响应（带命中标签与禁止重试头）。
+pub fn rule_block_response(labels: &[String]) -> Response {
+    let body = serde_json::json!({
+        "error": {
+            "code": "shield_rule_blocked",
+            "reason": "rule_action_block",
+            "labels": labels,
+        }
+    });
+    let mut resp = (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        serde_json::to_string(&body).unwrap_or_default(),
+    )
+        .into_response();
+    resp.headers_mut().insert(
+        axum::http::header::HeaderName::from_static("x-should-retry"),
+        axum::http::header::HeaderValue::from_static("false"),
+    );
+    resp
+}
+
 /// 结构化错误响应（JSON body，对齐 Python 的 error 形态）。
 pub fn error_response(status: StatusCode, message: &str) -> Response {
     let body = serde_json::json!({ "error": message });
@@ -416,4 +438,28 @@ pub async fn forward_all(state: SharedState, req: Request) -> Response {
     };
     let method = parts.method.as_str().to_string();
     passthrough(&state, &method, &parts.uri, &parts.headers, body_bytes).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rule_block_response_has_status_headers_and_labels() {
+        let labels = vec!["PHONE".to_string(), "CARD".to_string()];
+        let resp = rule_block_response(&labels);
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/json")
+        );
+        assert_eq!(
+            resp.headers()
+                .get("x-should-retry")
+                .and_then(|v| v.to_str().ok()),
+            Some("false")
+        );
+    }
 }

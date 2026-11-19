@@ -85,6 +85,19 @@
         <div class="rules-grid" id="ruleToggles"></div>
       </div>
 
+      <div class="panel">
+        <div class="panel-head">
+          <h2>值白名单</h2>
+          <span class="hint">整值精确匹配，大小写不敏感；最多 200 条，每行一个</span>
+        </div>
+        <textarea id="allowValues" rows="5" spellcheck="false"
+          placeholder="例如：13800138000&#10;test@example.com"></textarea>
+        <div class="row" style="margin-top:8px">
+          <button class="btn btn-primary" id="btnSaveAllow">保存白名单</button>
+          <span class="hint" id="allowSummary"></span>
+        </div>
+      </div>
+
       <!-- 自定义敏感词：分组是独立实体，先建组、再往里加词 -->
       <div class="panel">
         <div class="panel-head">

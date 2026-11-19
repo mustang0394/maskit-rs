@@ -1411,3 +1411,123 @@ async fn multimodal_blob_data_uri_mode_only_externalizes_data_uris() {
         ev.message
     );
 }
+
+/// 规则三态 block：上游必须零请求，返回 503 + labels，事件只记 BLOCK。
+#[tokio::test]
+async fn rule_action_block_returns_503_without_upstream() {
+    let h = Harness::new(true, false, true).await;
+    let mut cfg = h.state.config.get();
+    cfg.mask.rule_actions.insert("PHONE".into(), "block".into());
+    h.state.config.update(cfg);
+
+    let body = serde_json::json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": format!("电话{SENTINEL_PHONE}")}]
+    })
+    .to_string();
+    let (status, bytes) = h
+        .send("POST", "/v1/chat/completions", "application/json", &body)
+        .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["error"]["code"], "shield_rule_blocked");
+    assert_eq!(v["error"]["reason"], "rule_action_block");
+    assert_eq!(v["error"]["labels"][0], "PHONE");
+    assert!(h.mock.requests().is_empty(), "block 请求不得到达上游");
+
+    let ev = find_event(h.bus(), maskit_rs::store::events::EventType::Block).expect("BLOCK 事件");
+    assert_eq!(ev.reason, "rule_action_block");
+    assert!(ev.message.contains("PHONE"));
+    assert!(ev.mask_ms.is_some(), "BLOCK 事件应带脱敏耗时");
+    assert!(
+        find_event(h.bus(), maskit_rs::store::events::EventType::Mask).is_none(),
+        "block 不应再发 MASK 事件"
+    );
+    // block 不应删除同 sid 会话，且必须释放 inflight（否则 sweep 永久跳过）。
+    let sess = h
+        ._store
+        .get(&ev.session_id)
+        .expect("block 后会话不应被删除");
+    assert!(!sess.inflight, "block 后 inflight 必须释放");
+}
+
+/// warn：不改写、明文上行，但事件必须可见。
+#[tokio::test]
+async fn rule_action_warn_forwards_plaintext_and_reports() {
+    let h = Harness::new(true, false, true).await;
+    let mut cfg = h.state.config.get();
+    cfg.mask.rule_actions.insert("PHONE".into(), "warn".into());
+    h.state.config.update(cfg);
+
+    let body = serde_json::json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": format!("电话{SENTINEL_PHONE}")}]
+    })
+    .to_string();
+    let (status, _) = h
+        .send("POST", "/v1/chat/completions", "application/json", &body)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let up = String::from_utf8_lossy(&h.mock.last_body().unwrap()).to_string();
+    assert!(up.contains(SENTINEL_PHONE), "warn 按语义必须明文上行");
+    let ev = find_event(h.bus(), maskit_rs::store::events::EventType::Mask).expect("MASK 事件");
+    assert_eq!(ev.warned, 1);
+    assert_eq!(ev.warned_labels, vec!["PHONE"]);
+}
+
+/// allow_values：整值放行，不产生映射；与 block 同时配置时 allow 优先。
+#[tokio::test]
+async fn allow_values_forwards_plaintext_and_wins_over_block() {
+    let h = Harness::new(true, false, true).await;
+    let mut cfg = h.state.config.get();
+    cfg.mask.rule_actions.insert("PHONE".into(), "block".into());
+    cfg.mask.allow_values = vec![SENTINEL_PHONE.into()];
+    h.state.config.update(cfg);
+
+    let body = serde_json::json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": format!("电话{SENTINEL_PHONE}")}]
+    })
+    .to_string();
+    let (status, _) = h
+        .send("POST", "/v1/chat/completions", "application/json", &body)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let up = String::from_utf8_lossy(&h.mock.last_body().unwrap()).to_string();
+    assert!(up.contains(SENTINEL_PHONE), "白名单值必须放行");
+    let ev = find_event(h.bus(), maskit_rs::store::events::EventType::Mask).expect("MASK 事件");
+    assert_eq!(ev.warned, 0);
+    assert!(ev.items.is_empty(), "白名单命中不应产生 items");
+    assert!(
+        find_event(h.bus(), maskit_rs::store::events::EventType::Block).is_none(),
+        "allow 必须优先于 block"
+    );
+}
+
+/// log_credential_plaintext=false 时，allow 放行的凭据值也不能进 masked_dialog。
+#[tokio::test]
+async fn allowed_credential_is_redacted_from_masked_dialog() {
+    let h = Harness::with_plaintext(false).await;
+    let secret = "Sup3rSecretValue9";
+    let mut cfg = h.state.config.get();
+    cfg.mask.builtin_rules.insert("SECRET".into(), true);
+    cfg.mask.allow_values = vec![secret.into()];
+    h.state.config.update(cfg);
+
+    let body = serde_json::json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": format!("DB_PASSWORD={secret}")}]
+    })
+    .to_string();
+    let (status, _) = h
+        .send("POST", "/v1/chat/completions", "application/json", &body)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let ev = find_event(h.bus(), maskit_rs::store::events::EventType::Mask).expect("MASK 事件");
+    assert!(
+        !ev.masked_dialog.contains(secret),
+        "masked_dialog 泄漏了允许放行的凭据明文: {}",
+        ev.masked_dialog
+    );
+    assert!(!ev.dialog.contains(secret), "dialog 泄漏了凭据明文");
+}

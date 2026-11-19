@@ -515,11 +515,51 @@ pub struct Edit {
 }
 
 /// mask 上下文：一次请求级管线共享。
+/// 规则命中后的处置方式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Policy {
+    /// 正常脱敏。
+    Mask,
+    /// 只告警、不改写（原文上行）。
+    Warn,
+    /// 照常脱敏，但请求最终拒绝转发。
+    Block,
+    /// 整值白名单命中：不改写、不登记映射。
+    Allow,
+}
+
+/// 一次请求内的规则动作结果，由 `MaskCtx` 聚合，事件侧取走即可。
+#[derive(Debug, Default, Clone)]
+pub struct MaskOutcome {
+    /// warn 命中次数（按出现次数计，对齐原版 `_hit` 调用次数）。
+    pub warned: usize,
+    pub warned_labels: std::collections::BTreeSet<String>,
+    pub blocked_labels: std::collections::BTreeSet<String>,
+}
+
+impl MaskOutcome {
+    /// 合并 blob 回退重跑的第二次结果。
+    ///
+    /// warn 计数取 max 而不是相加：两次跑的是**同一逻辑请求**，Warn 不改写文本，
+    /// 直接相加会让同一命中翻倍；blocked/warned 标签取并集（两次都可能命中）。
+    pub fn merge_retry(&mut self, other: MaskOutcome) {
+        self.warned = self.warned.max(other.warned);
+        self.warned_labels.extend(other.warned_labels);
+        self.blocked_labels.extend(other.blocked_labels);
+    }
+}
+
 pub struct MaskCtx<'a> {
     pub cfg: &'a Config,
     pub store: &'a SessionStore,
     pub sid: String,
     pub custom: &'a CustomWords,
+    /// 规则三态查表（只含规整后的有效项）。
+    rule_actions: std::collections::HashMap<String, Policy>,
+    /// 整值白名单（已 trim + lowercase）。
+    allow_set: std::collections::HashSet<String>,
+    /// 请求级动作结果。
+    outcome: Mutex<MaskOutcome>,
     /// 多模态/编码载荷跳过策略（C 方案外置之后的兜底：短 data URI、响应侧等）
     pub blob: super::blob::BlobPolicy,
     /// 本请求由 `blob::extract` 注入的 token 集合。
@@ -547,15 +587,80 @@ impl<'a> MaskCtx<'a> {
         custom: &'a CustomWords,
     ) -> Self {
         let prefix_rx = prefix_regex(&cfg.mask.secret_prefixes);
+        let mut rule_actions = std::collections::HashMap::new();
+        for (label, action) in &cfg.mask.rule_actions {
+            let label = label.trim().to_ascii_uppercase();
+            let action = action.trim().to_ascii_lowercase();
+            let policy = match action.as_str() {
+                "warn" if !is_credential_label(&label) => Policy::Warn,
+                "block" => Policy::Block,
+                _ => Policy::Mask,
+            };
+            if policy != Policy::Mask {
+                rule_actions.insert(label, policy);
+            }
+        }
+        let allow_set = cfg
+            .mask
+            .allow_values
+            .iter()
+            .map(|v| v.trim().to_lowercase())
+            .collect();
         Self {
             cfg,
             store,
             sid,
             custom,
+            rule_actions,
+            allow_set,
+            outcome: Mutex::new(MaskOutcome::default()),
             blob: super::blob::BlobPolicy::from_config(&cfg.mask.multimodal_blob),
             blob_tokens: std::collections::HashSet::new(),
             splice_extra: std::sync::Mutex::new(std::collections::HashMap::new()),
             prefix_rx,
+        }
+    }
+
+    /// 取走本请求累积的规则动作结果（warn/block 计数与标签）。
+    pub fn take_outcome(&self) -> MaskOutcome {
+        match self.outcome.lock() {
+            Ok(mut g) => std::mem::take(&mut *g),
+            Err(_) => MaskOutcome::default(),
+        }
+    }
+
+    /// 命中值的处置判定。allow 优先；warn/block 在此处记账。
+    ///
+    /// 全默认配置（无三态、无白名单）时直接返回 Mask，零锁零分配。
+    fn policy(&self, orig: &str, label: &str) -> Policy {
+        if self.rule_actions.is_empty() && self.allow_set.is_empty() {
+            return Policy::Mask;
+        }
+        // 原版教训：空集判断必须在 trim/lowercase 之前（1MB / 9800 命中约 30ms）。
+        if !self.allow_set.is_empty() {
+            let key = orig.trim().to_lowercase();
+            if self.allow_set.contains(&key) {
+                return Policy::Allow;
+            }
+        }
+        let Some(action) = self.rule_actions.get(label).copied() else {
+            return Policy::Mask;
+        };
+        match action {
+            Policy::Warn => {
+                if let Ok(mut o) = self.outcome.lock() {
+                    o.warned += 1;
+                    o.warned_labels.insert(label.to_string());
+                }
+                Policy::Warn
+            }
+            Policy::Block => {
+                if let Ok(mut o) = self.outcome.lock() {
+                    o.blocked_labels.insert(label.to_string());
+                }
+                Policy::Block
+            }
+            _ => Policy::Mask,
         }
     }
 
@@ -621,6 +726,10 @@ impl<'a> MaskCtx<'a> {
                         continue;
                     }
                     let orig = slice;
+                    match self.policy(orig, "API_KEY") {
+                        Policy::Allow | Policy::Warn => continue,
+                        Policy::Block | Policy::Mask => {}
+                    }
                     if !token_of.contains_key(orig) {
                         let token = {
                             if self.store.get(&self.sid).is_none() {
@@ -743,6 +852,10 @@ impl<'a> MaskCtx<'a> {
                         .any(|s| s.contains(m0.as_str()) || m0.as_str().contains(s))
                 {
                     continue;
+                }
+                match self.policy(orig, rule.label) {
+                    Policy::Allow | Policy::Warn => continue,
+                    Policy::Block | Policy::Mask => {}
                 }
                 // 首次出现时取（或签发）占位符；复用已有映射
                 if !token_of.contains_key(orig) {
@@ -939,6 +1052,10 @@ impl<'a> MaskCtx<'a> {
                     .get(&matched.to_lowercase())
                     .map(|&i| self.custom.words[i].0.clone())
                     .unwrap_or_else(|| matched.to_string());
+                match self.policy(&word_key, &label) {
+                    Policy::Allow | Policy::Warn => continue,
+                    Policy::Block | Policy::Mask => {}
+                }
                 // 登记会话映射
                 let token = {
                     if self.store.get(&self.sid).is_none() {
@@ -948,6 +1065,11 @@ impl<'a> MaskCtx<'a> {
                     self.store.remember(&mut session, &word_key, &label, taken);
                     session.fwd.get(&word_key).cloned().unwrap_or_default()
                 };
+                // 与其它三条路径一致：签发失败（空 token）时保留原文，
+                // 绝不能把敏感词替换成空串（内容破坏比漏遮更难排查）。
+                if token.is_empty() {
+                    continue;
+                }
                 hits.insert(word_key.clone());
                 repl.insert(s, (e, word_key, token));
             }
@@ -971,36 +1093,70 @@ impl<'a> MaskCtx<'a> {
         for (_pat, label, compiled) in &self.custom.regex_words {
             match compiled {
                 CompiledUserRegex::Linear(rx) => {
-                    let origs: Vec<String> =
-                        rx.find_iter(&out).map(|m| m.as_str().to_string()).collect();
+                    let origs: Vec<String> = rx
+                        .find_iter(&out)
+                        .filter_map(|m| {
+                            let orig = m.as_str().to_string();
+                            match self.policy(&orig, label) {
+                                Policy::Allow | Policy::Warn => None,
+                                Policy::Block | Policy::Mask => Some(orig),
+                            }
+                        })
+                        .collect();
                     if !origs.is_empty() {
                         out = self.replace_unique(&out, rx, 0, &origs, label, taken);
                         hits.extend(origs.iter().cloned());
                     }
                 }
                 CompiledUserRegex::Fancy(f) => {
-                    // fancy 通道：仅收集原文再走统一替换（保持 100ms 预算语义由 M6 接线）
-                    let origs: Vec<String> = f
+                    // fancy 通道：收集带坐标的命中，先过占位符守卫，再按区间替换。
+                    // 不能直接 `out.replace`：既会改写已有 `{{…}}` 内部，也会在
+                    // 同一原文多处出现时产生二次方开销。
+                    let placeholders: Vec<(usize, usize)> = placeholder::placeholder_rx()
                         .find_iter(&out)
-                        .filter_map(|m| m.ok().map(|mm| mm.as_str().to_string()))
+                        .map(|m| (m.start(), m.end()))
                         .collect();
-                    if origs.is_empty() {
+                    let mut matches: Vec<(usize, usize, String)> = Vec::new();
+                    for m in f.find_iter(&out) {
+                        let Ok(mm) = m else { continue };
+                        let orig = mm.as_str().to_string();
+                        if overlaps_any(&placeholders, mm.start(), mm.end()) {
+                            continue;
+                        }
+                        match self.policy(&orig, label) {
+                            Policy::Allow | Policy::Warn => continue,
+                            Policy::Block | Policy::Mask => {}
+                        }
+                        matches.push((mm.start(), mm.end(), orig));
+                    }
+                    if matches.is_empty() {
                         continue;
                     }
-                    // fancy 命中用 aho 思路逐个替换（数量少，直接逐个）
-                    for orig in &origs {
-                        if self.store.get(&self.sid).is_none() {
-                            self.store.new_session(&self.sid);
+                    let mut token_of: std::collections::HashMap<String, String> =
+                        std::collections::HashMap::new();
+                    let mut spans: Vec<(usize, usize, String)> = Vec::new();
+                    for (s, e, orig) in matches {
+                        if !token_of.contains_key(&orig) {
+                            if self.store.get(&self.sid).is_none() {
+                                self.store.new_session(&self.sid);
+                            }
+                            let token = {
+                                let mut session = self.store.get_mut(&self.sid).unwrap();
+                                self.store.remember(&mut session, &orig, label, taken);
+                                session.fwd.get(&orig).cloned().unwrap_or_default()
+                            };
+                            if token.is_empty() {
+                                continue;
+                            }
+                            token_of.insert(orig.clone(), token);
                         }
-                        let token = {
-                            let mut session = self.store.get_mut(&self.sid).unwrap();
-                            self.store.remember(&mut session, orig, label, taken);
-                            session.fwd.get(orig).cloned().unwrap_or_default()
-                        };
-                        if !token.is_empty() {
-                            hits.insert(orig.clone());
-                            out = out.replace(orig.as_str(), &token);
+                        if let Some(token) = token_of.get(&orig) {
+                            spans.push((s, e, token.clone()));
                         }
+                    }
+                    if !spans.is_empty() {
+                        hits.extend(token_of.into_keys());
+                        out = splice_spans(&out, &spans);
                     }
                 }
             }
@@ -1385,6 +1541,153 @@ mod tests {
         // 还原
         let restored = restore_with(&parts, &masked);
         assert_eq!(restored, "电话13812345678 邮箱test@example.com");
+    }
+
+    fn mask_with_outcome(
+        ctx_parts: &(Config, SessionStore, CustomWords),
+        text: &str,
+    ) -> (String, MaskOutcome) {
+        let ctx = MaskCtx::new(&ctx_parts.0, &ctx_parts.1, "t".into(), &ctx_parts.2);
+        let out = ctx.mask(text);
+        (out, ctx.take_outcome())
+    }
+
+    #[test]
+    fn rule_action_warn_keeps_plaintext_and_counts() {
+        let mut parts = test_ctx(&[]);
+        parts
+            .0
+            .mask
+            .rule_actions
+            .insert("PHONE".into(), "warn".into());
+        let (out, outcome) = mask_with_outcome(&parts, "电话13812345678");
+        assert_eq!(out, "电话13812345678", "warn 不得改写文本");
+        assert_eq!(outcome.warned, 1);
+        assert!(outcome.warned_labels.contains("PHONE"));
+        assert!(outcome.blocked_labels.is_empty());
+        // warn-only 不产生映射
+        assert!(parts.1.get("t").unwrap().fwd.is_empty());
+    }
+
+    #[test]
+    fn rule_action_keys_are_normalized_in_engine() {
+        let mut parts = test_ctx(&[]);
+        parts
+            .0
+            .mask
+            .rule_actions
+            .insert(" phone ".into(), " WARN ".into());
+        let (out, outcome) = mask_with_outcome(&parts, "电话13812345678");
+        assert_eq!(out, "电话13812345678");
+        assert!(outcome.warned_labels.contains("PHONE"));
+    }
+
+    #[test]
+    fn rule_action_block_masks_and_records() {
+        let mut parts = test_ctx(&[]);
+        parts
+            .0
+            .mask
+            .rule_actions
+            .insert("PHONE".into(), "block".into());
+        let (out, outcome) = mask_with_outcome(&parts, "电话13812345678");
+        assert!(out.contains("{{PHONE_"), "block 仍应脱敏: {out}");
+        assert!(outcome.blocked_labels.contains("PHONE"));
+        assert_eq!(outcome.warned, 0);
+    }
+
+    #[test]
+    fn allow_values_are_exact_case_insensitive_and_win_over_block() {
+        let mut parts = test_ctx(&[]);
+        parts
+            .0
+            .mask
+            .rule_actions
+            .insert("PHONE".into(), "block".into());
+        parts.0.mask.allow_values = vec!["13800138000".into()];
+        let (out, outcome) = mask_with_outcome(&parts, "电话13800138000");
+        assert_eq!(out, "电话13800138000");
+        assert!(outcome.blocked_labels.is_empty(), "allow 必须优先于 block");
+        // 更长值不是同一值，仍应命中
+        let (out2, _) = mask_with_outcome(&parts, "电话13900139000");
+        assert!(
+            out2.contains("{{PHONE_"),
+            "其它手机号不得被白名单放行: {out2}"
+        );
+    }
+
+    #[test]
+    fn rule_action_block_applies_to_prefix_rule() {
+        let mut parts = test_ctx(&[]);
+        parts.0.mask.secret_prefixes = vec!["sk-".into()];
+        parts
+            .0
+            .mask
+            .rule_actions
+            .insert("API_KEY".into(), "block".into());
+        let (out, outcome) = mask_with_outcome(&parts, "key sk-Abc123Def456Ghi789");
+        assert!(
+            out.contains("{{APIKEY_"),
+            "前缀规则必须走 block 三态: {out}"
+        );
+        assert!(outcome.blocked_labels.contains("API_KEY"));
+    }
+
+    #[test]
+    fn allow_values_apply_to_prefix_rule() {
+        let mut parts = test_ctx(&[]);
+        parts.0.mask.secret_prefixes = vec!["sk-".into()];
+        let key = "sk-Abc123Def456Ghi789";
+        parts.0.mask.allow_values = vec![key.to_lowercase()];
+        let (out, outcome) = mask_with_outcome(&parts, &format!("key {key}"));
+        assert_eq!(out, format!("key {key}"));
+        assert_eq!(outcome.warned, 0);
+        assert!(outcome.blocked_labels.is_empty());
+    }
+
+    #[test]
+    fn rule_action_warn_applies_to_custom_words_and_user_regex() {
+        let mut parts = test_ctx(&[("Alice", "PHONE"), ("re:EMP-\\d+", "PHONE")]);
+        parts
+            .0
+            .mask
+            .rule_actions
+            .insert("PHONE".into(), "warn".into());
+        let (out, outcome) = mask_with_outcome(&parts, "Alice EMP-123");
+        assert_eq!(out, "Alice EMP-123", "自定义词/正则也要尊重 warn");
+        assert_eq!(outcome.warned, 2);
+        assert!(outcome.warned_labels.contains("PHONE"));
+    }
+
+    #[test]
+    fn fancy_user_regex_does_not_rewrite_existing_placeholder() {
+        let mut parts = test_ctx(&[("re:(?<=_)abcdef", "PHONE")]);
+        parts
+            .0
+            .mask
+            .rule_actions
+            .insert("PHONE".into(), "warn".into());
+        let text = "{{PHONE_abcdef}}";
+        let (out, outcome) = mask_with_outcome(&parts, text);
+        assert_eq!(out, text, "fancy 正则不得改写已有占位符: {out}");
+        assert_eq!(outcome.warned, 0, "占位符内部的命中不应计入 warn");
+    }
+
+    #[test]
+    fn merge_retry_does_not_double_warn_count() {
+        let mut a = MaskOutcome {
+            warned: 3,
+            warned_labels: std::collections::BTreeSet::from(["PHONE".to_string()]),
+            blocked_labels: std::collections::BTreeSet::new(),
+        };
+        let b = MaskOutcome {
+            warned: 3,
+            warned_labels: std::collections::BTreeSet::from(["PHONE".to_string()]),
+            blocked_labels: std::collections::BTreeSet::from(["CARD".to_string()]),
+        };
+        a.merge_retry(b);
+        assert_eq!(a.warned, 3, "同一逻辑请求重跑不得把 warn 翻倍");
+        assert!(a.blocked_labels.contains("CARD"));
     }
 
     #[test]

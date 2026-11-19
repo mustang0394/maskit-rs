@@ -379,6 +379,34 @@
     }
   });
 
+  // 规则三态：mask / warn / block
+  $('ruleToggles').addEventListener('change', async ev => {
+    const sel = ev.target.closest('select[data-action]');
+    if (!sel) return;
+    const key = sel.dataset.action;
+    const action = sel.value;
+    try {
+      const cfg = await patch(['mask', 'rule_actions', key], action);
+      applyRuleActionClasses(cfg.mask.rule_actions || {});
+      toast(`${key} 处置已改为 ${action === 'mask' ? '脱敏' : action === 'warn' ? '告警（明文上行）' : '阻断'}`);
+    } catch (e) {
+      toast('保存失败：' + e.message, true);
+      loadRules();
+    }
+  });
+  $('ruleToggles').addEventListener('click', ev => {
+    if (ev.target.closest('select[data-action]')) ev.stopPropagation();
+  });
+
+  function applyRuleActionClasses(actions) {
+    document.querySelectorAll('select[data-action]').forEach(sel => {
+      const a = actions[sel.dataset.action] || 'mask';
+      sel.value = a;
+      sel.classList.toggle('warn', a === 'warn');
+      sel.classList.toggle('block', a === 'block');
+    });
+  }
+
   function renderRuleSummary(rules) {
     const keys = Object.keys(rules);
     const n = keys.filter(k => rules[k]).length;
@@ -388,23 +416,45 @@
   async function loadRules() {
     const cfg = await api('/config');
     const rules = cfg.mask.builtin_rules || {};
+    const actions = cfg.mask.rule_actions || {};
     const keys = Object.keys(rules).sort();
 
     $('ruleToggles').innerHTML = keys.map(k => {
       const name = RULE_LABELS[k] || k;
+      const action = actions[k] || 'mask';
       return `<label class="rule-item ${rules[k] ? 'on' : ''}" title="${esc(name)}（${esc(k)}）">
         <input type="checkbox" data-rule="${esc(k)}" ${rules[k] ? 'checked' : ''}/>
         <span class="rule-text">
           <span class="rule-name">${esc(name)}</span>
           <span class="rule-key">${esc(k)}</span>
         </span>
+        <select class="rule-select ${action === 'warn' ? 'warn' : action === 'block' ? 'block' : ''}"
+          data-action="${esc(k)}" title="处置方式">
+          <option value="mask" ${action === 'mask' ? 'selected' : ''}>脱敏</option>
+          <option value="warn" ${action === 'warn' ? 'selected' : ''}>告警（明文上行）</option>
+          <option value="block" ${action === 'block' ? 'selected' : ''}>阻断</option>
+        </select>
       </label>`;
     }).join('');
     renderRuleSummary(rules);
+    const vals = cfg.mask.allow_values || [];
+    $('allowValues').value = vals.join('\n');
+    $('allowSummary').textContent = `已配置 ${vals.length} / 200 条`;
     await loadWords(cfg);
     renderPrefixes(cfg);
   }
   loaders.rules = loadRules;
+
+  $('btnSaveAllow').addEventListener('click', async () => {
+    const values = $('allowValues').value.split('\n').map(v => v.trim()).filter(Boolean);
+    if (values.length > 200) { toast('白名单最多 200 条', true); return; }
+    try {
+      const cfg = await patch(['mask', 'allow_values'], values);
+      $('allowValues').value = (cfg.mask.allow_values || []).join('\n');
+      $('allowSummary').textContent = `已配置 ${(cfg.mask.allow_values || []).length} / 200 条`;
+      toast('白名单已保存');
+    } catch (e) { toast('保存失败：' + e.message, true); }
+  });
 
   $('btnRulesDefault').addEventListener('click', async () => {
     if (!confirm('把所有内置规则恢复为默认开关状态？')) return;
@@ -978,6 +1028,7 @@
     if (e.count) meta.push(`脱敏 ${e.count}`);
     if (e.restored) meta.push(`还原 ${e.restored}`);
     if (e.unresolved) meta.push(`<span class="lrow-flag">未还原 ${e.unresolved}</span>`);
+    if (e.warned) meta.push(`<span class="lrow-flag">告警放行 ${e.warned}</span>`);
     if (e.item_count) meta.push(`明细 ${e.item_count}`);
     if (e.header_count) meta.push(`头 ${e.header_count}`);
     if (e.status >= 400) meta.push(`HTTP ${e.status}`);
@@ -1042,6 +1093,7 @@
     if (e.restored) addChip(' 还原', e.restored);
     if (e.new_count || e.reused_count) addChip(' 新增/复用', (e.new_count || 0) + ' / ' + (e.reused_count || 0));
     if (e.unresolved) addChip(' 未还原', e.unresolved, 'warn');
+    if (e.warned) addChip(' 告警放行', e.warned, 'warn');
     // sid 是标签在前（值在前读起来像一堆哈希）
     if (e.sid) chips.push(`<span class="d-chip">sid <b>${esc(e.sid)}</b></span>`);
     if (chips.length) parts.push(`<div class="d-chips">${chips.join('')}</div>`);
@@ -1157,6 +1209,9 @@
       </details>`);
     }
 
+    if ((e.warned_labels || []).length) {
+      parts.push(`<div class="d-note"><div class="note warn">按 <code>warn</code> 放行（原文已发给上游）：<span class="mono">${e.warned_labels.map(esc).join('、')}</span></div></div>`);
+    }
     if ((e.unresolved_samples || []).length) {
       parts.push(`<div class="d-note"><div class="note warn">未还原占位符：<span class="mono">${e.unresolved_samples.map(esc).join('、')}</span></div></div>`);
     }

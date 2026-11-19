@@ -379,6 +379,17 @@ impl SessionGuard {
     pub(crate) fn disarm(&mut self) {
         self.armed = false;
     }
+
+    /// 保留会话但释放 inflight 租约（rule_actions=block 用）。
+    ///
+    /// block 不转发、但不应删除同 sid 的历史映射；同时必须清 inflight，
+    /// 否则 sweep 会一直把它当在途会话跳过。
+    pub(crate) fn keep_session(&mut self) {
+        if let Some(mut sess) = self.store.get_mut(&self.sid) {
+            sess.inflight = false;
+        }
+        self.armed = false;
+    }
 }
 
 impl Drop for SessionGuard {

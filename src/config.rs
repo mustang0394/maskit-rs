@@ -272,6 +272,23 @@ pub struct MaskConfig {
     /// 自定义正则（每条 {name, pattern}）
     #[serde(default)]
     pub custom_regexes: Vec<CustomRegex>,
+    /// 每规则处置：`{LABEL: "mask"|"warn"|"block"}`。
+    ///
+    /// `warn` = 只告警、不改写（**原文上行**）；`block` = 照常脱敏但拒绝转发。
+    /// 缺省/非法值一律回退 `mask`；凭据类标签禁止 `warn`（配置层强制回退）。
+    /// 仅接受内置规则标签，自定义词分组不参与。
+    ///
+    /// 宽松反序列化：非字符串取值丢弃并告警，避免一个坏项让整份 config 回退默认。
+    /// 注意：**不要**加 `skip_serializing_if` —— 旧配置首次控制台 patch 需要
+    /// `/mask/rule_actions` 这个父键存在。
+    #[serde(default, deserialize_with = "de_rule_actions")]
+    pub rule_actions: std::collections::BTreeMap<String, String>,
+    /// 整值白名单：命中的**完整值**永不脱敏（trim + 大小写不敏感，非子串）。
+    ///
+    /// 上限 200 条、单条 256 字符；非字符串项在读盘时丢弃。
+    /// **不要**加 `skip_serializing_if`（理由同上）。
+    #[serde(default, deserialize_with = "de_allow_values")]
+    pub allow_values: Vec<String>,
     #[serde(default = "default_secret_prefixes")]
     pub secret_prefixes: Vec<String>,
     #[serde(default = "default_max_body_bytes")]
@@ -290,6 +307,56 @@ pub struct MaskConfig {
     #[serde(default)]
     pub multimodal_blob: MultimodalBlobConfig,
 }
+
+/// 允许的规则处置取值。
+pub const RULE_ACTION_VALUES: &[&str] = &["mask", "warn", "block"];
+
+fn de_rule_actions<'de, D>(d: D) -> Result<std::collections::BTreeMap<String, String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize as _;
+    let raw = serde_json::Value::deserialize(d)?;
+    let Some(map) = raw.as_object() else {
+        tracing::warn!("rule_actions 不是对象，已忽略");
+        return Ok(std::collections::BTreeMap::new());
+    };
+    let mut out = std::collections::BTreeMap::new();
+    for (k, v) in map {
+        match v.as_str() {
+            Some(s) => {
+                out.insert(k.clone(), s.to_string());
+            }
+            None => tracing::warn!("rule_actions[{k}] 不是字符串，已丢弃"),
+        }
+    }
+    Ok(out)
+}
+
+fn de_allow_values<'de, D>(d: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize as _;
+    let raw = serde_json::Value::deserialize(d)?;
+    let Some(items) = raw.as_array() else {
+        tracing::warn!("allow_values 不是数组，已忽略");
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::with_capacity(items.len());
+    for v in items {
+        match v.as_str() {
+            Some(s) => out.push(s.to_string()),
+            None => tracing::warn!("allow_values 含非字符串项，已丢弃"),
+        }
+    }
+    Ok(out)
+}
+
+/// 单条白名单值的字符上限。
+pub const ALLOW_VALUE_MAX_LEN: usize = 256;
+/// 白名单总条数上限。
+pub const ALLOW_VALUES_MAX: usize = 200;
 
 fn default_true() -> bool {
     true
@@ -321,6 +388,8 @@ impl Default for MaskConfig {
             sensitive_word_disabled: Default::default(),
             sensitive_word_whole: Default::default(),
             custom_regexes: Default::default(),
+            rule_actions: Default::default(),
+            allow_values: Default::default(),
             secret_prefixes: default_secret_prefixes(),
             max_body_bytes: default_max_body_bytes(),
             session_ttl: default_session_ttl(),
@@ -558,6 +627,51 @@ impl Config {
                 "mask.ner_enabled=true 但 NER 一期未实现（PLAN §11），配置被忽略".into(),
             ));
         }
+        // rule_actions：未知标签/非法动作告警；凭据类 warn 强制回退 mask。
+        for (k, raw_action) in &self.mask.rule_actions {
+            let key = k.trim().to_ascii_uppercase();
+            let action = raw_action.trim().to_ascii_lowercase();
+            if key.is_empty() {
+                warnings.push(ConfigWarning("mask.rule_actions 含空标签，已丢弃".into()));
+                continue;
+            }
+            if !ALL_BUILTIN_RULES.contains(&key.as_str()) {
+                warnings.push(ConfigWarning(format!(
+                    "mask.rule_actions 未知规则标签 {key}，已丢弃（自定义词分组不参与三态）"
+                )));
+                continue;
+            }
+            if !RULE_ACTION_VALUES.contains(&action.as_str()) {
+                warnings.push(ConfigWarning(format!(
+                    "mask.rule_actions.{key}={raw_action:?} 非法，已回退 mask"
+                )));
+                continue;
+            }
+            if action == "warn" && is_credential_label(&key) {
+                warnings.push(ConfigWarning(format!(
+                    "mask.rule_actions.{key}=warn 被拒绝：凭据类不允许明文出网，已回退 mask"
+                )));
+            } else if action == "warn" && self.fail_closed {
+                warnings.push(ConfigWarning(format!(
+                    "mask.rule_actions.{key}=warn 会让该类型明文上行，与 fail_closed=true 的承诺冲突；这是显式例外"
+                )));
+            }
+        }
+        if self.mask.allow_values.len() > ALLOW_VALUES_MAX {
+            warnings.push(ConfigWarning(format!(
+                "mask.allow_values 超过 {ALLOW_VALUES_MAX} 条，已截断"
+            )));
+        }
+        for v in &self.mask.allow_values {
+            let t = v.trim();
+            if t.is_empty() {
+                warnings.push(ConfigWarning("mask.allow_values 含空值，已丢弃".into()));
+            } else if t.chars().count() > ALLOW_VALUE_MAX_LEN {
+                warnings.push(ConfigWarning(format!(
+                    "mask.allow_values 含超过 {ALLOW_VALUE_MAX_LEN} 字符的值，已丢弃"
+                )));
+            }
+        }
         if !self.upstream.target.is_empty() && !self.upstream.target.contains("://") {
             warnings.push(ConfigWarning(
                 "upstream.target 缺少 scheme（http:// 或 https://）".into(),
@@ -630,6 +744,44 @@ impl Config {
         }
         if c.mask.mapping_ttl == 0 {
             c.mask.mapping_ttl = 24 * 3600;
+        }
+        // rule_actions：key 大写、动作小写；未知标签/非法动作丢弃；凭据类 warn 回退 mask。
+        {
+            let mut actions = std::collections::BTreeMap::new();
+            for (k, raw_action) in &c.mask.rule_actions {
+                let key = k.trim().to_ascii_uppercase();
+                let action = raw_action.trim().to_ascii_lowercase();
+                if key.is_empty() || !ALL_BUILTIN_RULES.contains(&key.as_str()) {
+                    continue;
+                }
+                if !RULE_ACTION_VALUES.contains(&action.as_str()) {
+                    continue;
+                }
+                if action == "warn" && is_credential_label(&key) {
+                    continue;
+                }
+                actions.insert(key, action);
+            }
+            c.mask.rule_actions = actions;
+        }
+        // allow_values：trim + 小写去重 + 200 条/256 字符上限。
+        {
+            let mut seen = std::collections::HashSet::new();
+            let mut values = Vec::new();
+            for raw in &c.mask.allow_values {
+                let v = raw.trim();
+                if v.is_empty() || v.chars().count() > ALLOW_VALUE_MAX_LEN {
+                    continue;
+                }
+                let key = v.to_lowercase();
+                if seen.insert(key.clone()) {
+                    values.push(key);
+                    if values.len() >= ALLOW_VALUES_MAX {
+                        break;
+                    }
+                }
+            }
+            c.mask.allow_values = values;
         }
         // 多模态 blob 阈值夹在 [1KiB, 8MiB]（与 `BlobPolicy::from_config` 同口径）。
         c.mask.multimodal_blob.min_base64_bytes = c
@@ -1137,6 +1289,106 @@ mod tests {
         let n = c.normalized();
         assert!(n.mask.builtin_rules.contains_key("EMAIL"));
         assert!(!n.mask.builtin_rules.contains_key("BOGUS"));
+    }
+
+    #[test]
+    fn rule_actions_normalize_and_credential_warn_is_rejected() {
+        let mut c = Config::default();
+        c.mask
+            .rule_actions
+            .insert(" phone ".into(), " WARN ".into());
+        c.mask.rule_actions.insert("card".into(), "BLOCK".into());
+        c.mask
+            .rule_actions
+            .insert("PRIVATE_KEY".into(), "warn".into());
+        c.mask
+            .rule_actions
+            .insert("NOT_A_RULE".into(), "block".into());
+        c.mask.rule_actions.insert("EMAIL".into(), "banana".into());
+        let w = c.validate();
+        assert!(w.iter().any(|w| w.0.contains("NOT_A_RULE")), "{w:?}");
+        assert!(w.iter().any(|w| w.0.contains("banana")), "{w:?}");
+        assert!(w.iter().any(|w| w.0.contains("凭据类")), "{w:?}");
+        let n = c.normalized();
+        assert_eq!(
+            n.mask.rule_actions.get("PHONE").map(String::as_str),
+            Some("warn")
+        );
+        assert_eq!(
+            n.mask.rule_actions.get("CARD").map(String::as_str),
+            Some("block")
+        );
+        assert_eq!(
+            n.mask.rule_actions.get("PRIVATE_KEY").map(String::as_str),
+            None
+        );
+        assert!(!n.mask.rule_actions.contains_key("NOT_A_RULE"));
+    }
+
+    #[test]
+    fn allow_values_normalize_bound_and_dedupe() {
+        let mut c = Config::default();
+        c.mask.allow_values = vec![
+            "  Test@Example.com ".into(),
+            "test@example.com".into(),
+            "".into(),
+            "x".repeat(ALLOW_VALUE_MAX_LEN + 1),
+        ];
+        c.mask
+            .allow_values
+            .extend((0..ALLOW_VALUES_MAX + 5).map(|i| format!("value-{i}")));
+        let n = c.normalized();
+        assert_eq!(n.mask.allow_values[0], "test@example.com");
+        assert_eq!(
+            n.mask
+                .allow_values
+                .iter()
+                .filter(|v| v.as_str() == "test@example.com")
+                .count(),
+            1
+        );
+        assert_eq!(n.mask.allow_values.len(), ALLOW_VALUES_MAX);
+        assert!(n
+            .mask
+            .allow_values
+            .iter()
+            .all(|v| v.chars().count() <= ALLOW_VALUE_MAX_LEN));
+    }
+
+    #[test]
+    fn rule_action_configs_with_wrong_container_type_do_not_break_load() {
+        let mut v = serde_json::to_value(Config::default()).unwrap();
+        v["mask"]["rule_actions"] = serde_json::json!([1, 2]);
+        v["mask"]["allow_values"] = serde_json::json!({"a": 1});
+        let c: Config = serde_json::from_value(v).expect("坏容器不应让整份配置解析失败");
+        assert!(c.mask.rule_actions.is_empty());
+        assert!(c.mask.allow_values.is_empty());
+    }
+
+    #[test]
+    fn rule_actions_and_allow_values_are_always_serialized() {
+        let cfg = Config::default();
+        let v = serde_json::to_value(&cfg).unwrap();
+        assert_eq!(v["mask"]["rule_actions"], serde_json::json!({}));
+        assert_eq!(v["mask"]["allow_values"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn patch_new_rule_action_and_allow_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let (center, _) = ConfigCenter::load_or_init(dir.path()).unwrap();
+        center
+            .patch("mask.rule_actions.PHONE", serde_json::json!("block"))
+            .unwrap();
+        center
+            .patch("mask.allow_values", serde_json::json!(["13800138000"]))
+            .unwrap();
+        let cfg = center.get();
+        assert_eq!(
+            cfg.mask.rule_actions.get("PHONE").map(String::as_str),
+            Some("block")
+        );
+        assert_eq!(cfg.mask.allow_values, vec!["13800138000"]);
     }
 
     #[test]

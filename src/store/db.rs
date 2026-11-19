@@ -329,7 +329,8 @@ impl EventStore {
                        CAST(COALESCE(json_extract(payload,'$.req_bytes'),0) AS INTEGER), \
                        CAST(COALESCE(json_extract(payload,'$.resp_bytes'),0) AS INTEGER), \
                        CAST(COALESCE(json_array_length(json_extract(payload,'$.items')),0) AS INTEGER), \
-                       CAST(COALESCE(json_array_length(json_extract(payload,'$.request_headers')),0) AS INTEGER) \
+                       CAST(COALESCE(json_array_length(json_extract(payload,'$.request_headers')),0) AS INTEGER), \
+                       CAST(COALESCE(json_extract(payload,'$.warned'),0) AS INTEGER) \
                      FROM events{where_sql} ORDER BY id DESC LIMIT ? OFFSET ?"
                 ))
                 .ok()?;
@@ -360,6 +361,7 @@ impl EventStore {
                         resp_bytes: r.get::<_, i64>(18)?.max(0) as usize,
                         item_count: r.get::<_, i64>(19)?.max(0) as usize,
                         header_count: r.get::<_, i64>(20)?.max(0) as usize,
+                        warned: r.get::<_, i64>(21)?.max(0) as usize,
                     })
                 })
                 .ok()?;
@@ -1662,7 +1664,7 @@ mod tests {
                 "INSERT INTO events (ts, type, payload) VALUES (?1, 'RESTORE', ?2)",
                 rusqlite::params![
                     1.0_f64,
-                    r#"{"id":9001,"ts":1.0,"type":"RESTORE","status":"restored","path":"/v1/chat/completions","restored":2,"items":[{"label":"PHONE","tok":"13800138000"}]}"#
+                    r#"{"id":9001,"ts":1.0,"type":"RESTORE","status":"restored","path":"/v1/chat/completions","restored":2,"warned":2,"items":[{"label":"PHONE","tok":"13800138000"}]}"#
                 ],
             )
             .unwrap();
@@ -1674,6 +1676,7 @@ mod tests {
         assert_eq!(rows[0].status, 0, "字符串状态按 Python 兼容语义落 0");
         assert_eq!(rows[0].restored, 2);
         assert_eq!(rows[0].item_count, 1, "数组长度必须投影出来");
+        assert_eq!(rows[0].warned, 2, "列表摘要必须带 warn 计数");
     }
 
     /// Python 版 payload **没有 `$.id` 字段**。列表会回退成表自增 id，

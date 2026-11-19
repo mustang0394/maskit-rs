@@ -133,7 +133,7 @@ fn emit(
         protocol: protocol.as_str().into(),
         model: model.into(),
         session_id: sid.into(),
-        mask_ms: None,
+        mask_ms: source.mask_ms,
         first_byte_ms: None,
         upstream_ms: None,
         req_bytes: source.req_bytes,
@@ -158,6 +158,8 @@ pub struct RequestMeta {
     pub req_bytes: usize,
     pub unknown_shape: bool,
     pub message: String,
+    /// 事件耗时（BLOCK 等非 MASK 事件用）。
+    pub mask_ms: Option<f64>,
     pub body_shape: Option<String>,
     /// 客户端请求头（已按 `log_credential_plaintext` 决定是否打码凭据值）。
     /// 在 `handler()` 入口采集一次，整条生命周期共用。
@@ -490,21 +492,25 @@ pub async fn handler(State(state): State<SharedState>, req: Request) -> Response
         // 拼回外置载荷。若 token 在脱敏阶段被改写（自定义词恰好命中 nonce），
         // 绝不能把残留 token 发给上游 —— 回退到「未外置」路径重跑一次
         // （慢，但正确；触发条件极罕见）。
+        let mut outcome = ctx.take_outcome();
         let final_text = match &extraction_task {
             Some(e) => match crate::mask::blob::reinject_checked(&masked.text, &e.blobs) {
                 Some(t) => t,
                 None => {
                     tracing::warn!("blob token 在脱敏后被改写，回退到未外置路径（本请求会变慢）");
-                    tree::mask_body(&orig_raw, &ctx)?.text
+                    let fallback = tree::mask_body(&orig_raw, &ctx)?.text;
+                    // warn 不改写文本，同一逻辑请求重跑会重复计数；合并而不是累加。
+                    outcome.merge_retry(ctx.take_outcome());
+                    fallback
                 }
             },
             None => masked.text.clone(),
         };
-        Ok::<_, String>((masked, dialog, masked_dialog, final_text))
+        Ok::<_, String>((masked, dialog, masked_dialog, final_text, outcome))
     })
     .await;
 
-    let (masked, req_dialog, req_masked_dialog, final_text) = match mask_result {
+    let (masked, req_dialog, req_masked_dialog, final_text, outcome) = match mask_result {
         Ok(Ok(m)) => m,
         Ok(Err(e)) => {
             // ── 判定⑨：脱敏抛异常 → 503（与协议无关） ──
@@ -552,10 +558,62 @@ pub async fn handler(State(state): State<SharedState>, req: Request) -> Response
         }
     };
     let mask_ms = mask_t0.elapsed().as_secs_f64() * 1000.0;
-
-    // MASK 事件（含命中明细 + 用户消息原文）
     let cfg_now = state.config.get();
     let keep_plaintext = crate::config::log_keeps_credential_plaintext(&cfg_now);
+
+    // ── rule_actions=block：已脱敏但拒绝转发 ──
+    // 不 drop session（历史映射仍需复用）；只释放 inflight 租约，返回 503。
+    if !outcome.blocked_labels.is_empty() {
+        let labels: Vec<String> = outcome.blocked_labels.iter().cloned().collect();
+        early_guard.keep_session();
+        let bus = state.bus.clone();
+        emit(
+            &bus,
+            EventType::Block,
+            &method_str,
+            &path,
+            503,
+            "rule_action_block",
+            protocol,
+            &model,
+            &sid,
+            &RequestMeta {
+                req_bytes,
+                unknown_shape,
+                message: format!("按规则三态设置阻断（命中类型：{}）", labels.join(",")),
+                mask_ms: Some(mask_ms),
+                request_headers: log_headers.clone(),
+                ..Default::default()
+            },
+        );
+        // 被 block 的请求也要进完整报文取证环（排查「为什么被拦」）。
+        if keep_plaintext && cfg_now.full_trace_count > 0 {
+            let max = cfg_now.full_trace_max_bytes;
+            let (req_raw, raw_tr) = crate::store::trace::cap_body_bytes(&body_bytes, max);
+            let (req_masked, masked_tr) = crate::store::trace::cap_body(&masked.text, max);
+            state.bus.put_trace(crate::store::trace::TraceBlob {
+                sid: sid.clone(),
+                kind: crate::store::trace::TraceKind::Req,
+                ts: crate::store::events::now_secs(),
+                method: method_str.clone(),
+                path: path.clone(),
+                protocol: protocol.as_str().to_string(),
+                model: model.clone(),
+                stream: stream_req,
+                primary_body: req_raw,
+                secondary_body: req_masked,
+                primary_bytes: body_bytes.len(),
+                secondary_bytes: masked.text.len(),
+                truncated: raw_tr || masked_tr,
+                extra: serde_json::Value::Null,
+                keep: cfg_now.full_trace_count,
+                budget_bytes: cfg_now.full_trace_total_bytes,
+            });
+        }
+        return crate::server::rule_block_response(&labels);
+    }
+
+    // MASK 事件（含命中明细 + 用户消息原文）
     let items = build_event_items(store, &sid, keep_plaintext);
     let new_count = store.get(&sid).map(|s| s.new_orig.len()).unwrap_or(0);
     let mut ev_meta = RequestMeta {
@@ -588,13 +646,23 @@ pub async fn handler(State(state): State<SharedState>, req: Request) -> Response
         } else {
             crate::server::response::redact_credentials(&req_dialog, &cfg_now.mask.secret_prefixes)
         },
-        // 脱敏后的文本本身已用占位符替代了敏感值，无需再洗
-        masked_dialog: req_masked_dialog.clone(),
+        // warn/allow 可能让原文保留在 masked_dialog 中：关掉凭据明文开关时
+        // 必须与 dialog 同口径再洗一遍（否则凭据红线被绕过）。
+        masked_dialog: if keep_plaintext {
+            req_masked_dialog.clone()
+        } else {
+            crate::server::response::redact_credentials(
+                &req_masked_dialog,
+                &cfg_now.mask.secret_prefixes,
+            )
+        },
         items,
         count: new_count.max(store.get(&sid).map(|s| s.last_hits.len()).unwrap_or(0)),
         masked_total: store.get(&sid).map(|s| s.fwd.len()).unwrap_or(0),
         new_count,
         reused_count: store.get(&sid).map(|s| s.reused_count).unwrap_or(0),
+        warned: outcome.warned,
+        warned_labels: outcome.warned_labels.iter().cloned().collect(),
         unresolved: 0,
         unresolved_samples: vec![],
         unknown_shape,

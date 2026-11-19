@@ -39,6 +39,8 @@
     "custom_words": {},
     "custom_word_groups": [],
     "custom_regexes": [],
+    "rule_actions": {},
+    "allow_values": [],
     "secret_prefixes": [
       "sk-",
       "ah-"

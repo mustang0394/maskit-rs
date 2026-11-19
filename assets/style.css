@@ -669,3 +669,13 @@ table.hdr-table td.hdr-cred { color: var(--warn); }
   .status { display: none; }
   .kbd-hint { margin-left: 0; }
 }
+
+/* 规则三态：mask / warn / block */
+.rule-main { display: flex; align-items: center; gap: 9px; min-width: 0; flex: 1 1 auto; cursor: pointer; }
+.rule-select {
+  flex: 0 0 auto; max-width: 74px; padding: 3px 4px; border-radius: 6px;
+  border: 1px solid var(--border); background: var(--panel);
+  color: var(--fg); font-size: 11px; cursor: pointer;
+}
+.rule-select.warn { border-color: #b9822f; color: #e0a94a; }
+.rule-select.block { border-color: #a34848; color: #e06c6c; }
