@@ -44,6 +44,8 @@ pub struct Session {
     pub cmd_req_snippets: Option<std::collections::HashSet<String>>,
     pub cmd_reason_snippets: std::collections::HashSet<String>,
     pub cmd_pend: HashMap<String, String>,
+    /// 跨帧工具参数累积缓冲（channel → 全文），observe 模式按完整值判定。
+    pub cmd_tool_buf: HashMap<String, String>,
     /// 本次会话新建的映射（待持久化到 SQLite；由调用方 drain 后入队落盘）
     pub pending_persist: std::collections::HashSet<String>,
     /// 请求侧命令窗口切片

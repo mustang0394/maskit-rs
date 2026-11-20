@@ -88,6 +88,8 @@ MASKIT_RS_DATA_DIR=/var/lib/maskit-rs ./target/release/maskit-rs
   - 每个事件里**未被槽位接管的其余文本**也会走一次整树兜底还原 —— 各家中转的字段名远比协议文档多，逐个列举等于打地鼠
   - 响应为文本类（`json` / `text/*` / `xml` / **未声明 content-type**）都会尝试还原；二进制（图片/音频/octet-stream）不动
   - **压缩响应**：gzip/deflate 的 SSE/NDJSON 会边解压边还原（不超过 128MiB 防炸弹上限）；`br`/`zstd` 仍先整包解码再还原（流式增量 API 复杂，见「已知限制」）
+  - **压缩请求**：请求体的 gzip / deflate / br / zstd 会先解压再进入脱敏管线，转发时剥掉 `content-encoding`；解压失败、多重编码或未知编码一律 415 拒绝（不透传未经脱敏的压缩体，且不受 `fail_closed` 影响）
+  - `content-encoding` 的比较统一按「去空白 + 小写」规范化：`IDENTITY` / ` Identity ` 与 `identity` 等价
 - **命令拦截**：observe（只记录，默认）/ rewrite（改写为 no-op 说明）/ block（停止下发）
 - **被动审计信号（已接线）**：错误泄露 / 换芯 / 流异常 / 响应投毒（含凭据回流检测）/ 危险动作。`audit.enabled`、`audit.passive`、`audit.signals`、`audit.severity_floor` 均生效；`CMDHIT` 事件会在控制台可见。需主动探针的「工具调用重写」「跨请求污染」不再作为可配置信号提供（无注入点，开启也不会触发）
 - **token 用量统计**：按模型统计输入/输出 token（`/api/stats/today`、`/api/stats/models`）。**只统计数量，不做价格/费用计算**
@@ -170,6 +172,7 @@ maskit-rs/
 ## 已知限制
 
 - `br` / `zstd` 压缩的 SSE/NDJSON 仍会先整包解码（gzip/deflate 已流式）；超大压缩流会受 64MiB 压缩体 / 128MiB 解压上限约束。
+- 压缩请求解出后的明文超过 `server.max_body_bytes`（默认 32MiB）会返回 413，避免小压缩体解出巨量内容。
 - `rewrite` / `block` 模式为了不把半截命令先下发给客户端，会对流式响应强制整包处理（失去逐字流式，但拦截语义正确）。
 - `arguments` / `partial_json` 这类「JSON 文本字段」会被解析后按业务区重新脱敏，序列化风格可能变化（保持 JSON 语义不变）。
 - 完整报文诊断环的「发给上游」一节显示 blob token 形态，实际转发已按原始字节拼回。

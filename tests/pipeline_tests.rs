@@ -19,10 +19,15 @@ const SENTINEL_PHONE: &str = "13800138000";
 /// mock 上游收到的请求记录：(path, body)
 type RecordedRequests = Vec<(String, Vec<u8>)>;
 
+/// mock 上游收到的请求头快照：(name, value)。
+type RecordedHeaders = Vec<Vec<(String, String)>>;
+
 /// 记录 mock 上游收到的请求。
 #[derive(Default, Clone)]
 struct MockUpstream {
     inner: Arc<std::sync::Mutex<RecordedRequests>>,
+    /// 与 `inner` 一一对应的请求头快照（验证逐跳头是否被正确剥除）。
+    headers: Arc<std::sync::Mutex<RecordedHeaders>>,
 }
 
 impl MockUpstream {
@@ -31,6 +36,14 @@ impl MockUpstream {
     }
     fn last_body(&self) -> Option<Vec<u8>> {
         self.inner.lock().unwrap().last().map(|(_, b)| b.clone())
+    }
+    fn last_headers(&self) -> Vec<(String, String)> {
+        self.headers
+            .lock()
+            .unwrap()
+            .last()
+            .cloned()
+            .unwrap_or_default()
     }
 }
 
@@ -43,10 +56,21 @@ async fn spawn_mock_upstream() -> (String, MockUpstream, tokio::task::JoinHandle
         let rec = rec2.clone();
         async move {
             let path = req.uri().path().to_string();
+            let hdrs: Vec<(String, String)> = req
+                .headers()
+                .iter()
+                .map(|(k, v)| {
+                    (
+                        k.as_str().to_string(),
+                        String::from_utf8_lossy(v.as_bytes()).to_string(),
+                    )
+                })
+                .collect();
             let bytes = axum::body::to_bytes(req.into_body(), 64 * 1024 * 1024)
                 .await
                 .unwrap_or_default();
             rec.inner.lock().unwrap().push((path, bytes.to_vec()));
+            rec.headers.lock().unwrap().push(hdrs);
             // SSE 响应（供流式测试）
             // 注意：字面量 "stream" 是 8 字节，窗口必须用 8；
             // 此前写成 windows(9) 导致永假，SSE 分支从未被测试覆盖。
@@ -977,6 +1001,392 @@ async fn unreachable_upstream_does_not_leak_sessions() {
 }
 
 // ===========================================================================
+// ===========================================================================
+// 请求侧压缩体（审查发现 #1）
+// ===========================================================================
+
+/// 回归：请求侧此前**从不看** `content-encoding`。
+/// - `fail_closed=true`：合法 gzip 请求被拒成 400 invalid_json；
+/// - `fail_closed=false`：压缩体原样转发，PII 从未脱敏。
+///
+/// 修复后：入口解压 → 正常脱敏 → 转发时剥掉 `content-encoding`。
+#[tokio::test]
+async fn gzip_request_is_decoded_and_masked() {
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use std::io::Write;
+
+    let h = Harness::new(true, false, true).await;
+    let body = serde_json::json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": format!("联系{SENTINEL_PHONE}")}]
+    })
+    .to_string();
+    let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+    enc.write_all(body.as_bytes()).unwrap();
+    let gz = enc.finish().unwrap();
+
+    let app = build_router(h.state.clone());
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .header("content-encoding", "gzip")
+        .body(Body::from(gz))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "合法 gzip 请求应正常处理");
+
+    let reqs = h.mock.requests();
+    assert_eq!(reqs.len(), 1, "必须转发一次");
+    let upstream = String::from_utf8_lossy(&reqs[0].1).to_string();
+    assert!(
+        !upstream.contains(SENTINEL_PHONE),
+        "压缩请求里的手机号未被脱敏: {upstream}"
+    );
+    assert!(upstream.contains("{{"), "上游应收到占位符: {upstream}");
+    assert!(
+        serde_json::from_str::<serde_json::Value>(&upstream).is_ok(),
+        "上游收到的必须是有效 JSON（已解压明文）: {upstream}"
+    );
+}
+
+/// 转发时必须剥掉 `content-encoding`，否则上游会按 gzip 解一份明文。
+#[tokio::test]
+async fn gzip_request_strips_content_encoding_on_forward() {
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use std::io::Write;
+
+    let h = Harness::new(true, false, true).await;
+    let body = r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}"#;
+    let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+    enc.write_all(body.as_bytes()).unwrap();
+    let gz = enc.finish().unwrap();
+
+    let app = build_router(h.state.clone());
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .header("content-encoding", "gzip")
+        .body(Body::from(gz))
+        .unwrap();
+    let _ = app.oneshot(req).await.unwrap();
+
+    // mock 记录的是解压后的 body，说明上游确实拿到明文
+    let reqs = h.mock.requests();
+    let upstream = String::from_utf8_lossy(&reqs[0].1).to_string();
+    assert!(
+        upstream.contains("\"hi\""),
+        "上游 body 应是明文 JSON: {upstream}"
+    );
+
+    // 关键断言：转发头里不能再有 content-encoding，content-length 等于明文长度
+    let hdrs = h.mock.last_headers();
+    assert!(
+        !hdrs
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("content-encoding")),
+        "解压后仍带着 content-encoding: {hdrs:?}"
+    );
+    let cl = hdrs
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+        .map(|(_, v)| v.clone());
+    assert_eq!(
+        cl.as_deref(),
+        Some(upstream.len().to_string().as_str()),
+        "content-length 必须按解压后长度重算: {hdrs:?}"
+    );
+}
+
+/// 多个 / 非法的 `content-encoding` 头：一律 415。
+/// 多值等价于多重编码；头值非可见 ASCII 时 `to_str` 失败，不能当「无编码」放过。
+#[tokio::test]
+async fn multiple_or_invalid_content_encoding_headers_are_rejected() {
+    let h = Harness::new(false, false, true).await;
+    let app = build_router(h.state.clone());
+    // body 是**合法** gzip：若没有多重头检测，`get` 只看第一个 gzip 就能
+    // 解压成功并放行 —— 用例才有区分度。
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use std::io::Write;
+    let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+    enc.write_all(br#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}"#)
+        .unwrap();
+    let body = enc.finish().unwrap();
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .header("content-encoding", "gzip")
+        .header("content-encoding", "br")
+        .body(Body::from(body))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    assert!(h.mock.requests().is_empty(), "多重编码不得转发");
+}
+
+/// 回归 #2 端到端：上游回 `Content-Encoding: IDENTITY`（大写变体）时，
+/// 响应必须照常还原，而不是整段透传导致占位符泄漏。
+#[tokio::test]
+async fn uppercase_identity_content_encoding_is_restored() {
+    use axum::routing::any;
+    let app = axum::Router::new().fallback(any(move |req: Request<Body>| async move {
+        let bytes = axum::body::to_bytes(req.into_body(), 1 << 20)
+            .await
+            .unwrap_or_default();
+        let masked = String::from_utf8_lossy(&bytes).to_string();
+        let sse = build_sse_response(&masked);
+        axum::response::Response::builder()
+            .status(200)
+            .header("content-type", "text/event-stream")
+            // 回归：大写 IDENTITY 曾被解码侧当「无编码」、还原侧当「不可还原」
+            .header("content-encoding", "IDENTITY")
+            .body(Body::from(sse))
+            .unwrap()
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let (center, _) = ConfigCenter::load_or_init(dir.path()).unwrap();
+    let mut cfg = center.get();
+    cfg.upstream.target = format!("http://{addr}");
+    center.update(cfg);
+    let upstream = Arc::new(UpstreamClient::new_or_placeholder(&center.get().upstream));
+    let bus = EventBus::new();
+    let store: &'static SessionStore = Box::leak(Box::new(SessionStore::new()));
+    let state = Arc::new(AppState::with_store(center, bus, upstream, None, store));
+    let app = build_router(state);
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(format!(
+            r#"{{"model":"gpt-4o","messages":[{{"role":"user","content":"联系{SENTINEL_PHONE}"}}],"stream":true}}"#
+        )))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .unwrap()
+        .to_vec();
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(
+        text.contains(SENTINEL_PHONE),
+        "大写 IDENTITY 下占位符未被还原: {text}"
+    );
+    assert!(!text.contains("{{PHONE_"), "占位符泄漏: {text}");
+    handle.abort();
+}
+
+/// F-04：单个 `Content-Encoding: gzip` 头 + 两个 gzip 成员，必须完整解压后脱敏。
+#[tokio::test]
+async fn multi_member_gzip_request_is_fully_masked() {
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use std::io::Write;
+
+    let h = Harness::new(true, false, true).await;
+    let head = r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hel"#;
+    let tail = format!(r#"lo 联系{SENTINEL_PHONE}"}}]}}"#);
+    let mut e1 = GzEncoder::new(Vec::new(), Compression::default());
+    e1.write_all(head.as_bytes()).unwrap();
+    let mut body = e1.finish().unwrap();
+    let mut e2 = GzEncoder::new(Vec::new(), Compression::default());
+    e2.write_all(tail.as_bytes()).unwrap();
+    body.extend_from_slice(&e2.finish().unwrap());
+
+    let app = build_router(h.state.clone());
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .header("content-encoding", "gzip")
+        .body(Body::from(body))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "多成员 gzip 必须正常处理");
+
+    let upstream = String::from_utf8_lossy(&h.mock.requests()[0].1).to_string();
+    assert!(
+        upstream.contains("hello 联系"),
+        "多成员内容被截断: {upstream}"
+    );
+    assert!(
+        !upstream.contains(SENTINEL_PHONE),
+        "多成员 gzip 里的 PII 未脱敏: {upstream}"
+    );
+    assert!(
+        serde_json::from_str::<serde_json::Value>(&upstream).is_ok(),
+        "上游收到的必须是完整合法 JSON: {upstream}"
+    );
+}
+
+/// F-04：多成员累计超过上限 → 413（不是按成员各自重置预算）。
+#[tokio::test]
+async fn multi_member_gzip_over_limit_is_413() {
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use std::io::Write;
+
+    let h = Harness::new(false, false, true).await;
+    let mut cfg = h.state.config.get();
+    cfg.mask.max_body_bytes = 1024;
+    h.state.config.update(cfg);
+
+    let mut body = Vec::new();
+    for _ in 0..4 {
+        let mut enc = GzEncoder::new(Vec::new(), Compression::best());
+        enc.write_all(&vec![b'A'; 800]).unwrap();
+        body.extend_from_slice(&enc.finish().unwrap());
+    }
+    let app = build_router(h.state.clone());
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .header("content-encoding", "gzip")
+        .body(Body::from(body))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert!(h.mock.requests().is_empty(), "超限请求不得转发");
+}
+
+/// F-05：zlib 包装的 deflate 超限也必须 413（不能退化成 415）。
+#[tokio::test]
+async fn zlib_deflate_over_limit_is_413() {
+    use flate2::write::ZlibEncoder;
+    use flate2::Compression;
+    use std::io::Write;
+
+    let h = Harness::new(false, false, true).await;
+    let mut cfg = h.state.config.get();
+    cfg.mask.max_body_bytes = 1024;
+    h.state.config.update(cfg);
+
+    let mut enc = ZlibEncoder::new(Vec::new(), Compression::best());
+    enc.write_all(&vec![b'A'; 64 * 1024]).unwrap();
+    let body = enc.finish().unwrap();
+
+    let app = build_router(h.state.clone());
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .header("content-encoding", "deflate")
+        .body(Body::from(body))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert!(h.mock.requests().is_empty());
+}
+
+/// 解压后超过 `server.max_body_bytes`：返回 413（与未压缩超限一致），
+/// 且解压上限就是 `max_body`，不会先分配 128MiB 再判断。
+#[tokio::test]
+async fn decompressed_request_larger_than_max_body_is_413() {
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use std::io::Write;
+
+    let h = Harness::new(true, false, true).await;
+    let mut cfg = h.state.config.get();
+    cfg.mask.max_body_bytes = 1024;
+    h.state.config.update(cfg);
+
+    let big = format!(
+        r#"{{"model":"gpt-4o","messages":[{{"role":"user","content":"{}"}}]}}"#,
+        "A".repeat(64 * 1024)
+    );
+    let mut enc = GzEncoder::new(Vec::new(), Compression::best());
+    enc.write_all(big.as_bytes()).unwrap();
+    let gz = enc.finish().unwrap();
+    assert!(gz.len() < 1024, "压缩体本身应小于 max_body: {}", gz.len());
+
+    let app = build_router(h.state.clone());
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .header("content-encoding", "gzip")
+        .body(Body::from(gz))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    let status = resp.status();
+    let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .unwrap_or_default();
+    assert_eq!(
+        status,
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "body={}",
+        String::from_utf8_lossy(&body)
+    );
+    assert!(h.mock.requests().is_empty(), "超限请求不得转发");
+}
+
+/// 头值不是可见 ASCII 时 `to_str` 失败：不能当「无编码」放过。
+#[tokio::test]
+async fn non_ascii_content_encoding_header_is_rejected() {
+    use axum::http::HeaderValue;
+    let h = Harness::new(false, false, true).await;
+    let app = build_router(h.state.clone());
+    // 0x80 属于 obs-text：`HeaderValue::from_bytes` 允许，但 `to_str()` 会失败
+    let ce = HeaderValue::from_bytes(b"gzip\x80").unwrap();
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .header("content-encoding", ce)
+        .body(Body::from(br#"{"messages":[]}"#.to_vec()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    assert!(h.mock.requests().is_empty(), "非法编码头不得转发");
+}
+
+/// 损坏的 gzip / 不支持的编码：一律拒绝，不看 `fail_closed`。
+/// 语义：未经脱敏的压缩体不得出网。
+#[tokio::test]
+async fn broken_compressed_request_is_rejected_not_forwarded() {
+    for (fc, enc_name, payload) in [
+        (true, "gzip", b"not-a-gzip-stream".to_vec()),
+        (false, "gzip", b"not-a-gzip-stream".to_vec()),
+        (false, "unknown-enc", b"whatever".to_vec()),
+        (true, "gzip, br", b"multi".to_vec()),
+    ] {
+        let h = Harness::new(fc, false, true).await;
+        let app = build_router(h.state.clone());
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .header("content-encoding", enc_name)
+            .body(Body::from(payload))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "fail_closed={fc} enc={enc_name} 必须 415 而不是透传"
+        );
+        assert!(
+            h.mock.requests().is_empty(),
+            "fail_closed={fc} enc={enc_name}: 解压失败的请求不得到达上游"
+        );
+    }
+}
+
 // 压缩体响应（回归：gzip 响应曾经整段透传、占位符静默泄漏）
 // ===========================================================================
 

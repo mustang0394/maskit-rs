@@ -333,8 +333,11 @@ pub fn text_slots(data: &Value) -> Vec<Slot> {
             ));
         }
     }
-    // Ollama NDJSON 增量（用 "done" 判别）
-    if obj.contains_key("done") {
+    // Ollama NDJSON 增量。
+    //
+    // 不能只用 `done` 判别：部分实现只在最后一行带 `done`，前面的增量行只有
+    // `message`，漏判会让工具参数完全不走槽位（跨行拆开的参数既拦不住也写不回）。
+    if obj.contains_key("done") || obj.get("message").is_some_and(Value::is_object) {
         if let Some(msg) = obj.get("message").and_then(Value::as_object) {
             if let Some(s) = msg.get("content").and_then(Value::as_str) {
                 slots.push(("o.message.content".into(), s.to_string(), false));
@@ -343,6 +346,25 @@ pub fn text_slots(data: &Value) -> Vec<Slot> {
             // 必须走槽位，否则跨 chunk 的半截占位符会原样下发。
             if let Some(s) = msg.get("thinking").and_then(Value::as_str) {
                 slots.push(("o.message.thinking".into(), s.to_string(), false));
+            }
+            // Ollama/自建 NDJSON 的 `message.tool_calls[].function.arguments`
+            // 同样是**增量**参数，必须走槽位：否则跨行拆开的命令既拦不住，
+            // 整包 rewrite 也写不回去。
+            if let Some(tcs) = msg.get("tool_calls").and_then(Value::as_array) {
+                for (n, tc) in tcs.iter().enumerate() {
+                    let slot_no = tc
+                        .get("index")
+                        .and_then(Value::as_u64)
+                        .map(|v| v as usize)
+                        .unwrap_or(n);
+                    if let Some(args) = tc
+                        .get("function")
+                        .and_then(|f| f.get("arguments"))
+                        .and_then(Value::as_str)
+                    {
+                        slots.push((format!("o.message.tool{slot_no}"), args.to_string(), true));
+                    }
+                }
             }
             for (k, v) in msg {
                 if k == "content" || k == "thinking" || k == "role" || k == "tool_calls" {
@@ -366,6 +388,224 @@ pub fn text_slots(data: &Value) -> Vec<Slot> {
         }
     }
     slots
+}
+
+/// **完成快照**里的工具参数（完整值，不是增量片段）。
+///
+/// 为什么必须单独识别：Responses 的 `response.function_call_arguments.done`、
+/// `response.output_item.done`、`response.completed` 以及 Chat 的整包工具调用
+/// 都会带上**完整** `arguments`。聚合器只接管 `.delta` 片段，快照若不走这里，
+/// rewrite/block 就完全看不见它们 —— 客户端从完成事件取参数，仍拿到原值。
+///
+/// 返回 `(channel, 完整参数文本, 是否需转义还原)`。
+pub fn snapshot_tool_slots(data: &Value) -> Vec<Slot> {
+    let mut slots = Vec::new();
+    let Some(obj) = data.as_object() else {
+        return slots;
+    };
+    // Responses：`arguments` / `response.output[].arguments` / `item.arguments`
+    let etype = obj.get("type").and_then(Value::as_str).unwrap_or("");
+    let mut push_args = |holder: &Value, tag: &str| {
+        if let Some(s) = holder.get("arguments").and_then(Value::as_str) {
+            if !s.is_empty() {
+                slots.push((format!("s.{tag}.arguments"), s.to_string(), true));
+            }
+        }
+    };
+    push_args(data, etype);
+    if let Some(resp) = obj.get("response") {
+        push_args(resp, "response");
+        if let Some(out) = resp.get("output").and_then(Value::as_array) {
+            for (n, item) in out.iter().enumerate() {
+                push_args(item, &format!("response.output{n}"));
+            }
+        }
+    }
+    if let Some(items) = obj.get("output").and_then(Value::as_array) {
+        for (n, item) in items.iter().enumerate() {
+            push_args(item, &format!("output{n}"));
+        }
+    }
+    if let Some(item) = obj.get("item") {
+        push_args(item, "item");
+        if let Some(fc) = item.get("function_call") {
+            push_args(fc, "item.function_call");
+        }
+    }
+    // Chat：`choices[].message.tool_calls[].function.arguments`（整包快照）
+    if let Some(choices) = obj.get("choices").and_then(Value::as_array) {
+        for (position, c) in choices.iter().enumerate() {
+            let idx = choice_index(c, position);
+            // 只认 `message`（整包快照）。`delta` 是增量片段，由 `text_slots`
+            // 按通道聚合后判定 —— 在这里当快照会把半截片段（`rm -rf /`）
+            // 误判成完整命令。
+            let Some(msg) = c.get("message") else {
+                continue;
+            };
+            if let Some(tcs) = msg.get("tool_calls").and_then(Value::as_array) {
+                for (tidx, tc) in tcs.iter().enumerate() {
+                    let slot_no = tc
+                        .get("index")
+                        .and_then(Value::as_u64)
+                        .map(|v| v as usize)
+                        .unwrap_or(tidx);
+                    if let Some(args) = tc
+                        .get("function")
+                        .and_then(|f| f.get("arguments"))
+                        .and_then(Value::as_str)
+                    {
+                        slots.push((format!("s.c{idx}.tool{slot_no}"), args.to_string(), true));
+                    }
+                }
+            }
+        }
+    }
+    // Ollama：`message.tool_calls[].function.arguments`
+    if let Some(msg) = obj.get("message") {
+        if let Some(tcs) = msg.get("tool_calls").and_then(Value::as_array) {
+            for (tidx, tc) in tcs.iter().enumerate() {
+                let slot_no = tc
+                    .get("index")
+                    .and_then(Value::as_u64)
+                    .map(|v| v as usize)
+                    .unwrap_or(tidx);
+                if let Some(args) = tc
+                    .get("function")
+                    .and_then(|f| f.get("arguments"))
+                    .and_then(Value::as_str)
+                {
+                    slots.push((format!("s.o.tool{slot_no}"), args.to_string(), true));
+                }
+            }
+        }
+    }
+    slots
+}
+
+/// 把 `snapshot_tool_slots` 的改写结果写回原位置。
+pub fn set_snapshot_tool(data: &mut Value, channel: &str, text: &str) {
+    let Some(tag) = channel.strip_prefix("s.") else {
+        return;
+    };
+    // 尾部统一是 `.arguments` / `.tool{n}`
+    if let Some(holder_tag) = tag.strip_suffix(".arguments") {
+        let mut targets: Vec<&mut Value> = Vec::new();
+        match holder_tag {
+            "response" => {
+                if let Some(v) = data.get_mut("response") {
+                    targets.push(v);
+                }
+            }
+            "item" => {
+                if let Some(v) = data.get_mut("item") {
+                    targets.push(v);
+                }
+            }
+            "item.function_call" => {
+                if let Some(v) = data
+                    .get_mut("item")
+                    .and_then(|i| i.get_mut("function_call"))
+                {
+                    targets.push(v);
+                }
+            }
+            t if t.starts_with("response.output") => {
+                if let Ok(n) = t["response.output".len()..].parse::<usize>() {
+                    if let Some(v) = data
+                        .get_mut("response")
+                        .and_then(|r| r.get_mut("output"))
+                        .and_then(|o| o.get_mut(n))
+                    {
+                        targets.push(v);
+                    }
+                }
+            }
+            t if t.starts_with("output") => {
+                if let Ok(n) = t["output".len()..].parse::<usize>() {
+                    if let Some(v) = data.get_mut("output").and_then(|o| o.get_mut(n)) {
+                        targets.push(v);
+                    }
+                }
+            }
+            _ => {
+                // 事件类型本身（`response.function_call_arguments.done` 等）：
+                // 参数就在载荷顶层。
+                if let Some(o) = data.as_object_mut() {
+                    o.insert("arguments".into(), Value::String(text.into()));
+                }
+                return;
+            }
+        }
+        for holder in targets {
+            if let Some(o) = holder.as_object_mut() {
+                o.insert("arguments".into(), Value::String(text.into()));
+            }
+        }
+        return;
+    }
+    // Chat 快照：`c{idx}.tool{n}`
+    if let Some(rest) = tag.strip_prefix('c') {
+        if let Some((idx_s, field)) = rest.split_once('.') {
+            let (Ok(idx), Some(n_s)) = (idx_s.parse::<usize>(), field.strip_prefix("tool")) else {
+                return;
+            };
+            let Ok(n) = n_s.parse::<usize>() else { return };
+            if let Some(choices) = data.get_mut("choices").and_then(Value::as_array_mut) {
+                for (position, c) in choices.iter_mut().enumerate() {
+                    let ci = c
+                        .get("index")
+                        .and_then(Value::as_u64)
+                        .map(|v| v as usize)
+                        .unwrap_or(position);
+                    if ci != idx {
+                        continue;
+                    }
+                    let Some(msg) = c.get_mut("message") else {
+                        continue;
+                    };
+                    if let Some(tcs) = msg.get_mut("tool_calls").and_then(Value::as_array_mut) {
+                        for (tidx, tc) in tcs.iter_mut().enumerate() {
+                            let slot_no = tc
+                                .get("index")
+                                .and_then(Value::as_u64)
+                                .map(|v| v as usize)
+                                .unwrap_or(tidx);
+                            if slot_no != n {
+                                continue;
+                            }
+                            if let Some(f) = tc.get_mut("function").and_then(Value::as_object_mut) {
+                                f.insert("arguments".into(), Value::String(text.into()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return;
+    }
+    // Ollama 快照：`o.tool{n}`
+    if let Some(n_s) = tag.strip_prefix("o.tool") {
+        let Ok(n) = n_s.parse::<usize>() else { return };
+        if let Some(tcs) = data
+            .get_mut("message")
+            .and_then(|m| m.get_mut("tool_calls"))
+            .and_then(Value::as_array_mut)
+        {
+            for (tidx, tc) in tcs.iter_mut().enumerate() {
+                let slot_no = tc
+                    .get("index")
+                    .and_then(Value::as_u64)
+                    .map(|v| v as usize)
+                    .unwrap_or(tidx);
+                if slot_no != n {
+                    continue;
+                }
+                if let Some(f) = tc.get_mut("function").and_then(Value::as_object_mut) {
+                    f.insert("arguments".into(), Value::String(text.into()));
+                }
+            }
+        }
+    }
 }
 
 /// 本事件后应结束（flush）的通道前缀。None = 全部，空 = 无。
@@ -609,6 +849,31 @@ pub fn set_slot(data: &mut Value, channel: &str, text: &str) {
     }
     // o.message.content / o.message.thinking / o.message.x{字段} / o.response / o.thinking
     if let Some(rest) = channel.strip_prefix("o.message.") {
+        // `o.message.tool{n}`：写回 `message.tool_calls[n].function.arguments`
+        if let Some(n_s) = rest.strip_prefix("tool") {
+            if let Ok(n) = n_s.parse::<usize>() {
+                if let Some(tcs) = data
+                    .get_mut("message")
+                    .and_then(|m| m.get_mut("tool_calls"))
+                    .and_then(Value::as_array_mut)
+                {
+                    for (i, tc) in tcs.iter_mut().enumerate() {
+                        let slot_no = tc
+                            .get("index")
+                            .and_then(Value::as_u64)
+                            .map(|v| v as usize)
+                            .unwrap_or(i);
+                        if slot_no != n {
+                            continue;
+                        }
+                        if let Some(f) = tc.get_mut("function").and_then(Value::as_object_mut) {
+                            f.insert("arguments".into(), Value::String(text.into()));
+                        }
+                    }
+                }
+                return;
+            }
+        }
         if let Some(msg) = data.get_mut("message").and_then(Value::as_object_mut) {
             let key = is_generic_field(rest).unwrap_or(rest);
             msg.insert(key.into(), Value::String(text.into()));

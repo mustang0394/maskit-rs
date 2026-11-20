@@ -44,7 +44,10 @@ pub struct ResponseOutcome {
 ///   * **二进制体**（image/audio/octet-stream/pdf…）—— `from_utf8_lossy`
 ///     会不可逆地弄坏它们，宁可不动。
 pub fn restorable(ct: &str, content_encoding: &str) -> bool {
-    if !content_encoding.is_empty() && content_encoding != "identity" {
+    // 与解码侧共用同一套规范化（trim + 小写）：`IDENTITY` / ` Identity ` 都必须
+    // 等同「无编码」。否则解码判为「不需要解」，还原判为「不可还原」，
+    // 上游回 `Content-Encoding: IDENTITY` 时占位符会原样下发。
+    if !crate::stream::decode::is_identity(content_encoding) {
         return false;
     }
     let c = ct.to_ascii_lowercase();
@@ -114,50 +117,156 @@ fn apply_cmd_to_encoded(
     cmdblock: &crate::cmdblock::CmdBlockEngine,
     blocked: &mut bool,
 ) -> String {
+    use crate::stream::slots;
+
+    // 拆成「块 → 行」；保留原始行文本，解析成功的 `data:` 载荷单独记下。
+    // 统一按行处理：SSE 的 `data:` 行与 NDJSON 的整行 JSON 都能解析；
+    // 空行与 `event:`/`id:` 等非数据行原样保留。分块信息只在最后拼接时用到 ——
+    // SSE 用 `\n\n` 分隔事件，NDJSON 用 `\n` 分隔行。
+    let mut blocks: Vec<Vec<(String, Option<serde_json::Value>)>> = Vec::new();
     if sse {
-        let mut blocks: Vec<String> = Vec::new();
         for block in text.split("\n\n") {
-            let mut lines: Vec<String> = Vec::new();
+            let mut lines = Vec::new();
             for line in block.split('\n') {
-                let Some(rest) = line.strip_prefix("data:") else {
-                    lines.push(line.to_string());
-                    continue;
-                };
-                let payload = rest.strip_prefix(' ').unwrap_or(rest);
-                if payload.trim() == "[DONE]" {
-                    lines.push(line.to_string());
+                lines.push(parse_data_line(line));
+            }
+            blocks.push(lines);
+        }
+    } else {
+        let mut lines = Vec::new();
+        for line in text.split('\n') {
+            lines.push(parse_data_line(line));
+        }
+        blocks.push(lines);
+    }
+
+    // 工具参数槽位按 channel 跨帧累积：客户端最终使用的是拼接后的完整参数，
+    // 逐帧判定既漏拦被切开的命令，也会把 `rm -rf /tmp` 的前半段误判成 `/`。
+    let mut fragments: Vec<(usize, usize, String, String)> = Vec::new(); // (块, 行, 通道, 片段)
+    let mut agg: Vec<(String, String)> = Vec::new();
+    let mut slot_of: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for (bi, lines) in blocks.iter().enumerate() {
+        for (li, (_, val)) in lines.iter().enumerate() {
+            let Some(v) = val else { continue };
+            for (channel, frag, _) in slots::text_slots(v) {
+                if crate::cmdblock::CmdBlockEngine::channel_kind(&channel) != "tool" {
                     continue;
                 }
-                match serde_json::from_str::<serde_json::Value>(payload) {
-                    Ok(v) => {
-                        let v = cmdblock.process_tree(v, sid, store, blocked);
-                        lines.push(format!(
-                            "data: {}",
-                            serde_json::to_string(&v).unwrap_or_else(|_| payload.to_string())
-                        ));
+                match slot_of.get(&channel) {
+                    Some(&n) => agg[n].1.push_str(&frag),
+                    None => {
+                        slot_of.insert(channel.clone(), agg.len());
+                        agg.push((channel.clone(), frag.clone()));
                     }
-                    Err(_) => lines.push(line.to_string()),
+                }
+                fragments.push((bi, li, channel, frag));
+            }
+        }
+    }
+
+    // 完整参数判定 + 把改写结果按原片段长度分配回去（客户端是拼接使用，
+    // 任意切分都等价，只要总串一致）。
+    let mut rewrites: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for (channel, full) in &agg {
+        let (new_text, b) = cmdblock.process_aggregated_tool(full, sid, store);
+        if b {
+            *blocked = true;
+        }
+        if new_text != *full {
+            rewrites.insert(channel.clone(), new_text);
+        }
+    }
+    if !*blocked {
+        for (channel, new_text) in &rewrites {
+            let chars: Vec<char> = new_text.chars().collect();
+            let mut pos = 0usize;
+            let mine: Vec<&(usize, usize, String, String)> =
+                fragments.iter().filter(|f| &f.2 == channel).collect();
+            for (n, f) in mine.iter().enumerate() {
+                let want = f.3.chars().count();
+                let take = if n + 1 == mine.len() {
+                    chars.len().saturating_sub(pos)
+                } else {
+                    want.min(chars.len().saturating_sub(pos))
+                };
+                let piece: String = chars[pos..pos + take].iter().collect();
+                pos += take;
+                if let Some(val) = blocks[f.0][f.1].1.as_mut() {
+                    slots::set_slot(val, channel, &piece);
                 }
             }
-            blocks.push(lines.join("\n"));
         }
-        blocks.join("\n\n")
-    } else {
-        text.split('\n')
-            .map(|line| {
-                if line.trim().is_empty() {
-                    return line.to_string();
-                }
-                match serde_json::from_str::<serde_json::Value>(line) {
-                    Ok(v) => {
-                        let v = cmdblock.process_tree(v, sid, store, blocked);
-                        serde_json::to_string(&v).unwrap_or_else(|_| line.to_string())
+    }
+
+    // 逐帧：只处理「未被聚合器接管」的部分。
+    //
+    // `process_tree_defer_streamed` 的语义是「工具参数子树里的字符串一律跳过」——
+    // 增量的确该跳过（已按通道拼接），但**完成快照**（`function_call_arguments.done`
+    // / `output_item.done` / `response.completed` / 整包 `message.tool_calls`）
+    // 带的是完整参数，必须在这里检查，否则客户端从完成事件取到的仍是原值。
+    for lines in blocks.iter_mut() {
+        for (_, val) in lines.iter_mut() {
+            if let Some(v) = val.take() {
+                let mut v = cmdblock.process_tree_defer_streamed(v, sid, store, blocked);
+                let snaps = slots::snapshot_tool_slots(&v);
+                for (channel, text, _escape) in snaps {
+                    let (new_text, b) = cmdblock.process_aggregated_tool(&text, sid, store);
+                    if b {
+                        *blocked = true;
                     }
-                    Err(_) => line.to_string(),
+                    if new_text != text {
+                        slots::set_snapshot_tool(&mut v, &channel, &new_text);
+                    }
                 }
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
+                *val = Some(v);
+            }
+        }
+    }
+
+    // 回写：解析过的行重新序列化，其余行保持原样。
+    blocks
+        .into_iter()
+        .map(|lines| {
+            lines
+                .into_iter()
+                .map(|(raw, val)| match val {
+                    Some(v) => {
+                        let json = serde_json::to_string(&v).unwrap_or_else(|_| raw.clone());
+                        if let Some(rest) = raw.strip_prefix("data:") {
+                            if rest.starts_with(' ') {
+                                format!("data: {json}")
+                            } else {
+                                format!("data:{json}")
+                            }
+                        } else {
+                            json
+                        }
+                    }
+                    None => raw,
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+/// 解析一行 SSE `data:` / NDJSON 载荷；非数据行或不合法 JSON 返回 `None`。
+fn parse_data_line(line: &str) -> (String, Option<serde_json::Value>) {
+    let Some(rest) = line.strip_prefix("data:") else {
+        // NDJSON：整行就是 JSON
+        return match serde_json::from_str::<serde_json::Value>(line) {
+            Ok(v) => (line.to_string(), Some(v)),
+            Err(_) => (line.to_string(), None),
+        };
+    };
+    let payload = rest.strip_prefix(' ').unwrap_or(rest);
+    if payload.trim() == "[DONE]" {
+        return (line.to_string(), None);
+    }
+    match serde_json::from_str::<serde_json::Value>(payload) {
+        Ok(v) => (line.to_string(), Some(v)),
+        Err(_) => (line.to_string(), None),
     }
 }
 
@@ -230,7 +339,8 @@ pub fn process_whole(
             joined.push_str(tail.trim_end_matches('\n'));
             joined.push('\n');
         }
-        if cmdblock.requires_whole_body() {
+        // 同 SSE 分支：observe 也必须扫描，否则整包 NDJSON 的工具参数命中丢失。
+        if cmdblock.has_channels() {
             joined = apply_cmd_to_encoded(&joined, false, sid, store, cmdblock, &mut blocked);
         }
         joined
@@ -249,7 +359,10 @@ pub fn process_whole(
         if !tail.is_empty() {
             joined = format!("{}\n\n{}", joined.trim_end_matches('\n'), tail);
         }
-        if cmdblock.requires_whole_body() {
+        // observe 也要走这里：整包 SSE 在「上游非流式 / stream_response=false」
+        // 时不会经过流式逐帧扫描，若只按 requires_whole_body 判断，observe
+        // 会完全漏掉工具参数命中（CMDHIT 永远不出现）。
+        if cmdblock.has_channels() {
             joined = apply_cmd_to_encoded(&joined, true, sid, store, cmdblock, &mut blocked);
         }
         joined
@@ -556,6 +669,10 @@ pub fn stream_response(
             }
             yield Ok(Bytes::from(tail));
         }
+        // 工具参数缓冲的最终判定（observe）：跨帧参数只有流末才完整，
+        // 逐帧判定会漏拦被切开的命令，也会把 `rm -rf /tmp` 的前半段当成删根。
+        cmdblock.flush_tool_fragments(&sid, store);
+
         // RESTORE 事件 + 响应扫描
         // dialog 取 state.kept —— 那是**还原后**的正文（上游回的是占位符，
         // 用户看到的是原文，事件里也该记原文）。
@@ -1213,6 +1330,264 @@ mod tests {
         assert_eq!(out3, "工具 ask_user_question 被调用");
     }
 
+    /// F-02 回归：同一次工具调用的参数跨两帧发送，整包处理时必须先拼接再判定。
+    ///
+    /// 断言必须**重组参数**再检查：输入本身就是分片，原始报文里本来就不含
+    /// 连续的危险子串，只查报文字节会让「完全没拦」也通过。
+    #[test]
+    fn cross_frame_tool_arguments_are_joined_before_scanning() {
+        use crate::config::{CmdBlockMode, Config};
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"command\\\":\\\"rm -r\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"f /\\\"}\"}}]}}]}\n\n"
+        );
+        for mode in [CmdBlockMode::Rewrite, CmdBlockMode::Block] {
+            let mut cfg = Config::default();
+            cfg.command_block.mode = mode;
+            let e = crate::cmdblock::CmdBlockEngine::new(&cfg);
+            let store = SessionStore::new();
+            store.new_session("s");
+            let outcome = process_whole(sse.as_bytes(), "text/event-stream", "s", &store, &e);
+            let body = String::from_utf8_lossy(&outcome.body).to_string();
+
+            let mut joined = String::new();
+            for block in body.split("\n\n") {
+                for line in block.lines() {
+                    let Some(payload) = line.strip_prefix("data:") else {
+                        continue;
+                    };
+                    let Ok(v) = serde_json::from_str::<serde_json::Value>(payload.trim()) else {
+                        continue;
+                    };
+                    if let Some(a) = v["choices"][0]["delta"]["tool_calls"][0]["function"]
+                        .get("arguments")
+                        .and_then(|x| x.as_str())
+                    {
+                        joined.push_str(a);
+                    }
+                }
+            }
+            match mode {
+                CmdBlockMode::Rewrite => {
+                    assert!(!outcome.blocked);
+                    assert!(
+                        !joined.contains("rm -rf /"),
+                        "跨帧拼接后的危险命令未被改写: {joined}"
+                    );
+                    // 改写后内层仍必须是合法 JSON（客户端要能解析）
+                    assert!(
+                        serde_json::from_str::<serde_json::Value>(&joined).is_ok(),
+                        "改写后参数不是合法 JSON: {joined}"
+                    );
+                }
+                _ => assert!(outcome.blocked, "跨帧拼接后的危险命令必须阻断"),
+            }
+        }
+    }
+
+    /// 整包 SSE/NDJSON 的 observe 也要记录命中：不会经过流式逐帧扫描时，
+    /// 只按 `requires_whole_body` 判断会让 observe 完全漏掉工具参数。
+    #[test]
+    fn whole_body_observe_records_tool_hits() {
+        use crate::config::{CmdBlockMode, Config};
+        let mut cfg = Config::default();
+        cfg.command_block.mode = CmdBlockMode::Observe;
+        let e = crate::cmdblock::CmdBlockEngine::new(&cfg);
+        let store = SessionStore::new();
+        store.new_session("s");
+        let sse = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"rm -rf /\"}}]}}]}\n\n";
+        let outcome = process_whole(sse.as_bytes(), "text/event-stream", "s", &store, &e);
+        assert!(!outcome.blocked);
+        assert_eq!(
+            store.get("s").map(|s| s.cmd_hits.len()).unwrap_or(0),
+            1,
+            "整包 observe 必须记录命中"
+        );
+        // observe 零改写
+        assert!(String::from_utf8_lossy(&outcome.body).contains("rm -rf /"));
+    }
+
+    /// F-02 回归（本轮回审）：Responses 完成快照不能绕过 —— 聚合器只接管
+    /// `.delta` 片段，`function_call_arguments.done` / `output_item.done` /
+    /// `response.completed` 带的是**完整**参数，必须同样被检查与改写。
+    #[test]
+    fn responses_completion_snapshots_are_checked() {
+        use crate::config::{CmdBlockMode, Config};
+        let sse = concat!(
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"delta\":\"{\\\"command\\\":\\\"rm -rf /\\\"}\"}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"arguments\":\"{\\\"command\\\":\\\"rm -rf /\\\"}\"}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"function_call\",\"arguments\":\"{\\\"command\\\":\\\"rm -rf /\\\"}\"}]}}\n\n"
+        );
+        for mode in [CmdBlockMode::Rewrite, CmdBlockMode::Block] {
+            let mut cfg = Config::default();
+            cfg.command_block.mode = mode;
+            let e = crate::cmdblock::CmdBlockEngine::new(&cfg);
+            let store = SessionStore::new();
+            store.new_session("s");
+            let outcome = process_whole(sse.as_bytes(), "text/event-stream", "s", &store, &e);
+            let body = String::from_utf8_lossy(&outcome.body).to_string();
+            match mode {
+                CmdBlockMode::Rewrite => {
+                    assert!(!outcome.blocked);
+                    assert!(!body.contains("rm -rf /"), "完成快照仍保留危险参数: {body}");
+                }
+                _ => assert!(outcome.blocked, "仅完成快照也必须能阻断"),
+            }
+        }
+    }
+
+    /// F-02 回归：只有完整快照（没有 delta）的响应同样要拦。
+    #[test]
+    fn snapshot_only_response_is_blocked() {
+        use crate::config::{CmdBlockMode, Config};
+        let mut cfg = Config::default();
+        cfg.command_block.mode = CmdBlockMode::Block;
+        let e = crate::cmdblock::CmdBlockEngine::new(&cfg);
+        let store = SessionStore::new();
+        store.new_session("s");
+        let sse = "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"arguments\":\"{\\\"command\\\":\\\"rm -rf /\\\"}\"}}\n\n";
+        let outcome = process_whole(sse.as_bytes(), "text/event-stream", "s", &store, &e);
+        assert!(outcome.blocked, "仅快照的响应必须阻断");
+    }
+
+    /// 业务字符串（同名 `input`/`arguments`）不得被当作参数容器重新序列化。
+    #[test]
+    fn business_strings_named_input_are_not_reparsed() {
+        use crate::config::{CmdBlockMode, Config};
+        let body = concat!(
+            r#"{"tool_calls":[{"function":{"arguments":{"path":"demo.txt","#,
+            r#""input":"{ \"x\": 1 }","arguments":"a/b"}}}]}"#
+        );
+        for mode in [
+            CmdBlockMode::Observe,
+            CmdBlockMode::Rewrite,
+            CmdBlockMode::Block,
+        ] {
+            let mut cfg = Config::default();
+            cfg.command_block.mode = mode;
+            let e = crate::cmdblock::CmdBlockEngine::new(&cfg);
+            let store = SessionStore::new();
+            store.new_session("s");
+            let outcome = process_whole(body.as_bytes(), "application/json", "s", &store, &e);
+            let text = String::from_utf8_lossy(&outcome.body).to_string();
+            let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+            let args = &v["tool_calls"][0]["function"]["arguments"];
+            assert_eq!(args["input"], "{ \"x\": 1 }", "{mode:?}: input 被改写");
+            assert_eq!(args["arguments"], "a/b", "{mode:?}: 业务 arguments 被改写");
+            assert_eq!(args["path"], "demo.txt");
+            assert_eq!(
+                store.get("s").map(|s| s.cmd_hits.len()).unwrap_or(0),
+                0,
+                "{mode:?}: 无命中不应有记录"
+            );
+        }
+    }
+
+    /// 通用工具增量（`custom_tool_call_input.delta`）拼接后是安全路径时不得误拦。
+    #[test]
+    fn generic_tool_delta_join_is_not_false_positive() {
+        use crate::config::{CmdBlockMode, Config};
+        let sse = concat!(
+            "data: {\"type\":\"response.custom_tool_call_input.delta\",\"delta\":\"rm -rf /\",\"item_id\":\"c1\"}\n\n",
+            "data: {\"type\":\"response.custom_tool_call_input.delta\",\"delta\":\"tmp/keep\",\"item_id\":\"c1\"}\n\n"
+        );
+        for mode in [CmdBlockMode::Rewrite, CmdBlockMode::Block] {
+            let mut cfg = Config::default();
+            cfg.command_block.mode = mode;
+            let e = crate::cmdblock::CmdBlockEngine::new(&cfg);
+            let store = SessionStore::new();
+            store.new_session("s");
+            let outcome = process_whole(sse.as_bytes(), "text/event-stream", "s", &store, &e);
+            assert!(
+                !outcome.blocked,
+                "{mode:?}: 完整值 `rm -rf /tmp/keep` 不是删根命令，不得误拦"
+            );
+            let text = String::from_utf8_lossy(&outcome.body).to_string();
+            assert!(!text.contains("Maskit"), "{mode:?}: 安全路径被改写: {text}");
+        }
+    }
+
+    /// F-02（NDJSON）：Ollama 风格 `message.tool_calls` 跨行拆开的参数，
+    /// 也必须先拼接再判定；rewrite 后客户端重组仍是合法 JSON。
+    #[test]
+    fn ndjson_cross_line_tool_arguments_are_joined() {
+        use crate::config::{CmdBlockMode, Config};
+        let nd = concat!(
+            "{\"message\":{\"content\":\"\",\"tool_calls\":[{\"function\":{\"name\":\"sh\",\"arguments\":\"{\\\"command\\\":\\\"rm -r\"}}]}}\n",
+            "{\"message\":{\"content\":\"\",\"tool_calls\":[{\"function\":{\"arguments\":\"f /\\\"}\"}}]},\"done\":true}\n"
+        );
+        for mode in [CmdBlockMode::Rewrite, CmdBlockMode::Block] {
+            let mut cfg = Config::default();
+            cfg.command_block.mode = mode;
+            let e = crate::cmdblock::CmdBlockEngine::new(&cfg);
+            let store = SessionStore::new();
+            store.new_session("s");
+            let outcome = process_whole(nd.as_bytes(), "application/x-ndjson", "s", &store, &e);
+            let body = String::from_utf8_lossy(&outcome.body);
+            let mut joined = String::new();
+            for line in body.lines() {
+                // 每一行都必须是合法 JSON（协议完整性）
+                let v: serde_json::Value = serde_json::from_str(line).expect("行必须是合法 JSON");
+                if let Some(a) = v["message"]["tool_calls"][0]["function"]
+                    .get("arguments")
+                    .and_then(|x| x.as_str())
+                {
+                    joined.push_str(a);
+                }
+            }
+            match mode {
+                CmdBlockMode::Rewrite => assert!(
+                    !joined.contains("rm -rf /"),
+                    "NDJSON 跨行参数未被改写: {joined}"
+                ),
+                _ => {
+                    assert!(outcome.blocked, "NDJSON 跨行参数必须阻断");
+                    assert!(serde_json::from_str::<serde_json::Value>(&joined).is_ok());
+                }
+            }
+        }
+    }
+
+    /// 安全命令恰好被切在 `/` 上时，不得因为前半段看似 `rm -rf /` 而误改。
+    #[test]
+    fn safe_path_split_at_slash_is_not_false_positive() {
+        use crate::config::{CmdBlockMode, Config};
+        let mut cfg = Config::default();
+        cfg.command_block.mode = CmdBlockMode::Rewrite;
+        let e = crate::cmdblock::CmdBlockEngine::new(&cfg);
+        let store = SessionStore::new();
+        store.new_session("s");
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"rm -rf /\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"tmp/keep\"}}]}}]}\n\n"
+        );
+        let outcome = process_whole(sse.as_bytes(), "text/event-stream", "s", &store, &e);
+        let text = String::from_utf8_lossy(&outcome.body).to_string();
+        assert!(!outcome.blocked);
+        assert!(
+            text.contains("rm -rf /") && text.contains("tmp/keep"),
+            "安全路径被误改: {text}"
+        );
+    }
+
+    /// JSON 字符串形式的工具参数（单帧完整）在整包路径也要拦得住。
+    #[test]
+    fn json_string_arguments_blocked_in_whole_body() {
+        use crate::config::{CmdBlockMode, Config};
+        let mut cfg = Config::default();
+        cfg.command_block.mode = CmdBlockMode::Block;
+        let e = crate::cmdblock::CmdBlockEngine::new(&cfg);
+        let store = SessionStore::new();
+        store.new_session("s");
+        let body = serde_json::json!({
+            "tool_calls": [{"function": {"name": "sh",
+                "arguments": "{\"command\":\"rm -rf /\"}"}}]
+        })
+        .to_string();
+        let outcome = process_whole(body.as_bytes(), "application/json", "s", &store, &e);
+        assert!(outcome.blocked, "JSON 字符串参数里的危险命令未被阻断");
+    }
+
     #[test]
     fn content_type_gates() {
         assert!(restorable("application/json", ""));
@@ -1220,6 +1595,18 @@ mod tests {
         assert!(
             !restorable("text/event-stream", "gzip"),
             "压缩体在解码前不可按事件切分"
+        );
+        // 回归：`IDENTITY` / 带空白的大小写变体曾被判为不可还原 —— 解码侧
+        // 忽略大小写、还原侧精确比较，两者结论相反，占位符会静默泄漏。
+        for enc in ["identity", "IDENTITY", " Identity ", "\tIdentity"] {
+            assert!(
+                restorable("application/json", enc),
+                "大小写/空白的 identity 也必须还原: {enc:?}"
+            );
+        }
+        assert!(
+            !restorable("application/json", "gzip"),
+            "压缩体仍然不可还原"
         );
         // 回归：文本类响应必须试着还原 —— 占位符是我们自己签发的，
         // 「content-type 不是 json」不等于「可以放着占位符不管」。

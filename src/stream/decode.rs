@@ -17,19 +17,32 @@
 //! 解码失败一律返回 `None` → 调用方退回原来的「不可还原则透传」行为,
 //! 不会把好数据弄坏。
 
+/// `content-encoding` 的规范化形式：去首尾空白 + ASCII 小写。
+///
+/// 为什么必须共用：响应侧 `restorable()` 与解码侧曾各写一套判断 —— 解码把
+/// `IDENTITY` 视为「无编码」，还原却按精确字符串比较把小写 `identity` 当唯一
+/// 无编码形式。上游回 `Content-Encoding: IDENTITY` 时，两者结论相反：不解码、
+/// 也不还原，占位符原样下发且不产生 RESTORE 事件（静默泄漏）。
+pub fn normalize_encoding(content_encoding: &str) -> String {
+    content_encoding.trim().to_ascii_lowercase()
+}
+
+/// 规范化后是否等价于「无编码」。
+pub fn is_identity(content_encoding: &str) -> bool {
+    let e = normalize_encoding(content_encoding);
+    e.is_empty() || e == "identity"
+}
+
 /// `content-encoding` 是否是我们能解码的压缩体。
 ///
 /// 只认单一编码(gzip/x-gzip/deflate/br/zstd)。多重编码(`gzip, br` 之类)
 /// 返回 false —— 叠加解码的顺序与语义容易出错,宁可透传也不误处理。
 pub fn is_decodable(content_encoding: &str) -> bool {
-    let e = content_encoding.trim();
-    if e.is_empty() || e.eq_ignore_ascii_case("identity") || e.contains(',') {
+    let e = normalize_encoding(content_encoding);
+    if e.is_empty() || e == "identity" || e.contains(',') {
         return false;
     }
-    matches!(
-        e.to_ascii_lowercase().as_str(),
-        "gzip" | "x-gzip" | "deflate" | "br" | "zstd"
-    )
+    matches!(e.as_str(), "gzip" | "x-gzip" | "deflate" | "br" | "zstd")
 }
 
 /// 解压后允许的最大字节数（防 zip bomb / OOM）。
@@ -55,19 +68,115 @@ fn read_capped<R: std::io::Read>(mut r: R) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
+/// 请求体解压上限。
+///
+/// 比响应侧更保守：`server.max_body_bytes` 默认 32MiB，请求体在 HTTP 语义上
+/// 是「用户输入」，不该允许解出几百 MB。128MiB 与响应侧同量级，但请求侧
+/// 单独留常量便于按需调整。
+pub const MAX_REQUEST_DECODED_BYTES: usize = 128 * 1024 * 1024;
+
+/// 请求解压上限的哨兵前缀：调用方据此把它映射成 413（而不是 415）。
+pub const DECODE_TOO_LARGE_PREFIX: &str = "decoded_too_large:";
+
+/// 解压请求体（客户端 → 网关方向）。
+///
+/// 为什么必须有：请求侧此前只按 `content-type` 判断是否走 JSON 管线，**从不看
+/// `content-encoding`**。压缩 JSON 无法当普通文本解析，于是 `fail_closed=true`
+/// 时合法 gzip 请求被拒成 400，`fail_closed=false` 时压缩体被原样转发 ——
+/// 里面所有 PII 从未经过脱敏。
+///
+/// 返回 `Ok(None)` 表示无需解压（无编码 / identity）；`Err` 表示编码不支持、
+/// 多重编码或解压失败，调用方必须按未脱敏体处理，不能透传。
+/// `max_out`：调用方的业务上限（通常 `server.max_body_bytes`）。
+///
+/// 必须由调用方传入而不是只用常量：解压发生在内存里，若只按 128MiB 常量封顶、
+/// 事后才比较 `max_body`，一个约 128KiB 的高压缩比请求就能让单请求分配 128MiB
+/// （默认 `max_body` 32MiB 的 4 倍），并发时可直接打满内存。
+pub fn decode_request(
+    body: &[u8],
+    content_encoding: &str,
+    max_out: usize,
+) -> Result<Option<Vec<u8>>, String> {
+    if is_identity(content_encoding) {
+        return Ok(None);
+    }
+    let cap = max_out.clamp(1, MAX_REQUEST_DECODED_BYTES);
+    let capped = request_decode_capped(body, content_encoding, cap)?;
+    Ok(Some(capped))
+}
+
+/// 带上限的实际解压；与响应侧共用算法但用请求侧上限。
+fn request_decode_capped(
+    body: &[u8],
+    content_encoding: &str,
+    cap: usize,
+) -> Result<Vec<u8>, String> {
+    use std::io::Read as _;
+    let e = normalize_encoding(content_encoding);
+    if e.contains(',') {
+        return Err(format!("multi_encoding_unsupported: {e}"));
+    }
+    let read = |mut r: Box<dyn std::io::Read>| -> Result<Vec<u8>, String> {
+        let mut out = Vec::new();
+        let n = r
+            .by_ref()
+            .take(cap as u64 + 1)
+            .read_to_end(&mut out)
+            .map_err(|err| err.to_string())?;
+        if n > cap {
+            return Err(format!("{DECODE_TOO_LARGE_PREFIX} >{cap}"));
+        }
+        Ok(out)
+    };
+    // 超出上限的错误必须原样保留哨兵前缀，不能被 `gzip_decode_failed:` 包掉 ——
+    // 调用方靠前缀区分 413（超限）与 415（编码不支持/损坏）。
+    fn keep_sentinel(kind: &str, err: String) -> String {
+        if err.starts_with(DECODE_TOO_LARGE_PREFIX) {
+            err
+        } else {
+            format!("{kind}: {err}")
+        }
+    }
+    match e.as_str() {
+        // 必须用 `MultiGzDecoder`：`GzDecoder` 只解第一个成员，多成员 gzip
+        // 会被静默截断（合法 JSON 变成半截，fail-closed 反而拒绝合法请求）。
+        "gzip" | "x-gzip" => read(Box::new(flate2::read::MultiGzDecoder::new(body)))
+            .map_err(|err| keep_sentinel("gzip_decode_failed", err)),
+        "deflate" => {
+            // zlib 包装 vs 裸 deflate：先试 zlib，失败再试裸流。
+            // **超限错误必须原样返回**：`if let Ok` 会把它吞掉，转去按裸
+            // deflate 重试，最终变成「损坏流」→ 入口按 415 而非 413 处理。
+            match read(Box::new(flate2::read::ZlibDecoder::new(body))) {
+                Ok(out) => return Ok(out),
+                Err(err) if err.starts_with(DECODE_TOO_LARGE_PREFIX) => return Err(err),
+                Err(_) => {}
+            }
+            read(Box::new(flate2::read::DeflateDecoder::new(body)))
+                .map_err(|err| keep_sentinel("deflate_decode_failed", err))
+        }
+        "br" => read(Box::new(brotli::Decompressor::new(body, 4096)))
+            .map_err(|err| keep_sentinel("brotli_decode_failed", err)),
+        "zstd" => {
+            let d = ruzstd::decoding::StreamingDecoder::new(body)
+                .map_err(|err| format!("zstd_decode_failed: {err}"))?;
+            read(Box::new(d)).map_err(|err| keep_sentinel("zstd_decode_failed", err))
+        }
+        _ => Err(format!("unsupported_encoding: {e}")),
+    }
+}
+
 /// 解码响应体。
 ///
 /// `Ok(Some(plain))` = 解码成功;`Ok(None)` = 无编码(原样);`Err` = 解压失败。
 pub fn decode(body: &[u8], content_encoding: &str) -> Result<Option<Vec<u8>>, String> {
-    let e = content_encoding.trim();
-    if e.is_empty() || e.eq_ignore_ascii_case("identity") {
+    let e = normalize_encoding(content_encoding);
+    if e.is_empty() || e == "identity" {
         return Ok(None);
     }
     if e.contains(',') {
         return Err(format!("multi_encoding_unsupported: {e}"));
     }
-    let lower = e.to_ascii_lowercase();
-    match lower.as_str() {
+    match e.as_str() {
         "gzip" | "x-gzip" => {
             let out = read_capped(flate2::read::GzDecoder::new(body))
                 .map_err(|err| format!("gzip_decode_failed: {err}"))?;
@@ -460,6 +569,145 @@ mod tests {
     /// 回归理由：上游 64MB 的响应限幅（`aggregate_stream`）限的是**压缩后**的
     /// 输入；gzip 压缩比可达 ~1000:1，解压无上限时一个几十 MB 的响应就能
     /// 解出几十 GB → OOM。
+    /// 回归（审查发现 #2）：`IDENTITY` / 带空白变体必须与 `identity` 等价。
+    #[test]
+    fn encoding_normalization_is_case_and_space_insensitive() {
+        for enc in ["identity", "IDENTITY", " Identity ", "\tIDentIty\n", ""] {
+            assert!(is_identity(enc), "{enc:?} 应等价于无编码");
+            assert!(!is_decodable(enc), "{enc:?} 不应被当作压缩体");
+        }
+        assert_eq!(normalize_encoding(" GZip\n"), "gzip");
+        assert!(is_decodable(" GZip\n"), "带空白的 gzip 也必须能解码");
+        assert!(!is_identity("gzip"));
+    }
+
+    /// 请求体解压：明文/identity 返回 None，压缩体解出原文，坏流报错。
+    #[test]
+    fn request_decode_handles_identity_and_gzip() {
+        assert!(decode_request(b"{}", "", 1024).unwrap().is_none());
+        assert!(decode_request(b"{}", "IDENTITY", 1024).unwrap().is_none());
+
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+        let plain = br#"{"messages":[{"content":"13800138000"}]}"#;
+        let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(plain).unwrap();
+        let gz = enc.finish().unwrap();
+        let out = decode_request(&gz, "GZIP", 1 << 20).unwrap().unwrap();
+        assert_eq!(out, plain.to_vec());
+
+        assert!(
+            decode_request(b"not-gzip", "gzip", 1 << 20).is_err(),
+            "坏流必须报错（调用方据此拒绝）"
+        );
+        assert!(
+            decode_request(b"x", "gzip, br", 1 << 20).is_err(),
+            "多重编码必须报错"
+        );
+        assert!(
+            decode_request(b"x", "made-up", 1 << 20).is_err(),
+            "未知编码必须报错"
+        );
+        // 解出超过调用方上限：必须以哨兵前缀返回，供调用方映射 413。
+        let err = decode_request(&gz, "gzip", 8).unwrap_err();
+        assert!(err.starts_with(DECODE_TOO_LARGE_PREFIX), "{err}");
+
+        // 大压缩比 + 小上限（生产默认 32MiB / 测试 1KiB）同样要命中哨兵
+        let big = format!(
+            r#"{{"messages":[{{"content":"{}"}}]}}"#,
+            "A".repeat(64 * 1024)
+        );
+        let mut enc = GzEncoder::new(Vec::new(), Compression::best());
+        enc.write_all(big.as_bytes()).unwrap();
+        let big_gz = enc.finish().unwrap();
+        let err = decode_request(&big_gz, "gzip", 1024).unwrap_err();
+        assert!(err.starts_with(DECODE_TOO_LARGE_PREFIX), "{err}");
+    }
+
+    /// F-04 回归：多成员 gzip 必须全部解出；`GzDecoder` 只解第一个成员。
+    #[test]
+    fn multi_member_gzip_is_fully_decoded() {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+        let a = br#"{"model":"m","messages":[{"role":"user","content":"hel"#;
+        let b = br#"lo"}]}"#;
+        let mut e1 = GzEncoder::new(Vec::new(), Compression::default());
+        e1.write_all(a).unwrap();
+        let mut body = e1.finish().unwrap();
+        let mut e2 = GzEncoder::new(Vec::new(), Compression::default());
+        e2.write_all(b).unwrap();
+        body.extend_from_slice(&e2.finish().unwrap());
+
+        let out = decode_request(&body, "gzip", 1 << 20).unwrap().unwrap();
+        assert_eq!(out.len(), a.len() + b.len(), "多成员被截断");
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(&out).is_ok(),
+            "多成员拼出的完整 JSON 必须可解析: {:?}",
+            String::from_utf8_lossy(&out)
+        );
+
+        // 累计上限按所有成员算，不是每个成员各自重置
+        assert!(
+            decode_request(&body, "gzip", 20).is_err(),
+            "多成员累计超限必须报错"
+        );
+
+        // 第二个成员损坏 / 尾随垃圾：必须整体报错，不能返回「部分解压成功」
+        let mut corrupt = gz_bytes(a);
+        let mut bad = gz_bytes(b);
+        let n = bad.len();
+        bad[n - 3] ^= 0xff;
+        corrupt.extend_from_slice(&bad);
+        assert!(
+            decode_request(&corrupt, "gzip", 1 << 20).is_err(),
+            "后续成员损坏不得当作完整解压"
+        );
+
+        let mut trailing = gz_bytes(b"{\"a\":1}");
+        trailing.extend_from_slice(b"garbage");
+        assert!(
+            decode_request(&trailing, "gzip", 1 << 20).is_err(),
+            "尾随垃圾不得静默忽略"
+        );
+    }
+
+    fn gz_bytes(b: &[u8]) -> Vec<u8> {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+        let mut e = GzEncoder::new(Vec::new(), Compression::default());
+        e.write_all(b).unwrap();
+        e.finish().unwrap()
+    }
+
+    /// F-05 回归：zlib 包装与裸 deflate 的超限错误都要保留 `decoded_too_large`
+    /// 前缀（否则入口按 415 而不是 413 处理）。
+    #[test]
+    fn deflate_too_large_keeps_sentinel_for_both_formats() {
+        use flate2::write::{DeflateEncoder, ZlibEncoder};
+        use flate2::Compression;
+        use std::io::Write;
+        let big = vec![b'A'; 64 * 1024];
+
+        let mut z = ZlibEncoder::new(Vec::new(), Compression::default());
+        z.write_all(&big).unwrap();
+        let zbody = z.finish().unwrap();
+        let err = decode_request(&zbody, "deflate", 1024).unwrap_err();
+        assert!(err.starts_with(DECODE_TOO_LARGE_PREFIX), "zlib: {err}");
+
+        let mut r = DeflateEncoder::new(Vec::new(), Compression::default());
+        r.write_all(&big).unwrap();
+        let rbody = r.finish().unwrap();
+        let err = decode_request(&rbody, "deflate", 1024).unwrap_err();
+        assert!(err.starts_with(DECODE_TOO_LARGE_PREFIX), "raw: {err}");
+
+        // 损坏数据仍然是解码失败，不能被误判为超限
+        let err = decode_request(b"\x00\x01garbage", "deflate", 1024).unwrap_err();
+        assert!(!err.starts_with(DECODE_TOO_LARGE_PREFIX), "{err}");
+    }
+
     #[test]
     fn zip_bomb_is_capped() {
         use std::io::Write;

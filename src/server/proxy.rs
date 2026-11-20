@@ -178,7 +178,7 @@ pub async fn proxy_root(state: SharedState) -> Response {
 }
 
 pub async fn handler(State(state): State<SharedState>, req: Request) -> Response {
-    let (parts, body) = req.into_parts();
+    let (mut parts, body) = req.into_parts();
     let method = parts.method.clone();
     let method_str = method.as_str().to_string();
     let path = parts.uri.path().to_string();
@@ -291,6 +291,131 @@ pub async fn handler(State(state): State<SharedState>, req: Request) -> Response
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
+
+    // ── 判定③.5：请求体压缩 → 先解压再脱敏 ──
+    //
+    // 回归（审查发现 #1）：此前请求侧只按 `content-type` 判断，**从不看
+    // `content-encoding`**。压缩 JSON 无法当文本解析，于是 `fail_closed=true`
+    // 时合法 gzip 请求被拒成 400 invalid_json（功能不可用），`fail_closed=false`
+    // 时压缩体被原样转发 —— 其中 PII 从未经过脱敏（隐私边界失效）。
+    //
+    // 语义：解压成功 → 后续管线全部基于明文，转发时剥掉 `content-encoding`；
+    // 解压失败/不支持/多重编码 → **一律拒绝**（不看 fail_closed），按「未脱敏
+    // 体不得出网」的同一原则处理。
+    // 多个 `Content-Encoding` 头等价于逗号拼接（HTTP 语义），必须全部取出；
+    // 头值不是可见 ASCII 时 `to_str` 失败 —— 不能当成「无编码」放过，
+    // 否则压缩体又会被当文本透传（正是本次修复的漏洞形态）。
+    let mut req_enc_bad = false;
+    let mut req_enc_parts: Vec<String> = Vec::new();
+    for v in parts.headers.get_all("content-encoding") {
+        match v.to_str() {
+            Ok(s) => req_enc_parts.push(s.trim().to_string()),
+            Err(_) => req_enc_bad = true,
+        }
+    }
+    let req_enc = req_enc_parts.join(",");
+    let req_enc_norm = crate::stream::decode::normalize_encoding(&req_enc);
+    let mut decoded_req_body: Option<Bytes> = None;
+    if req_enc_bad || req_enc_parts.len() > 1 {
+        emit(
+            &state.bus,
+            EventType::Block,
+            &method_str,
+            &path,
+            415,
+            "request_decode_failed",
+            Protocol::Unknown,
+            "",
+            "",
+            &RequestMeta {
+                req_bytes,
+                message: "content-encoding 非法或多重编码".to_string(),
+                request_headers: log_headers.clone(),
+                ..Default::default()
+            },
+        );
+        return error_response(StatusCode::UNSUPPORTED_MEDIA_TYPE, "request_decode_failed");
+    }
+    if !req_enc_norm.is_empty() && req_enc_norm != "identity" {
+        match crate::stream::decode::decode_request(&body_bytes, &req_enc, max_body) {
+            Ok(Some(plain)) => {
+                if plain.len() > max_body {
+                    emit(
+                        &state.bus,
+                        EventType::Block,
+                        &method_str,
+                        &path,
+                        413,
+                        "request_decoded_too_large",
+                        Protocol::Unknown,
+                        "",
+                        "",
+                        &RequestMeta {
+                            req_bytes: plain.len(),
+                            request_headers: log_headers.clone(),
+                            ..Default::default()
+                        },
+                    );
+                    return error_response(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        "request_decoded_too_large",
+                    );
+                }
+                tracing::debug!(
+                    enc = %req_enc_norm,
+                    compressed = body_bytes.len(),
+                    decoded = plain.len(),
+                    "请求体已解压后脱敏"
+                );
+                decoded_req_body = Some(Bytes::from(plain));
+            }
+            Ok(None) => {}
+            Err(e) => {
+                // 明确拒绝而不是透传：压缩体未经脱敏不得出网。
+                // 解出超过 `max_body` 与「编码不支持/损坏」区分开：前者是 413
+                // （与未压缩请求超限一致），后者是 415。
+                let too_large = e.starts_with(crate::stream::decode::DECODE_TOO_LARGE_PREFIX);
+                let (status, reason) = if too_large {
+                    (413, "request_decoded_too_large")
+                } else {
+                    (415, "request_decode_failed")
+                };
+                emit(
+                    &state.bus,
+                    EventType::Block,
+                    &method_str,
+                    &path,
+                    status,
+                    reason,
+                    Protocol::Unknown,
+                    "",
+                    "",
+                    &RequestMeta {
+                        req_bytes,
+                        message: format!("{req_enc_norm}: {e}").chars().take(200).collect(),
+                        request_headers: log_headers.clone(),
+                        ..Default::default()
+                    },
+                );
+                let status = if too_large {
+                    StatusCode::PAYLOAD_TOO_LARGE
+                } else {
+                    StatusCode::UNSUPPORTED_MEDIA_TYPE
+                };
+                return error_response(status, reason);
+            }
+        }
+    }
+    let req_was_decoded = decoded_req_body.is_some();
+    let body_bytes = decoded_req_body.unwrap_or(body_bytes);
+    // 解压后 body 已是明文：所有后续转发路径（含 fail-open 的 invalid_json /
+    // non_llm_json）都必须剥掉编码头，否则上游会拿 gzip 头解明文而失败。
+    if req_was_decoded {
+        parts.headers.remove("content-encoding");
+    }
+    // 事件与完整报文的字节口径统一为「实际处理（解压后）字节」，
+    // 否则同一请求在事件列表里高压缩比时会低估上千倍。
+    let req_bytes = body_bytes.len();
 
     // ── 判定④：声明非 JSON ──
     if !is_json_ct(&ct) {
@@ -719,6 +844,8 @@ pub async fn handler(State(state): State<SharedState>, req: Request) -> Response
     // 转发（脱敏后的 body）+ 响应侧还原
     let mut headers = parts.headers.clone();
     force_identity_encoding(&mut headers);
+    // 请求体若在入口解压，`parts.headers` 已剥掉 content-encoding（见上）；
+    // content-length 由 `build_request` 按实际 body 长度重算。
     // `final_text` = 脱敏结果 + 外置载荷已按原始字节拼回（见 spawn_blocking 内）。
     let out_body = Bytes::from(final_text.into_bytes());
     // 事件日志 dialog：从**原始**请求体抽对话文本（用户消息）。
@@ -977,7 +1104,8 @@ async fn forward_inner(
                             match crate::stream::sse::aggregate_stream(raw_body).await {
                                 Ok(raw) => match crate::stream::decode::decode(&raw, &enc) {
                                     Ok(Some(plain)) => (Some(Bytes::from(plain)), String::new()),
-                                    Ok(None) => (Some(raw), enc.clone()),
+                                    // identity：体没动，但头也别再带出去（大小写变体统一）
+                                    Ok(None) => (Some(raw), String::new()),
                                     Err(e) => {
                                         tracing::warn!(
                                             "[decode] 压缩体解码失败({enc}): {e};按原样透传"
@@ -996,7 +1124,14 @@ async fn forward_inner(
                         }
                     } else {
                         pending_body = Some(resp.take().expect("body 未被取过").into_body());
-                        (None, enc.clone())
+                        // identity 的各种大小写/空白变体归一化成「无编码」，
+                        // 与 `restorable` 共用同一判定，避免头体语义不一致。
+                        let eff = if crate::stream::decode::is_identity(&enc) {
+                            String::new()
+                        } else {
+                            crate::stream::decode::normalize_encoding(&enc)
+                        };
+                        (None, eff)
                     };
                 let can_restore = crate::server::response::restorable(&ct, &eff_enc);
                 if can_restore {
